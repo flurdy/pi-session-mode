@@ -2,7 +2,13 @@
   "name": "@flurdy/pi-session-mode",
   "version": "0.1.0",
   "private": true,
+  "description": "Guarded plan mode and canonical Git-worktree writer leases for Pi",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/flurdy/pi-session-mode.git"
+  },
+  "keywords": ["pi-package", "pi-extension", "session-mode", "worktree-lease"],
   "type": "module",
   "engines": {
     "node": ">=22.19"
@@ -12,17 +18,33 @@
       "./index.ts"
     ]
   },
+  "exports": {
+    "./lease-observer": "./lease-observer.ts"
+  },
+  "files": [
+    "README.md",
+    "docs/guard.md",
+    "index.ts",
+    "lease-observer.ts",
+    "lease.ts",
+    "policy.ts",
+    "session-mode.ts",
+    "subagent-policy.ts"
+  ],
   "scripts": {
     "test": "tsx --test *.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "pack:check": "node scripts/check-package.mjs",
+    "check": "npm test && npm run typecheck && npm run pack:check",
+    "verify:git-install": "bash scripts/verify-git-install.sh"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.84.4",
-    "@types/node": "^24.12.0",
-    "tsx": "^4.20.0",
-    "typescript": "^5.9.0"
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@types/node": "24.12.0",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3"
   }
 }

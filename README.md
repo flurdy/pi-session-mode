@@ -1,87 +1,61 @@
 # Pi Session Mode
 
-Pi extension that keeps normal implementation fast while preventing two guarded Pi sessions from intentionally writing the same Git worktree.
+A [Pi](https://pi.dev) extension for guarded plan mode and one cooperative writer per canonical Git worktree. This is an accidental-change guard, not a sandbox.
 
-This is a best-effort accidental-change guard, not a sandbox or security boundary.
+See [the guard contract](docs/guard.md) for policy, lease lifetime, compatibility, failure behavior, and explicit bypasses.
 
-## Modes
+## Requirements
 
-| Mode | Behavior |
-| --- | --- |
-| `implement` | Acquires the canonical Git-worktree lease before enabling write tools. This is the default for a new session. |
-| `plan` | Takes no lease, hides `edit`/`write`, and blocks obvious model-driven mutations. |
+- Pi 0.85.1 or newer; development and lifecycle checks use 0.85.1.
+- Git and util-linux `flock` for writer exclusion; Linux `lslocks` for optional occupancy observation.
+- Node.js from `.nvmrc` for development.
 
-Commands:
+Pi supplies its core package at runtime; the peer range deliberately accepts the host version. The optional guarded-reviewer integration uses the installed `pi-subagents` discovery API and fails closed when unavailable; see the contract.
 
-- `/plan`: guard tools first, release any held lease, warn if the worktree is dirty, and persist the mode on the active session branch.
-- `/implement`: acquire the lease before restoring write tools.
+## Install
 
-The extension exposes `--plan` and `--implement` for launcher integration. `pl` provides the preferred Ctrl-P mode toggle. An explicit startup flag wins over restored branch state; otherwise the latest active-branch mode is restored.
-
-The extension publishes full-text footer states: `implement`, `plan`, `conflict`, `lost`, and `unguarded`. `acquiring` is shown while `/implement` waits for the lease handshake. The companion statusline keeps those labels as its text fallback and normally maps them to `✅`, `🔍`, `⛔`, `💥`, `🚨`, and `⏳` respectively.
-
-## Lease
-
-The lease identity is the SHA-256 hash of `realpath(git rev-parse --show-toplevel)`. A private runtime directory contains:
-
-- a stable `flock(1)` lock file, which is the authority;
-- best-effort JSON holder metadata, which is diagnostic only.
-
-A fixed child runs under nonblocking `flock`, prints a ready handshake, and then waits on a parent-owned pipe. Pi reports `implement` only after that handshake and metadata write complete. Releasing the pipe, normal shutdown, or process death releases the kernel lock. Unexpected holder exit moves the session immediately to guarded `lost` state.
-
-Separate Git worktrees have separate canonical roots and can implement concurrently. A second session in the same worktree enters guarded `conflict` state and shows holder details when available.
-
-The companion statusline may inspect the same stable lock path through the kernel's live lock table. In plan mode it renders a separate `🔒` cell when another same-user session holds the worktree lease. This read-only, asynchronous observation never trusts holder JSON, never takes the lock, and disappears when inspection is unavailable.
-
-The observer and statusline share a 2000 ms per-command default for Git and `lslocks`. Whole-system
-lock scans can exceed 500 ms; the larger deadline accommodates those scans without treating a
-killed command as evidence that the worktree is free. Explicit timeouts and cancellation remain
-supported. Slower scans still return unavailable, with timeout diagnostics; this does not bound
-scan cost or guarantee availability on every host.
-
-## Guarded policy
-
-Guarded states:
-
-- hide and independently block `edit` and `write`, and block the native `powershell` tool;
-- allow read-only subagent management, status, validation, and cancellation operations;
-- allow direct `reviewer`, `claude-code`, `codex-exec`, and `cursor-agent` calls only when pi-subagents resolves their effective tool or runner contracts as read-only in the active model-provider context;
-- block alternate child cwd/scope, writer agents, resume/steer operations, explicit output paths, host gates, remote sharing, managed-worktree creation, and dynamic `workflowScript` launches;
-- recursively inspect `multi_tool_use.parallel` and allow only named, input-checked read-only tools through a fail-closed nesting limit;
-- block obvious model Bash file, package, Git, system, and destructive/remote Beads mutations;
-- allow reads and ordinary local Beads triage, including local `.beads`/Dolt writes;
-- inject concise guarded-mode guidance into the model system prompt.
-
-The effective-agent check uses pi-subagents' installed resolver, including package, user, project, settings, and active-provider overrides. It rejects unexpected tool sets, outputs, extensions, native runners, nested delegation, unpinned external-CLI commands, and direct MCP tool grants. A model change clears previous approval before provider-aware verification completes. Missing or incompatible resolver APIs fail closed for direct agent launches while management and ordinary read tools remain available, and emit one visible warning per guarded episode. Effective agent definitions that simply do not match the read-only contract remain blocked without being reported as discovery failures.
-
-The Bash policy is intentionally bounded. Unknown commands are allowed, constant `sh`/`bash`-family `-c` payloads are inspected recursively through a fail-closed nesting limit, and exact `/dev/null` output discards and file-descriptor duplication are allowed without treating real or dynamic redirect targets as safe. POSIX read-write (`<>`) redirects are mutations. Quoted-text handling only reduces common redirect false positives. Tests pin representative false-positive and false-negative boundaries.
-
-## Explicit boundaries
-
-- Typed `!` and `!!` Bash is not intercepted.
-- `--no-extensions` bypasses the guard. In pi-subagents, an explicit extension list or a `denyExtensions` capability ceiling can also result in `--no-extensions`; treat that as the same silent bypass.
-- Guarded mode does not yet allow dynamic multi-review `workflowScript` fan-out. That requires a pi-subagents pre-launch policy seam carrying each resolved child and host-step contract; display-only preflight lane metadata and script-text heuristics are not treated as authority.
-- Writer children remain blocked in guarded mode, including managed-worktree launches. Switch to `/implement` before launching writers. A same-worktree child that loads the extension contends for the lease rather than inheriting authority.
-- Trusted extensions run with user permissions and can bypass this policy.
-- Other agents, editors, terminals, machines, and direct filesystem activity do not share this lease.
-- Non-Git sessions acquire no cwd lock and remain visibly `unguarded`; a cwd lock would falsely imply protection for nested repositories.
-- Nested repositories and initialized submodules are guarded only according to the canonical Git top-level resolved for the launched session.
-- Missing Git, `flock`, runtime-directory access, or metadata writes fail open with a prominent `unguarded` state.
-
-Set `PI_SESSION_GUARD=0` for the emergency fail-open kill switch.
-
-## Install and verify
-
-From the repository root:
+Pin a reviewed immutable Git ref:
 
 ```bash
-make apply
-cd pi/session-mode
-npm install
-npm test
-npm run typecheck
+pi install git:github.com/flurdy/pi-session-mode@<commit-or-tag>
 ```
 
-Restart Pi after the extension is first linked. Later source changes can use `/reload`; reload shuts down and releases the old runtime before reacquiring in the new one. This ordering is verified against Pi 0.84.4 internals and must be rechecked on Pi upgrades.
+For a reviewed mutable checkout, run `make apply`. It owns the existing `~/.pi/agent/extensions/flurdy-session-mode` link. Do not enable a Git package and a checkout link together. Restart Pi after first installation; use `/reload` for later edits. Each reload releases the old lease before attempting to reacquire it.
 
-To roll back, remove the managed extension link and restart Pi. Existing `session-mode` custom entries are inert without the extension.
+## Use
+
+- `/plan` guards writes, releases the lease, and saves plan mode.
+- `/implement` acquires the lease before enabling writes.
+- `pi --plan` and `pi --implement` select startup mode; explicit plan wins.
+- `PI_SESSION_GUARD=0` is the explicit, visibly unguarded emergency bypass.
+
+Separate worktrees can implement concurrently. Workspace-root leases do not cover linked child repositories; this version does not implement multi-repository scopes.
+
+## Observer integration
+
+Consumers import the package-owned API:
+
+```typescript
+import { probeWorktreeLeaseOccupancy } from "@flurdy/pi-session-mode/lease-observer";
+```
+
+The observer has no third-party runtime dependencies and never acquires a lock. A separately installed Pi package is not automatically a Node dependency of another extension. [ai-tools statusline](https://github.com/flurdy/ai-tools/tree/main/pi/statusline) provides explicit dependency wiring to the reviewed checkout or installed Git package. Keep the guard and observer on the same selected revision and reload them together.
+
+## Develop and verify
+
+```bash
+npm ci
+npm run check
+```
+
+After committing, run `npm run verify:git-install`. It installs the exact local commit through a temporary loopback Git server into an isolated Pi agent directory, verifies commands and real lease lifecycle without a provider request, and checks the exported observer from a scratch consumer. No user installation is modified.
+
+`make verify-apply` verifies a checkout link; `make check` runs tests, typechecking, and the exact package allowlist. History provenance is recorded in [the extraction record](https://github.com/flurdy/pi-session-mode/blob/main/docs/extraction-history.md).
+
+## Rollback
+
+Enter `/plan`, remove only the selected package or checkout link, then restart Pi. Do not delete runtime lock files to force takeover. Restoring a previous reviewed package revision restores its policy; v1 custom mode entries are inert when the extension is absent.
+
+## License
+
+[MIT](LICENSE).
