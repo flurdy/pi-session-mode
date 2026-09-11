@@ -8,6 +8,9 @@ import { pathToFileURL } from "node:url";
 const [agentDir, workDir, installed] = process.argv.slice(2).map((value) => resolve(value));
 const { acquireWorktreeLease, lockIdentity } = await import(pathToFileURL(join(installed, "lease.ts")).href);
 const runtimeDir = join(agentDir, "runtime");
+const settingsPath = join(agentDir, "settings.json");
+const settings = JSON.parse(await readFile(settingsPath, "utf8"));
+await writeFile(settingsPath, JSON.stringify({ ...settings, defaultProjectTrust: "never" }));
 await mkdir(runtimeDir);
 await mkdir(join(agentDir, "extensions"), { recursive: true });
 await writeFile(join(agentDir, "extensions", "smoke.ts"), `export default function(pi) {
