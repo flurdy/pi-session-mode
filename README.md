@@ -1,6 +1,6 @@
 # Pi Session Mode
 
-A [Pi](https://pi.dev) extension for guarded plan mode and one cooperative writer per canonical Git worktree. This is an accidental-change guard, not a sandbox.
+A [Pi](https://pi.dev) extension for guarded plan mode and explicitly scoped, incremental Git-worktree writer leases. Disjoint repository sets can work concurrently. This is an accidental-change guard, not a sandbox.
 
 See [the guard contract](docs/guard.md) for policy, lease lifetime, compatibility, failure behavior, and explicit bypasses.
 
@@ -24,12 +24,16 @@ For a reviewed mutable checkout, run `make apply`. It owns the existing `~/.pi/a
 
 ## Use
 
-- `/plan` guards writes, releases the lease, and saves plan mode.
-- `/implement` acquires the lease before enabling writes.
-- `pi --plan` and `pi --implement` select startup mode; explicit plan wins.
+- `/plan` guards writes, drains pending additions, releases all leases, and saves plan mode.
+- `/implement` acquires the cwd worktree when none is held; otherwise it retains the current set.
+- `/implement repos/api repos/web` adds those worktree roots without implicitly leasing the workspace root. Quote literal paths containing spaces.
+- `/leases` shows held/requested/failed scopes. `/leases repos/api` inspects that root without acquiring.
+- `pi --implement --lease-roots '["repos/api","repos/web"]'` selects explicit startup roots. `--plan` wins; explicit startup flags override saved selection.
 - `PI_SESSION_GUARD=0` is the explicit, visibly unguarded emergency bypass.
 
-Separate worktrees can implement concurrently. Workspace-root leases do not cover linked child repositories; this version does not implement multi-repository scopes.
+**Compatibility change in 0.2:** native `edit`/`write` calls require the target's owning worktree lease, including from default cwd-only sessions. A workspace-root lease no longer lets those tools edit linked or nested repositories. Select each target explicitly. Bash/script effects remain outside path enforcement. Legacy non-Git or unavailable implicit-cwd sessions remain visibly `unguarded` and bypass native checks; start in plan mode or select explicit valid roots to obtain protection.
+
+A failed addition preserves previously held roots. Any lost lease guards the whole session and releases the set. There is no automatic acquisition from Beads, automatic release on completion/idle, per-root release, or special cross-repository owner. Narrow a set with `/plan`, then select the desired roots again. The footer keeps the guard label and adds `leases:N`; `/leases` provides full identities.
 
 ## Observer integration
 
@@ -54,7 +58,7 @@ After committing, run `npm run verify:git-install`. It installs the exact local 
 
 ## Rollback
 
-Enter `/plan`, remove only the selected package or checkout link, then restart Pi. Do not delete runtime lock files to force takeover. Restoring a previous reviewed package revision restores its policy; v1 custom mode entries are inert when the extension is absent.
+Enter `/plan`, remove only the selected package or checkout link, then restart Pi. Do not delete runtime lock files to force takeover. Version 0.2 writes safe v1 plan checkpoints before v2 scope records so older versions resume guarded instead of reviving stale implementation mode. Removing the extension makes its custom entries inert. Downgrading also removes scoped native-write enforcement; do not assume mixed-version sessions provide the same protection.
 
 ## License
 

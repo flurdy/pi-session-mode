@@ -93,6 +93,17 @@ test("defaults to implement and acquires before reporting write authority", asyn
 	assert.deepEqual(pi.activeTools, ["read", "bash", "edit", "write", "questionnaire", "subagent"]);
 });
 
+test("implicit cwd contention retains implementation intent for a later restore", async () => {
+	const { pi, controller } = harness([{ kind: "contended", root: "/repo" }]);
+	pi.planFlag = true;
+	const ctx = context();
+	await pi.emit("session_start", ctx);
+	await pi.commands.get("implement")?.handler("", ctx);
+	assert.equal(controller.state, "implement-blocked");
+	assert.equal(controller.mode, "implement");
+	assert.deepEqual(pi.appended.at(-1), { type: "session-mode", data: { version: 2, mode: "implement", scope: { kind: "cwd" } } });
+});
+
 test("explicit --plan wins over restored implement state and takes no lease", async () => {
 	const branch = [{ type: "custom", customType: "session-mode", data: { version: 1, mode: "implement" } }];
 	const { pi, acquisitions, controller } = harness([]);
@@ -119,6 +130,7 @@ test("explicit launcher implement mode wins over restored plan state", async () 
 	await pi.emit("session_start", context(activeBranch));
 	assert.equal(controller.state, "implement");
 	assert.deepEqual(acquisitions, ["acquire"]);
+	assert.deepEqual(pi.appended.at(-1), { type: "session-mode", data: { version: 2, mode: "implement", scope: { kind: "cwd" } } });
 });
 
 test("rejects both mode changes while Pi is busy", async () => {
@@ -176,7 +188,36 @@ test("plan disables writes before releasing, warns when dirty, and persists", as
 	assert.deepEqual(order, ["guard", "release"]);
 	assert.equal(controller.state, "plan");
 	assert.match(ctx.notifications.map((n) => n.message).join("\n"), /dirty/i);
-	assert.deepEqual(pi.appended.at(-1), { type: "session-mode", data: { version: 1, mode: "plan" } });
+	assert.deepEqual(pi.appended.at(-1), { type: "session-mode", data: { version: 2, mode: "plan" } });
+});
+
+test("plan intent is saved before advisory checks can be interrupted by shutdown", async () => {
+	const { pi } = harness();
+	const ctx = context();
+	await pi.emit("session_start", ctx);
+	let started!: () => void;
+	let finish!: () => void;
+	const checking = new Promise<void>((resolve) => { started = resolve; });
+	const gate = new Promise<void>((resolve) => { finish = resolve; });
+	pi.exec = async () => { started(); await gate; return { code: 0, stdout: "", stderr: "" }; };
+	const planning = pi.commands.get("plan")?.handler("", ctx);
+	await checking;
+	await pi.emit("session_shutdown", ctx);
+	finish();
+	await planning;
+	assert.deepEqual(pi.appended.at(-1), { type: "session-mode", data: { version: 2, mode: "plan" } });
+});
+
+test("a failed plan checkpoint never prevents lease release", async () => {
+	const releases: string[] = [];
+	const { pi, controller } = harness([held(releases)]);
+	const ctx = context();
+	await pi.emit("session_start", ctx);
+	pi.appendEntry = () => { throw new Error("checkpoint unavailable"); };
+	await assert.rejects(async () => pi.commands.get("plan")?.handler("", ctx), /checkpoint unavailable/);
+	assert.deepEqual(releases, ["release"]);
+	assert.deepEqual(controller.roots, []);
+	assert.equal(pi.activeTools.includes("write"), false);
 });
 
 test("clean /plan transition does not emit a dirty-worktree warning", async () => {
@@ -291,22 +332,24 @@ test("keeps writes guarded until /implement finishes acquiring", async () => {
 	assert.equal(pi.activeTools.includes("write"), true);
 });
 
-test("a completed /plan transition supersedes a pending implement acquisition", async () => {
+test("plan cancels and drains a pending implement acquisition", async () => {
 	let resolveLease: ((result: WorktreeLeaseResult) => void) | undefined;
+	let started!: () => void;
+	const acquiring = new Promise<void>((resolve) => { started = resolve; });
 	const pending = new Promise<WorktreeLeaseResult>((resolve) => (resolveLease = resolve));
 	const releases: string[] = [];
-	const { pi, controller } = harness([], { acquireLease: async () => pending });
+	const { pi, controller } = harness([], { acquireLease: async () => { started(); return pending; } });
 	const ctx = context();
 
 	const startup = pi.emit("session_start", ctx);
-	await Promise.resolve();
+	await acquiring;
 	assert.equal(controller.state, "acquiring");
 
-	await pi.commands.get("plan")?.handler("", ctx);
+	const planning = pi.commands.get("plan")?.handler("", ctx);
 	assert.equal(controller.mode, "plan");
 	assert.equal(controller.state, "plan");
 	resolveLease?.(held(releases));
-	await startup;
+	await Promise.all([startup, planning]);
 
 	assert.deepEqual(releases, ["release"]);
 	assert.equal(controller.mode, "plan");
@@ -316,20 +359,23 @@ test("a completed /plan transition supersedes a pending implement acquisition", 
 
 test("a superseded /implement command does not persist after /plan", async () => {
 	let resolveLease: ((result: WorktreeLeaseResult) => void) | undefined;
+	let started!: () => void;
+	const acquiring = new Promise<void>((resolve) => { started = resolve; });
 	const pending = new Promise<WorktreeLeaseResult>((resolve) => (resolveLease = resolve));
-	const { pi } = harness([], { acquireLease: async () => pending });
+	const { pi } = harness([], { acquireLease: async () => { started(); return pending; } });
 	pi.planFlag = true;
 	const ctx = context();
 	await pi.emit("session_start", ctx);
 
 	const implement = pi.commands.get("implement")?.handler("", ctx);
-	await Promise.resolve();
-	await pi.commands.get("plan")?.handler("", ctx);
+	await acquiring;
+	const planning = pi.commands.get("plan")?.handler("", ctx);
 	resolveLease?.(held());
-	await implement;
+	await Promise.all([implement, planning]);
 
 	assert.deepEqual(pi.appended, [
 		{ type: "session-mode", data: { version: 1, mode: "plan" } },
+		{ type: "session-mode", data: { version: 2, mode: "plan" } },
 	]);
 });
 
@@ -463,6 +509,22 @@ test("lost-lease UI failures stay contained with write tools guarded", async () 
 	assert.equal(pi.activeTools.includes("write"), false);
 });
 
+test("malformed scope arguments remain visible after lease loss", async () => {
+	let lose!: () => void;
+	const lease = held();
+	lease.lost = new Promise<void>((resolve) => { lose = resolve; });
+	const { pi, controller } = harness([lease]);
+	const ctx = context();
+	await pi.emit("session_start", ctx);
+	lose();
+	await new Promise((resolve) => setImmediate(resolve));
+	const count = ctx.notifications.length;
+	await pi.commands.get("implement")?.handler('"unfinished', ctx);
+	assert.equal(controller.state, "lost");
+	assert.ok(ctx.notifications.length > count);
+	assert.match(ctx.notifications.at(-1)?.message ?? "", /Unterminated/);
+});
+
 test("headless plan mode guards without prompting", async () => {
 	const { pi, controller } = harness([]);
 	pi.planFlag = true;
@@ -516,15 +578,17 @@ test("reload lifecycle releases before reacquiring and exposes a lost race as co
 
 test("shutdown waits for a pending acquisition and releases its result", async () => {
 	let resolveLease: ((result: WorktreeLeaseResult) => void) | undefined;
+	let started!: () => void;
+	const acquiring = new Promise<void>((resolve) => { started = resolve; });
 	const pending = new Promise<WorktreeLeaseResult>((resolve) => (resolveLease = resolve));
 	const releases: string[] = [];
-	const { pi } = harness([], { acquireLease: async () => pending });
+	const { pi } = harness([], { acquireLease: async () => { started(); return pending; } });
 	pi.planFlag = true;
 	const ctx = context();
 	await pi.emit("session_start", ctx);
 
 	const transition = pi.commands.get("implement")?.handler("", ctx);
-	await Promise.resolve();
+	await acquiring;
 	let shutdownFinished = false;
 	const shutdown = pi.emit("session_shutdown", ctx).then(() => { shutdownFinished = true; });
 	await new Promise<void>((resolve) => setImmediate(resolve));

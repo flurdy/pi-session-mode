@@ -52,9 +52,9 @@ const BEADS_DESTRUCTIVE_OR_REMOTE =
 	/\bbd\b[^\n;&|]*(?:\bdelete\b|\bpurge\b|\bmigrate\b|\bcleanup\b|\bdolt\s+(?:push|pull|fetch|reset|checkout|merge|remote)\b)/i;
 const SYSTEM_MUTATION =
 	/\b(?:sudo|su|kill|pkill|killall|reboot|shutdown)\b|\b(?:systemctl|service)\s+(?:\S+\s+)?(?:start|stop|restart|enable|disable)\b/i;
-const MAX_PARALLEL_DEPTH = 4;
+export const MAX_PARALLEL_DEPTH = 4;
 const MAX_INSPECTION_DEPTH = 4;
-const SAFE_PARALLEL_TOOL_NAMES = new Set([
+export const SAFE_PARALLEL_TOOL_NAMES: ReadonlySet<string> = new Set([
 	"read",
 	"web_search",
 	"source_check",

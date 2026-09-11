@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { readFile, realpath } from "node:fs/promises";
-import { worktreeLeaseLockPath } from "./lease.ts";
+import { resolveGitRoot, worktreeLeaseLockPath } from "./lease.ts";
+import { MAX_LEASE_ROOTS } from "./scope.ts";
 
 export const DEFAULT_LEASE_OCCUPANCY_TIMEOUT_MS = 2000;
 
@@ -76,34 +77,47 @@ export async function probeWorktreeLeaseOccupancy(
 	cwd: string,
 	options: ProbeWorktreeLeaseOccupancyOptions = {},
 ): Promise<WorktreeLeaseOccupancy> {
-	let root: string;
-	try {
-		const git = await runCommand(options.gitCommand ?? "git", ["-C", cwd, "rev-parse", "--show-toplevel"], options);
-		root = await realpath(git.stdout.trim());
-	} catch (error) {
-		return { kind: "unavailable", reason: error instanceof Error ? error.message : String(error) };
-	}
+	return (await probeWorktreeLeaseOccupancies([cwd], options))[0]!;
+}
 
-	let lockPath: string;
-	try {
-		lockPath = await realpath(worktreeLeaseLockPath(root, options.runtimeDir));
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "free", root };
-		return { kind: "unavailable", reason: error instanceof Error ? error.message : String(error) };
+export async function probeWorktreeLeaseOccupancies(
+	cwds: readonly string[],
+	options: ProbeWorktreeLeaseOccupancyOptions = {},
+): Promise<WorktreeLeaseOccupancy[]> {
+	if (cwds.length > MAX_LEASE_ROOTS) throw new Error(`At most ${MAX_LEASE_ROOTS} worktrees may be inspected`);
+	const results: WorktreeLeaseOccupancy[] = [];
+	const pending: Array<{ index: number; root: string; lockPath: string }> = [];
+	for (const [index, cwd] of cwds.entries()) {
+		try {
+			options.signal?.throwIfAborted();
+			const resolved = await resolveGitRoot(cwd, { gitCommand: options.gitCommand, gitTimeoutMs: options.timeoutMs ?? DEFAULT_LEASE_OCCUPANCY_TIMEOUT_MS, signal: options.signal });
+			if (!("root" in resolved)) { results[index] = { kind: "unavailable", reason: resolved.detail ?? resolved.reason }; continue; }
+			const root = resolved.root;
+			try {
+				const lockPath = await realpath(worktreeLeaseLockPath(root, options.runtimeDir));
+				pending.push({ index, root, lockPath });
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				results[index] = { kind: "free", root };
+			}
+		} catch (error) {
+			results[index] = { kind: "unavailable", reason: error instanceof Error ? error.message : String(error) };
+		}
 	}
-
-	try {
-		const locks = await runCommand(
-			options.lslocksCommand ?? "lslocks",
-			["--json", "--output", "PATH,TYPE,MODE,PID"],
-			options,
-		);
-		const observation = observeLock(locks.stdout, lockPath);
-		if (!observation) return { kind: "unavailable", reason: "lslocks returned an incompatible response" };
-		if (!observation.held) return { kind: "free", root };
-		const parentPid = await processParentPid(observation.holderPid!, options.signal);
-		return parentPid === (options.selfPid ?? process.pid) ? { kind: "free", root } : { kind: "held", root };
-	} catch (error) {
-		return { kind: "unavailable", reason: error instanceof Error ? error.message : String(error) };
+	if (pending.length) {
+		try {
+			const locks = await runCommand(options.lslocksCommand ?? "lslocks", ["--json", "--output", "PATH,TYPE,MODE,PID"], options);
+			for (const { index, root, lockPath } of pending) {
+				options.signal?.throwIfAborted();
+				const observation = observeLock(locks.stdout, lockPath);
+				if (!observation) { results[index] = { kind: "unavailable", reason: "lslocks returned an incompatible response" }; continue; }
+				const parentPid = observation.held ? await processParentPid(observation.holderPid!, options.signal) : undefined;
+				options.signal?.throwIfAborted();
+				results[index] = { kind: observation.held && parentPid !== (options.selfPid ?? process.pid) ? "held" : "free", root };
+			}
+		} catch (error) {
+			for (const { index } of pending) results[index] = { kind: "unavailable", reason: error instanceof Error ? error.message : String(error) };
+		}
 	}
+	return results;
 }

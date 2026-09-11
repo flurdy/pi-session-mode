@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { access, chmod, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { acquireWorktreeLease, lockIdentity } from "./lease.ts";
-import { probeWorktreeLeaseOccupancy, type ProbeWorktreeLeaseOccupancyOptions } from "./lease-observer.ts";
+import { probeWorktreeLeaseOccupancy, probeWorktreeLeaseOccupancies, type ProbeWorktreeLeaseOccupancyOptions } from "./lease-observer.ts";
 
 async function gitRepo(): Promise<{ repo: string; runtimeDir: string; cleanup: () => Promise<void> }> {
 	const root = await mkdtemp(join(tmpdir(), "pi-lease-observer-"));
@@ -34,6 +34,24 @@ async function scriptedProbe(script: (lockPath: string) => string, options: Prob
 		await fixture.cleanup();
 	}
 }
+
+test("multiple explicit roots share one kernel scan and preserve partial lookup failures", async () => {
+	const fixture = await gitRepo();
+	try {
+		const second = join(fixture.repo, "second");
+		await mkdir(second);
+		execFileSync("git", ["-C", second, "init", "-q", "-b", "main"]);
+		await mkdir(fixture.runtimeDir);
+		for (const root of [fixture.repo, second]) await writeFile(join(fixture.runtimeDir, `${lockIdentity(root)}.lock`), "");
+		const calls = join(fixture.runtimeDir, "calls");
+		const command = join(fixture.runtimeDir, "batch-lslocks");
+		await writeFile(command, `#!${process.execPath}\nrequire("node:fs").appendFileSync(${JSON.stringify(calls)},"scan\\n"); console.log('{"locks":[]}');\n`, { mode: 0o700 });
+		const result = await probeWorktreeLeaseOccupancies([fixture.repo, second, join(fixture.repo, "absent")], { runtimeDir: fixture.runtimeDir, lslocksCommand: command });
+		assert.deepEqual(result.slice(0, 2), [{ kind: "free", root: fixture.repo }, { kind: "free", root: second }]);
+		assert.equal(result[2]?.kind, "unavailable");
+		assert.equal(await readFile(calls, "utf8"), "scan\n");
+	} finally { await fixture.cleanup(); }
+});
 
 test("default deadline still stops a stalled lock scan", async () => {
 	const result = await scriptedProbe(() => `setTimeout(() => process.stdout.write('{"locks":[]}'), 3000);`);

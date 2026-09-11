@@ -1,6 +1,6 @@
 {
   "name": "@flurdy/pi-session-mode",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Guarded plan mode and canonical Git-worktree writer leases for Pi",
   "license": "MIT",
@@ -26,8 +26,12 @@
     "docs/guard.md",
     "index.ts",
     "lease-observer.ts",
+    "lease-set.ts",
     "lease.ts",
     "policy.ts",
+    "scope.ts",
+    "scoped-policy.ts",
+    "selection.ts",
     "session-mode.ts",
     "subagent-policy.ts"
   ],

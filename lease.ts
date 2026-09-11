@@ -1,8 +1,8 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, realpath, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, realpath, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 export interface LeaseHolderMetadata {
 	root: string;
@@ -17,6 +17,7 @@ export interface HeldWorktreeLease {
 	root: string;
 	holderPid: number;
 	lost: Promise<void>;
+	readonly alive?: boolean;
 	release(): Promise<void>;
 }
 
@@ -27,6 +28,7 @@ export type WorktreeLeaseResult =
 
 export interface LeaseExecOptions {
 	timeoutMs: number;
+	signal?: AbortSignal;
 }
 
 export interface LeaseCommandResult {
@@ -39,6 +41,8 @@ export interface LeaseCommandResult {
 export type LeaseExec = (command: string, args: string[], options: LeaseExecOptions) => Promise<LeaseCommandResult>;
 
 export interface AcquireWorktreeLeaseOptions {
+	expectedRoot?: string;
+	signal?: AbortSignal;
 	runtimeDir?: string;
 	flockCommand?: string;
 	gitCommand?: string;
@@ -54,6 +58,7 @@ function defaultExec(command: string, args: string[], options: LeaseExecOptions)
 		const child = execFile(command, args, {
 			encoding: "utf8",
 			timeout: options.timeoutMs,
+			signal: options.signal,
 			windowsHide: true,
 		}, (error, stdout, stderr) => {
 			resolve({
@@ -78,9 +83,9 @@ export function worktreeLeaseLockPath(root: string, runtimeDir = worktreeLeaseRu
 	return join(runtimeDir, `${lockIdentity(root)}.lock`);
 }
 
-async function resolveGitRoot(
+export async function resolveGitRoot(
 	cwd: string,
-	options: AcquireWorktreeLeaseOptions,
+	options: AcquireWorktreeLeaseOptions = {},
 ): Promise<{ root: string } | { reason: "non-git" | "git-unavailable"; detail?: string }> {
 	const configuredTimeoutMs = options.gitTimeoutMs ?? 2000;
 	const timeoutMs = Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0 ? configuredTimeoutMs : 2000;
@@ -89,7 +94,7 @@ async function resolveGitRoot(
 		result = await (options.exec ?? defaultExec)(
 			options.gitCommand ?? "git",
 			["-C", cwd, "rev-parse", "--show-toplevel"],
-			{ timeoutMs },
+			{ timeoutMs, ...(options.signal ? { signal: options.signal } : {}) },
 		);
 	} catch (error) {
 		return { reason: "git-unavailable", detail: error instanceof Error ? error.message : String(error) };
@@ -103,7 +108,18 @@ async function resolveGitRoot(
 		return { reason: "git-unavailable", detail: result.stderr.trim() || result.error?.message || `git exited ${result.code}` };
 	}
 	try {
-		return { root: await realpath(result.stdout.trim()) };
+		const root = await realpath(result.stdout.replace(/\n$/, ""));
+		let marker = await realpath(cwd);
+		while (true) {
+			options.signal?.throwIfAborted();
+			try { await lstat(join(marker, ".git")); break; }
+			catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT" || dirname(marker) === marker) throw error;
+				marker = dirname(marker);
+			}
+		}
+		if (root !== marker) return { reason: "git-unavailable", detail: "Git top-level does not match the nearest filesystem .git marker" };
+		return { root };
 	} catch (error) {
 		return { reason: "git-unavailable", detail: error instanceof Error ? error.message : String(error) };
 	}
@@ -131,8 +147,12 @@ export async function acquireWorktreeLease(
 	cwd: string,
 	options: AcquireWorktreeLeaseOptions = {},
 ): Promise<WorktreeLeaseResult> {
+	const cancelled = (): WorktreeLeaseResult => ({ kind: "unguarded", reason: "lease-error", detail: "Lease acquisition cancelled" });
+	if (options.signal?.aborted) return cancelled();
 	const resolved = await resolveGitRoot(cwd, options);
+	if (options.signal?.aborted) return cancelled();
 	if (!("root" in resolved)) return { kind: "unguarded", ...resolved };
+	if (options.expectedRoot !== undefined && options.expectedRoot !== resolved.root) return { kind: "unguarded", reason: "lease-error", detail: "Worktree identity changed before acquisition" };
 
 	const runtimeDir = options.runtimeDir ?? worktreeLeaseRuntimeDir();
 	try {
@@ -142,6 +162,7 @@ export async function acquireWorktreeLease(
 		return { kind: "unguarded", reason: "lease-error", detail: error instanceof Error ? error.message : String(error) };
 	}
 
+	if (options.signal?.aborted) return cancelled();
 	const identity = lockIdentity(resolved.root);
 	const lockPath = worktreeLeaseLockPath(resolved.root, runtimeDir);
 	const metadataPath = join(runtimeDir, `${identity}.json`);
@@ -166,17 +187,23 @@ export async function acquireWorktreeLease(
 		let lostResolve: (() => void) | undefined;
 		const lost = new Promise<void>((done) => (lostResolve = done));
 		const cleanupTemp = () => void unlink(metadataTempPath).catch(() => undefined);
-		const readyTimer = setTimeout(() => {
+		const detachAbort = () => options.signal?.removeEventListener("abort", onAbort);
+		const fail = (result: WorktreeLeaseResult) => {
 			if (phase !== "acquiring") return;
 			phase = "finished";
+			clearTimeout(readyTimer);
+			detachAbort();
 			cleanupTemp();
+			child.once("close", () => resolve(result));
 			child.kill("SIGKILL");
-			resolve({ kind: "unguarded", reason: "lease-error", detail: "flock ready handshake timed out" });
-		}, options.readyTimeoutMs ?? 2000);
+		};
+		const onAbort = () => fail(cancelled());
+		const readyTimer = setTimeout(() => fail({ kind: "unguarded", reason: "lease-error", detail: "flock ready handshake timed out" }), options.readyTimeoutMs ?? 2000);
 
 		child.stdin.on("error", () => undefined);
 		child.stderr.on("data", (chunk) => (errorOutput += String(chunk)));
 		child.once("spawn", () => {
+			if (phase !== "acquiring") return;
 			// spawn precedes stdout data; flock -F and exec keep this PID as the lock holder.
 			holderPid = child.pid!;
 			const metadata: LeaseHolderMetadata = {
@@ -196,19 +223,11 @@ export async function acquireWorktreeLease(
 				})
 				.catch((error) => {
 					cleanupTemp();
-					if (phase !== "acquiring") return;
-					phase = "finished";
-					clearTimeout(readyTimer);
-					child.kill("SIGKILL");
-					resolve({ kind: "unguarded", reason: "lease-error", detail: error instanceof Error ? error.message : String(error) });
+					fail({ kind: "unguarded", reason: "lease-error", detail: error instanceof Error ? error.message : String(error) });
 				});
 		});
 		child.once("error", (error: NodeJS.ErrnoException) => {
-			if (phase !== "acquiring") return;
-			phase = "finished";
-			cleanupTemp();
-			clearTimeout(readyTimer);
-			resolve({
+			fail({
 				kind: "unguarded",
 				reason: error.code === "ENOENT" ? "flock-unavailable" : "lease-error",
 				detail: error.message,
@@ -216,6 +235,7 @@ export async function acquireWorktreeLease(
 		});
 
 		child.once("close", (code) => {
+			detachAbort();
 			if (phase === "held") {
 				phase = "finished";
 				if (!releasing) lostResolve?.();
@@ -241,6 +261,7 @@ export async function acquireWorktreeLease(
 			output += String(chunk);
 			if (!output.includes("\n") || output.split("\n", 1)[0] !== "ready") return;
 			phase = "held";
+			detachAbort();
 			clearTimeout(readyTimer);
 			let releasePromise: Promise<void> | undefined;
 			resolve({
@@ -248,6 +269,7 @@ export async function acquireWorktreeLease(
 				root: resolved.root,
 				holderPid: holderPid!,
 				lost,
+				get alive() { return phase === "held" && !releasing && child.exitCode === null && child.signalCode === null; },
 				release() {
 					if (releasePromise) return releasePromise;
 					releasing = true;
@@ -256,12 +278,18 @@ export async function acquireWorktreeLease(
 							done();
 							return;
 						}
-						child.once("close", done);
-						child.stdin.end();
+						const force = setTimeout(() => {
+							if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+						}, 1000);
+						child.once("close", () => { clearTimeout(force); done(); });
+						try { child.stdin.end(); }
+						catch { child.kill("SIGKILL"); }
 					});
 					return releasePromise;
 				},
 			});
 		});
+		options.signal?.addEventListener("abort", onAbort, { once: true });
+		if (options.signal?.aborted) onAbort();
 	});
 }

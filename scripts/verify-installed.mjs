@@ -95,8 +95,8 @@ function launch(flags, env) {
 	clients.push(client);
 	return client;
 }
-async function proveFree() {
-	const result = await acquireWorktreeLease(workDir, { runtimeDir: join(runtimeDir, `pi-session-guard-${process.getuid()}`) });
+async function proveFree(target = workDir) {
+	const result = await acquireWorktreeLease(target, { runtimeDir: join(runtimeDir, `pi-session-guard-${process.getuid()}`) });
 	try { assert.equal(result.kind, "held", "kernel lease was not released"); }
 	finally { if (result.kind === "held") await result.release(); }
 }
@@ -153,6 +153,46 @@ assert.equal(result.kind,"held");
 	await disabled.state("unguarded", true);
 	await proveFree();
 	await disabled.stop();
+	for (const name of ["api", "web"]) {
+		await mkdir(join(workDir, name));
+		execFileSync("git", ["-C", join(workDir, name), "init", "-q", "-b", "main"]);
+	}
+	const scoped = launch();
+	await scoped.send("get_commands");
+	await scoped.send("prompt", { message: "/plan" });
+	await scoped.send("prompt", { message: "/implement api" });
+	await scoped.state("implement", true);
+	const peer = launch(["--lease-roots", '["web"]']);
+	await peer.send("get_commands");
+	await peer.state("implement", true);
+	await proveFree();
+	const overlap = launch(["--lease-roots", '["api"]']);
+	await overlap.send("get_commands");
+	await overlap.state("conflict", false);
+	await scoped.send("prompt", { message: "/implement web" });
+	await scoped.state("implement", true);
+	assert.match(scoped.events.findLast((event) => event.statusKey === "session-mode-leases").statusText, /^leases:1/);
+	await peer.send("prompt", { message: "/plan" });
+	await scoped.send("prompt", { message: "/implement web" });
+	await scoped.send("prompt", { message: "/smoke-reload" });
+	await scoped.state("implement", true);
+	assert.match(scoped.events.findLast((event) => event.statusKey === "session-mode-leases").statusText, /^leases:2/);
+	const webMetadata = JSON.parse(await readFile(join(runtimeDir, `pi-session-guard-${process.getuid()}`, `${lockIdentity(join(workDir, "web"))}.json`), "utf8"));
+	assert.equal(webMetadata.parentPid, scoped.child.pid);
+	process.kill(webMetadata.pid, "SIGTERM");
+	const scopeLossDeadline = Date.now() + 5000;
+	while (!scoped.events.some((event) => event.statusKey === "session-mode" && /lost/.test(event.statusText ?? "")) && Date.now() < scopeLossDeadline) await delay(20);
+	await scoped.state("lost", false);
+	await scoped.send("prompt", { message: "/plan" });
+	await proveFree(join(workDir, "api"));
+	await proveFree(join(workDir, "web"));
+	await overlap.send("prompt", { message: "/implement web" });
+	await overlap.state("implement", true);
+	await overlap.send("prompt", { message: "/leases" });
+	assert.ok(overlap.events.some((event) => event.method === "notify" && event.message.includes('"held":') && event.message.includes("web")));
+	await scoped.stop(); await peer.stop(); await overlap.stop();
+	await proveFree(join(workDir, "web"));
+	console.log("Scoped RPC: disjoint roots, no implicit cwd lease, overlap, retained prior scope, additive acquisition, v2 reload, whole-set loss and read-only diagnostics: PASS");
 	for (const client of clients) {
 		assert.equal(client.events.some((event) => event.type === "agent_start" || event.type === "extension_error"), false, "unexpected model turn or extension error");
 		assert.doesNotMatch(client.stderr, /Failed to load extension/);

@@ -21,6 +21,84 @@ async function gitRepo(): Promise<{ repo: string; runtimeDir: string; cleanup: (
 	return { repo, runtimeDir, cleanup: () => rm(root, { recursive: true, force: true }) };
 }
 
+test("release force-terminates a stopped holder before returning", async () => {
+	const fixture = await gitRepo();
+	try {
+		const lease = await acquireWorktreeLease(fixture.repo, { runtimeDir: fixture.runtimeDir });
+		assert.equal(lease.kind, "held");
+		if (lease.kind !== "held") return;
+		process.kill(lease.holderPid, "SIGSTOP");
+		let rescued = false;
+		const rescue = setTimeout(() => { rescued = true; try { process.kill(lease.holderPid, "SIGKILL"); } catch {} }, 2500);
+		try { await lease.release(); }
+		finally { clearTimeout(rescue); }
+		assert.equal(rescued, false, "release did not terminate its stopped holder");
+		const next = await acquireWorktreeLease(fixture.repo, { runtimeDir: fixture.runtimeDir });
+		try { assert.equal(next.kind, "held"); }
+		finally { if (next.kind === "held") await next.release(); }
+	} finally { await fixture.cleanup(); }
+});
+
+test("identity mismatch is rejected before taking a kernel lease", async () => {
+	const fixture = await gitRepo();
+	try {
+		const result = await acquireWorktreeLease(fixture.repo, { runtimeDir: fixture.runtimeDir, expectedRoot: "/different-root" });
+		try { assert.equal(result.kind, "unguarded"); }
+		finally { if (result.kind === "held") await result.release(); }
+	} finally { await fixture.cleanup(); }
+});
+
+test("pre-cancelled acquisition creates no holder", async () => {
+	const fixture = await gitRepo();
+	try {
+		const controller = new AbortController();
+		controller.abort();
+		const result = await acquireWorktreeLease(fixture.repo, { runtimeDir: fixture.runtimeDir, signal: controller.signal });
+		try { assert.equal(result.kind, "unguarded"); }
+		finally { if (result.kind === "held") await result.release(); }
+	} finally { await fixture.cleanup(); }
+});
+
+test("cancels a pending handshake and drains its kernel holder", async () => {
+	const fixture = await gitRepo();
+	let started!: () => void;
+	let finishWrite!: () => void;
+	const writing = new Promise<void>((resolve) => { started = resolve; });
+	const gate = new Promise<void>((resolve) => { finishWrite = resolve; });
+	try {
+		const controller = new AbortController();
+		const pending = acquireWorktreeLease(fixture.repo, {
+			runtimeDir: fixture.runtimeDir,
+			signal: controller.signal,
+			writeMetadata: async () => { started(); await gate; },
+		});
+		await writing;
+		controller.abort();
+		const result = await pending;
+		assert.equal(result.kind, "unguarded");
+		if (result.kind === "unguarded") assert.match(result.detail ?? "", /cancelled/);
+		const next = await acquireWorktreeLease(fixture.repo, { runtimeDir: fixture.runtimeDir });
+		try { assert.equal(next.kind, "held"); }
+		finally { if (next.kind === "held") await next.release(); }
+	} finally { finishWrite(); await fixture.cleanup(); }
+});
+
+test("a ready lease exposes live validity and ignores later acquisition cancellation", async () => {
+	const fixture = await gitRepo();
+	try {
+		const controller = new AbortController();
+		const lease = await acquireWorktreeLease(fixture.repo, { runtimeDir: fixture.runtimeDir, signal: controller.signal });
+		assert.equal(lease.kind, "held");
+		if (lease.kind !== "held") return;
+		try {
+			assert.equal(lease.alive, true);
+			controller.abort();
+			assert.equal(lease.alive, true);
+		} finally { await lease.release(); }
+		assert.equal(lease.alive, false);
+	} finally { await fixture.cleanup(); }
+});
+
 test("uses one stable identity for canonical and symlinked worktree paths", async () => {
 	const fixture = await gitRepo();
 	try {
