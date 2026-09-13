@@ -69,6 +69,24 @@ test("explicit child scopes escape root contention and reject unleased native wr
 	assert.match(child.statuses.get("session-mode-leases"), /^leases:1/);
 }));
 
+test("initial contention remains guarded with absent or malformed holder metadata", async () => fixture(async (root, start) => {
+	const holder = await start({});
+	const metadataPath = join(root, "runtime", `${lockIdentity(root)}.json`);
+	for (const metadata of [undefined, "not json", JSON.stringify({ pid: -1, sessionId: "untrusted-holder", root: "wrong-root" })]) {
+		if (metadata === undefined) await rm(metadataPath, { force: true });
+		else await writeFile(metadataPath, metadata);
+		const contender = await start({});
+		assert.equal(contender.controller.state, "implement-blocked");
+		assert.deepEqual(contender.controller.roots, []);
+		assert.equal(contender.pi.tools.includes("write"), false);
+		assert.match(contender.notices.at(-1), /another live session/);
+		assert.doesNotMatch(contender.notices.at(-1), /retained|untrusted-holder|wrong-root|pid/);
+		assert.ok(contender.notices.at(-1).includes(root));
+		assert.equal(holder.controller.state, "implement");
+		assert.deepEqual(holder.controller.roots, [root]);
+	}
+}));
+
 test("additions preserve existing leases on conflict and /plan clears all selections", async () => fixture(async (root, start) => {
 	const a = await start(), b = await start();
 	await a.command("implement", "api");
@@ -77,6 +95,9 @@ test("additions preserve existing leases on conflict and /plan clears all select
 	assert.equal(a.controller.state, "implement");
 	assert.deepEqual(a.controller.roots, [join(root, "api")]);
 	assert.match(a.notices.at(-1), /web/);
+	assert.match(a.notices.at(-1), /another live session/);
+	assert.match(a.notices.at(-1), /Existing valid leases are retained/);
+	assert.doesNotMatch(a.notices.at(-1), /writes remain guarded|"holder"|"sessionId"/);
 	await b.command("plan");
 	await a.command("implement", "web");
 	assert.deepEqual(a.controller.roots, [join(root, "api"), join(root, "web")]);
@@ -124,6 +145,9 @@ test("an unavailable safe checkpoint stays guarded without recursive save retrie
 	assert.equal(session.controller.state, "plan");
 	assert.equal(saves, 1);
 	assert.ok(session.notices.some((message: string) => message.includes("could not be saved")));
+	assert.doesNotMatch(session.notices.at(-1), /retained|another live session/);
+	assert.match(session.notices.at(-1), /"kind":"invalid"/);
+	assert.match(session.notices.at(-1), /writes remain guarded/);
 }));
 
 test("lease diagnostics escape terminal control characters", async () => fixture(async (_root, start) => {
@@ -152,9 +176,13 @@ test("scoped startup and restoration remain guarded on invalid input or changed 
 	const invalid = await start({ "lease-roots": "[]" });
 	assert.equal(invalid.controller.state, "plan");
 	assert.deepEqual(invalid.acquired, []);
+	assert.match(invalid.notices.at(-1), /nonempty literal worktree paths/);
+	assert.doesNotMatch(invalid.notices.at(-1), /retained|another live session/);
 	const moved = await start({}, [{ type: "custom", customType: "session-mode", data: { version: 2, mode: "implement", scope: { kind: "roots", roots: [join(root, "api")], originCwd: "/elsewhere" } } }]);
 	assert.equal(moved.controller.state, "plan");
 	assert.deepEqual(moved.acquired, []);
+	assert.match(moved.notices.at(-1), /origin cwd changed/);
+	assert.doesNotMatch(moved.notices.at(-1), /retained|another live session/);
 	const scoped = await start({ "lease-roots": '["web"]' });
 	assert.equal(scoped.controller.state, "implement");
 	assert.deepEqual(scoped.controller.roots, [join(root, "web")]);

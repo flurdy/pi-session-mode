@@ -16,6 +16,8 @@ Explicit paths must identify existing worktree roots or their symlink aliases. S
 
 `--plan` wins as a per-launch guarded override; use `/plan` to clear saved selection. Successful explicit startup roots and `--implement` selections are checkpointed for later restoration. Explicit startup roots replace restored selection; explicit `--implement` without roots selects cwd. The existing `pl` picker can select plan mode, followed by scoped `/implement` commands; it does not need to discover workspace topology.
 
+`/new` starts an empty session rather than inheriting interactive `/plan` selection. Without an explicit startup override, it attempts the cwd lease. If another live session holds that worktree, the replacement stays guarded in `conflict`; the warning identifies the root without exposing holder metadata. Use `/leases` to inspect, `/plan` for read-only work, or `/implement <root>` for a disjoint worktree. A failed addition reports retained leases only when a healthy prior set remains.
+
 Two plain workspace-root implementation sessions still contend. To work concurrently, choose disjoint member scopes. Workspace files require the workspace lease; tracking-only local Beads operations remain permitted without it. A Beads store identifies tracking ownership, not every source repository a task needs.
 
 ## Kernel authority and transitions

@@ -143,7 +143,14 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 			}
 			setState(ctx, typeof result !== "string" && result.kind === "contended" ? "implement-blocked" : "plan");
 		}
-		notify(ctx, `Scope acquisition failed: ${JSON.stringify(lastFailure)}. Existing valid leases are retained.`, "error");
+		const authority = leases.live ? "Existing valid leases are retained." : "No worktree leases are held; writes remain guarded.";
+		if (typeof result !== "string" && result.kind === "contended") {
+			const escapedRoot = safeDisplay(result.root);
+			const root = JSON.stringify(escapedRoot.length > 1000 ? `${escapedRoot.slice(0, 970)} … (truncated)` : escapedRoot);
+			notify(ctx, `Worktree ${root} is held by another live session. ${authority} Use /leases to inspect, /plan for read-only work, or /implement <root> for a disjoint worktree.`, "warning");
+		} else {
+			notify(ctx, `Scope acquisition failed: ${JSON.stringify(lastFailure)}. ${authority}`, "error");
+		}
 	}
 
 	function enterImplement(ctx: ExtensionContext, paths?: string[], persist = false, expected?: { roots: readonly string[]; originCwd: string }): Promise<void> {

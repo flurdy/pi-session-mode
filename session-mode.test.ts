@@ -14,9 +14,10 @@ class FakePi {
 	activeTools = ["read", "bash", "edit", "write", "questionnaire", "subagent"];
 	planFlag = false;
 	implementFlag = false;
+	leaseRootsFlag: string | undefined;
 
 	registerFlag(): void {}
-	getFlag(name: string): boolean { return name === "plan" ? this.planFlag : name === "implement" ? this.implementFlag : false; }
+	getFlag(name: string): boolean | string | undefined { return name === "plan" ? this.planFlag : name === "implement" ? this.implementFlag : this.leaseRootsFlag; }
 	on(name: string, handler: Handler): void { this.handlers.set(name, [...(this.handlers.get(name) ?? []), handler]); }
 	registerCommand(name: string, command: { handler: Handler }): void { this.commands.set(name, command); }
 	getActiveTools(): string[] { return [...this.activeTools]; }
@@ -91,6 +92,107 @@ test("defaults to implement and acquires before reporting write authority", asyn
 	assert.equal(controller.state, "implement");
 	assert.equal(ctx.statuses.at(-1), "implement");
 	assert.deepEqual(pi.activeTools, ["read", "bash", "edit", "write", "questionnaire", "subagent"]);
+});
+
+test("fresh initial contention explains the held root without exposing holder metadata", async (t) => {
+	for (const holder of [undefined, { root: "/canonical/repo", pid: 987654, parentPid: 987653, sessionId: "private-holder-session", startedAt: "private-start-time" }]) {
+		await t.test(holder ? "with holder metadata" : "without holder metadata", async () => {
+			const { pi, controller } = harness([{ kind: "contended", root: "/canonical/repo", holder }]);
+			const ctx = context();
+			await pi.emit("session_start", ctx);
+			assert.equal(controller.state, "implement-blocked");
+			assert.equal(controller.mode, "implement");
+			assert.deepEqual(controller.roots, []);
+			assert.deepEqual(pi.appended, []);
+			assert.equal(pi.activeTools.includes("write"), false);
+			assert.equal(pi.activeTools.includes("edit"), false);
+			const notice = ctx.notifications.at(-1)!;
+			assert.equal(notice.level, "warning");
+			assert.match(notice.message, /Worktree "\/canonical\/repo" is held by another live session/);
+			assert.match(notice.message, /writes remain guarded/);
+			for (const action of ["/leases", "/plan", "/implement"]) assert.ok(notice.message.includes(action));
+			assert.doesNotMatch(notice.message, /retained|Scope acquisition failed|private-holder-session|private-start-time|98765|"holder"/);
+			await pi.commands.get("leases")?.handler("", ctx);
+			const diagnostics = JSON.parse(ctx.notifications.at(-1)!.message);
+			assert.equal(diagnostics.lastFailure.result.kind, "contended");
+			assert.equal(diagnostics.lastFailure.result.holder?.sessionId, holder?.sessionId);
+		});
+	}
+});
+
+test("contention roots are terminal-safe and bounded without hiding recovery guidance", async (t) => {
+	for (const root of ["/repo\u001b[31m\u009b\n", `/repo\u001b${"x".repeat(20_000)}`]) {
+		await t.test(root.length > 1000 ? "oversized root" : "control characters", async () => {
+			const { pi } = harness([{ kind: "contended", root }]);
+			const ctx = context();
+			await pi.emit("session_start", ctx);
+			const message = ctx.notifications.at(-1)!.message;
+			assert.doesNotMatch(message, /[\u0000-\u001f\u007f-\u009f]/);
+			assert.ok(message.includes("\\u001b"));
+			assert.ok(message.length < 2000);
+			if (root.length > 1000) assert.match(message, /truncated/);
+			assert.match(message, /writes remain guarded/);
+			for (const action of ["/leases", "/plan", "/implement"]) assert.ok(message.includes(action));
+		});
+	}
+});
+
+test("non-contention acquisition failures stay errors without claiming retained leases", async () => {
+	const { pi, controller } = harness([], { acquireLease: async () => { throw new Error("identity lookup failed"); } });
+	const ctx = context();
+	await pi.emit("session_start", ctx);
+	assert.equal(controller.state, "plan");
+	assert.equal(pi.activeTools.includes("write"), false);
+	const notice = ctx.notifications.at(-1)!;
+	assert.equal(notice.level, "error");
+	assert.match(notice.message, /"kind":"invalid"/);
+	assert.match(notice.message, /identity lookup failed/);
+	assert.match(notice.message, /writes remain guarded/);
+	assert.doesNotMatch(notice.message, /retained|another live session/);
+});
+
+test("unavailable explicit scopes stay guarded while legacy implicit failures remain unguarded", async (t) => {
+	for (const reason of ["git-unavailable", "flock-unavailable", "lease-error"] as const) {
+		await t.test(reason, async () => {
+			const explicit = harness([{ kind: "unguarded", reason, detail: "diagnostic detail" }]);
+			const ctx = context();
+			ctx.cwd = process.cwd();
+			explicit.pi.leaseRootsFlag = JSON.stringify([ctx.cwd]);
+			await explicit.pi.emit("session_start", ctx);
+			assert.equal(explicit.controller.state, "plan");
+			assert.equal(explicit.pi.activeTools.includes("write"), false);
+			assert.deepEqual(explicit.controller.roots, []);
+			const notice = ctx.notifications.at(-1)!;
+			assert.equal(notice.level, "error");
+			assert.ok(notice.message.includes(reason));
+			assert.match(notice.message, /diagnostic detail/);
+			assert.match(notice.message, /writes remain guarded/);
+			assert.doesNotMatch(notice.message, /retained|another live session/);
+			const implicit = harness([{ kind: "unguarded", reason }]);
+			const implicitContext = context();
+			await implicit.pi.emit("session_start", implicitContext);
+			assert.equal(implicit.controller.state, "unguarded");
+			assert.equal(implicit.pi.activeTools.includes("write"), true);
+			assert.equal(implicitContext.notifications.at(-1)!.message, `Session guard unavailable (${reason}). This session is unguarded.`);
+		});
+	}
+});
+
+test("fresh replacement does not inherit outgoing interactive plan selection", async () => {
+	const outgoing = harness([]);
+	const planBranch = [{ type: "custom", customType: "session-mode", data: { version: 2, mode: "plan" } }];
+	const oldContext = context(planBranch);
+	await outgoing.pi.emit("session_start", oldContext);
+	assert.equal(outgoing.controller.state, "plan");
+	await outgoing.pi.emit("session_shutdown", oldContext);
+	assert.deepEqual(outgoing.acquisitions, []);
+	const replacement = harness([{ kind: "contended", root: "/repo" }]);
+	const newContext = context();
+	await replacement.pi.emit("session_start", newContext);
+	assert.deepEqual(replacement.acquisitions, ["acquire"]);
+	assert.equal(replacement.controller.state, "implement-blocked");
+	assert.match(newContext.notifications.at(-1)!.message, /another live session/);
+	assert.doesNotMatch(newContext.notifications.at(-1)!.message, /retained/);
 });
 
 test("implicit cwd contention retains implementation intent for a later restore", async () => {
@@ -469,7 +571,8 @@ test("contention and holder loss use the same guarded tool path", async () => {
 	await contended.pi.emit("session_start", contendedContext);
 	assert.equal(contended.controller.state, "implement-blocked");
 	assert.equal(contended.pi.activeTools.includes("write"), false);
-	assert.match(contendedContext.notifications.at(-1)?.message ?? "", /other/);
+	assert.match(contendedContext.notifications.at(-1)?.message ?? "", /another live session/);
+	assert.doesNotMatch(contendedContext.notifications.at(-1)?.message ?? "", /"sessionId"/);
 
 	let lose: (() => void) | undefined;
 	const lostLease: HeldWorktreeLease = {
