@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { HeldWorktreeLease, WorktreeLeaseResult } from "./lease.ts";
+import type { FileLeaseResult, HeldWorktreeLease, WorktreeLeaseResult } from "./lease.ts";
+import type { PackageActivationEvidence, PackageActivationRequest, PreparedPackageActivation } from "./package-activation.ts";
 import { registerSessionMode, type SessionModeDependencies } from "./session-mode.ts";
 
 type Handler = (event: any, context: any) => unknown;
@@ -8,6 +9,7 @@ type Handler = (event: any, context: any) => unknown;
 class FakePi {
 	readonly handlers = new Map<string, Handler[]>();
 	readonly commands = new Map<string, { handler: Handler }>();
+	readonly tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
 	readonly appended: Array<{ type: string; data: unknown }> = [];
 	readonly activeToolHistory: string[][] = [];
 	readonly execCalls: string[][] = [];
@@ -20,6 +22,7 @@ class FakePi {
 	getFlag(name: string): boolean | string | undefined { return name === "plan" ? this.planFlag : name === "implement" ? this.implementFlag : this.leaseRootsFlag; }
 	on(name: string, handler: Handler): void { this.handlers.set(name, [...(this.handlers.get(name) ?? []), handler]); }
 	registerCommand(name: string, command: { handler: Handler }): void { this.commands.set(name, command); }
+	registerTool(tool: { name: string; execute: (...args: any[]) => Promise<any> }): void { this.tools.set(tool.name, tool); }
 	getActiveTools(): string[] { return [...this.activeTools]; }
 	setActiveTools(names: string[]): void { this.activeTools = [...names]; this.activeToolHistory.push([...names]); }
 	appendEntry(type: string, data: unknown): void { this.appended.push({ type, data }); }
@@ -51,6 +54,7 @@ function context(branch: any[] = [], provider = "provider-a") {
 			theme: { fg: (_tone: string, text: string) => text },
 			setStatus: (_key: string, value: string | undefined) => statuses.push(value),
 			notify: (message: string, level?: string) => notifications.push({ message, level }),
+			confirm: async (_title: string, _message: string, _options?: unknown) => true,
 		},
 	};
 	return Object.assign(ctx, { statuses, notifications });
@@ -714,4 +718,207 @@ test("shutdown releases the held lease, restores tools, and clears status", asyn
 	assert.deepEqual(releases, ["release"]);
 	assert.equal(pi.activeTools.includes("write"), true);
 	assert.equal(ctx.statuses.at(-1), undefined);
+});
+
+const activationSource = (version: string) => `git:github.com/flurdy/pi-session-mode${String.fromCharCode(64)}${version}`;
+
+function preparedActivation(): PreparedPackageActivation {
+	return {
+		revision: "a".repeat(64),
+		display: {
+			package: "session-mode",
+			currentSource: activationSource("v0.3.0"),
+			requestedSource: activationSource("v0.4.0"),
+			currentCommit: "1".repeat(40),
+			expectedCommit: "2".repeat(40),
+			settingsPath: "/agent/settings.json",
+			checkoutPath: "/agent/git/github.com/flurdy/pi-session-mode",
+		},
+		snapshot: {} as never,
+	};
+}
+
+function activationOptions(overrides: Partial<NonNullable<SessionModeDependencies["packageActivation"]>> = {}) {
+	const calls: string[] = [];
+	const prepared = preparedActivation();
+	const evidence: PackageActivationEvidence = {
+		package: "session-mode",
+		source: prepared.display.requestedSource,
+		commit: prepared.display.expectedCommit,
+		version: "0.4.0",
+		verified: true,
+	};
+	const packageActivation: NonNullable<SessionModeDependencies["packageActivation"]> = {
+		prepare: async () => { calls.push("prepare"); return prepared; },
+		activate: async (_request, _prepared, options) => { calls.push("activate"); options?.beforeLaunch?.(); return evidence; },
+		acquireSettingsLease: async () => ({
+			kind: "held", file: prepared.display.settingsPath, holderPid: 321,
+			lost: new Promise(() => undefined), alive: true,
+			async release() { calls.push("release"); },
+		}),
+		...overrides,
+	};
+	return { calls, evidence, packageActivation };
+}
+
+const activationRequest: PackageActivationRequest = {
+	package: "session-mode",
+	version: "v0.4.0",
+	expectedCommit: "2".repeat(40),
+};
+
+test("confirmed TUI activation uses live implementation authority and a serialized settings lease", async () => {
+	const activation = activationOptions();
+	const { pi } = harness([held()], { packageActivation: activation.packageActivation });
+	const ctx = context();
+	let confirmation = "";
+	ctx.ui.confirm = async (_title: string, message: string) => { confirmation = message; return true; };
+	await pi.emit("session_start", ctx);
+	const tool = pi.tools.get("activate_pi_package");
+	assert.ok(tool);
+	const result = await tool.execute("call-1", activationRequest, new AbortController().signal, undefined, ctx);
+	assert.deepEqual(activation.calls, ["prepare", "activate", "release"]);
+	assert.deepEqual(result.details, activation.evidence);
+	assert.match(confirmation, /v0\.3\.0/);
+	assert.match(confirmation, /v0\.4\.0/);
+	assert.match(confirmation, /2222222222222222222222222222222222222222/);
+	assert.match(confirmation, /\/agent\/settings\.json/);
+	assert.match(confirmation, /\/agent\/git\/github\.com\/flurdy\/pi-session-mode/);
+});
+
+test("package activation refuses guarded, headless, declined, stale and contended requests", async (t) => {
+	await t.test("plan mode", async () => {
+		const activation = activationOptions();
+		const { pi } = harness([], { packageActivation: activation.packageActivation });
+		pi.planFlag = true;
+		const ctx = context();
+		await pi.emit("session_start", ctx);
+		await assert.rejects(pi.tools.get("activate_pi_package")!.execute("call", activationRequest, undefined, undefined, ctx), /live implement mode/);
+		assert.deepEqual(activation.calls, []);
+	});
+	await t.test("RPC and headless modes", async () => {
+		for (const mode of ["rpc", "print", "json"]) {
+			const activation = activationOptions();
+			const { pi } = harness([held()], { packageActivation: activation.packageActivation });
+			const ctx = context();
+			ctx.mode = mode;
+			await pi.emit("session_start", ctx);
+			await assert.rejects(pi.tools.get("activate_pi_package")!.execute("call", activationRequest, undefined, undefined, ctx), /interactive TUI/);
+			assert.deepEqual(activation.calls, []);
+		}
+	});
+	await t.test("conflict and guard bypass", async () => {
+		for (const disabled of [false, true]) {
+			const activation = activationOptions();
+			const { pi } = harness([{ kind: "contended", root: "/repo" }], { packageActivation: activation.packageActivation, isDisabled: () => disabled });
+			const ctx = context();
+			await pi.emit("session_start", ctx);
+			await assert.rejects(pi.tools.get("activate_pi_package")!.execute("call", activationRequest, undefined, undefined, ctx), /live implement mode/);
+			assert.deepEqual(activation.calls, []);
+		}
+	});
+	await t.test("file-only implement", async () => {
+		const activation = activationOptions();
+		const { pi, controller } = harness([], {
+			packageActivation: activation.packageActivation,
+			resolveFiles: async () => ["/config"],
+			acquireFile: async () => ({ kind: "held", file: "/config", holderPid: 123, alive: true, lost: new Promise(() => {}), release: async () => {} }),
+		});
+		pi.planFlag = true;
+		const ctx = context();
+		await pi.emit("session_start", ctx);
+		await pi.commands.get("grant-file")!.handler("/config", ctx);
+		assert.equal(controller.state, "implement");
+		assert.deepEqual(controller.roots, []);
+		await assert.rejects(pi.tools.get("activate_pi_package")!.execute("call", activationRequest, undefined, undefined, ctx), /live implement mode/);
+		assert.deepEqual(activation.calls, []);
+	});
+	await t.test("declined confirmation", async () => {
+		const activation = activationOptions();
+		const { pi } = harness([held()], { packageActivation: activation.packageActivation });
+		const ctx = context();
+		ctx.ui.confirm = async () => false;
+		await pi.emit("session_start", ctx);
+		const result = await pi.tools.get("activate_pi_package")?.execute("call", activationRequest, undefined, undefined, ctx);
+		assert.deepEqual(activation.calls, ["prepare"]);
+		assert.match(result.content[0].text, /cancelled/);
+	});
+	await t.test("authorization changes during confirmation", async () => {
+		const activation = activationOptions();
+		const { pi } = harness([held()], { packageActivation: activation.packageActivation });
+		const ctx = context();
+		ctx.ui.confirm = async () => { ctx.mode = "rpc"; return true; };
+		await pi.emit("session_start", ctx);
+		await assert.rejects(pi.tools.get("activate_pi_package")!.execute("call", activationRequest, undefined, undefined, ctx), /authorization context changed/);
+		assert.deepEqual(activation.calls, ["prepare"]);
+	});
+	await t.test("authorization changes during final preflight", async () => {
+		const activation = activationOptions();
+		const { pi } = harness([held()], { packageActivation: activation.packageActivation });
+		const ctx = context();
+		activation.packageActivation.activate = async (_request, _prepared, options) => {
+			activation.calls.push("activate");
+			ctx.mode = "rpc";
+			options?.beforeLaunch?.();
+			return activation.evidence;
+		};
+		await pi.emit("session_start", ctx);
+		await assert.rejects(pi.tools.get("activate_pi_package")!.execute("call", activationRequest, undefined, undefined, ctx), /during final preflight/);
+		assert.deepEqual(activation.calls, ["prepare", "activate", "release"]);
+	});
+	await t.test("settings lease contention", async () => {
+		const activation = activationOptions({
+			acquireSettingsLease: async (): Promise<FileLeaseResult> => ({ kind: "contended", file: "/agent/settings.json" }),
+		});
+		const { pi } = harness([held()], { packageActivation: activation.packageActivation });
+		const ctx = context();
+		await pi.emit("session_start", ctx);
+		await assert.rejects(pi.tools.get("activate_pi_package")!.execute("call", activationRequest, undefined, undefined, ctx), /already running/);
+		assert.deepEqual(activation.calls, ["prepare"]);
+	});
+});
+
+test("shutdown drains an installer already launched before releasing session leases", async () => {
+	let started!: () => void, finish!: () => void;
+	const launching = new Promise<void>((resolve) => { started = resolve; });
+	const pending = new Promise<void>((resolve) => { finish = resolve; });
+	const releases: string[] = [];
+	const activation = activationOptions();
+	activation.packageActivation.activate = async (_request, _prepared, options) => {
+		options?.beforeLaunch?.();
+		started();
+		await pending;
+		return activation.evidence;
+	};
+	const { pi } = harness([held(releases)], { packageActivation: activation.packageActivation });
+	const ctx = context();
+	await pi.emit("session_start", ctx);
+	const running = pi.tools.get("activate_pi_package")!.execute("call", activationRequest, undefined, undefined, ctx);
+	await launching;
+	let stopped = false;
+	const stopping = pi.emit("session_shutdown", ctx).then(() => { stopped = true; });
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	const premature = stopped || releases.length > 0;
+	finish();
+	await Promise.all([running, stopping]);
+	assert.equal(premature, false);
+	assert.deepEqual(releases, ["release"]);
+	assert.deepEqual(activation.calls, ["prepare", "release"]);
+});
+
+test("concurrent activation calls are rejected before duplicate confirmation", async () => {
+	let confirmFirst!: (value: boolean) => void;
+	const waiting = new Promise<boolean>((resolve) => (confirmFirst = resolve));
+	const activation = activationOptions();
+	const { pi } = harness([held()], { packageActivation: activation.packageActivation });
+	const ctx = context();
+	ctx.ui.confirm = async () => waiting;
+	await pi.emit("session_start", ctx);
+	const tool = pi.tools.get("activate_pi_package")!;
+	const first = tool.execute("first", activationRequest, undefined, undefined, ctx);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	await assert.rejects(tool.execute("second", activationRequest, undefined, undefined, ctx), /already running/);
+	confirmFirst(false);
+	await first;
+	assert.deepEqual(activation.calls, ["prepare"]);
 });

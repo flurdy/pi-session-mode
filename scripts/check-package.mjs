@@ -6,14 +6,14 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const manifest = JSON.parse(readFileSync(resolve(root, "package.json"), "utf8"));
-const runtimeFiles = ["README.md", "docs/guard.md", "file-scope.ts", "index.ts", "lease-observer.ts", "lease-set.ts", "lease.ts", "path.ts", "policy.ts", "scope.ts", "scoped-policy.ts", "selection.ts", "session-mode.ts", "subagent-policy.ts"];
+const runtimeFiles = ["README.md", "docs/guard.md", "docs/package-activation.md", "file-scope.ts", "index.ts", "lease-observer.ts", "lease-set.ts", "lease.ts", "package-activation.ts", "path.ts", "policy.ts", "scope.ts", "scoped-policy.ts", "selection.ts", "session-mode.ts", "subagent-policy.ts"];
 
 assert.ok(manifest.keywords?.includes("pi-package"), "package discovery metadata is required");
 assert.deepEqual(manifest.pi, { extensions: ["./index.ts"] });
 assert.deepEqual(manifest.exports, { "./lease-observer": "./lease-observer.ts" });
 assert.deepEqual([...manifest.files].sort(), runtimeFiles, "runtime allowlist differs");
 assert.equal(manifest.repository?.url, "git+https://github.com/flurdy/pi-session-mode.git");
-assert.deepEqual(manifest.peerDependencies, { "@earendil-works/pi-coding-agent": "*" });
+assert.deepEqual(manifest.peerDependencies, { "@earendil-works/pi-coding-agent": "*", typebox: "*" });
 assert.equal(manifest.devDependencies["@earendil-works/pi-coding-agent"], "0.85.1");
 
 const reports = JSON.parse(execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { cwd: root, encoding: "utf8" }));

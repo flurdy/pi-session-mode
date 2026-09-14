@@ -24,11 +24,13 @@
   "files": [
     "README.md",
     "docs/guard.md",
+    "docs/package-activation.md",
     "file-scope.ts",
     "index.ts",
     "lease-observer.ts",
     "lease-set.ts",
     "lease.ts",
+    "package-activation.ts",
     "path.ts",
     "policy.ts",
     "scope.ts",
@@ -46,12 +48,14 @@
     "verify:dynamic": "node scripts/verify-dynamic.mjs"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.85.1",
     "@types/node": "24.12.0",
     "tsx": "4.20.6",
+    "typebox": "1.3.7",
     "typescript": "5.9.3"
   }
 }

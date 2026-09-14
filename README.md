@@ -30,6 +30,7 @@ For a reviewed mutable checkout, run `make apply`. It owns the existing `~/.pi/a
 - `/grant-file ~/.agents/tool/config.json` resolves exact non-Git files, displays their canonical identities, and requires an interactive confirmation before acquiring them. It can establish file-only implementation mode without leasing cwd; the bounded guarded Bash/subagent policy remains active until a worktree is also leased.
 - `/leases` shows held/requested/failed worktree scopes. `/leases repos/api` inspects that root without acquiring.
 - `/grants` shows held/requested/failed exact-file scopes. `/grants path` resolves that file identity without acquiring it.
+- `activate_pi_package` is an opt-in agent tool for one already-installed allowlisted Pi Git package. It requires live implement state and fresh TUI confirmation, but does not publish or reload. See [confirmed package activation](docs/package-activation.md).
 - `pi --implement --lease-roots '["repos/api","repos/web"]'` selects explicit startup roots. `--plan` wins; explicit startup flags override saved selection.
 - `PI_SESSION_GUARD=0` is the explicit, visibly unguarded emergency bypass.
 

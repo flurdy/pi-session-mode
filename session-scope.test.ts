@@ -20,6 +20,7 @@ class Pi {
 	registerFlag() {}
 	getFlag(name: string) { return this.flags.get(name); }
 	registerCommand(name: string, value: { handler: Handler }) { this.commands.set(name, value); }
+	registerTool() {}
 	on(name: string, value: Handler) { this.handlers.set(name, value); }
 	getActiveTools() { return [...this.tools]; }
 	setActiveTools(tools: string[]) { this.toolChanges++; this.tools = tools; }

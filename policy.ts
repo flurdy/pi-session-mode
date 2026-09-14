@@ -2,6 +2,7 @@ const GUARDED_TOOL_REASONS = new Map<string, string>([
 	["edit", "Guarded session: direct file edits are disabled. Switch to /implement after acquiring the worktree lease."],
 	["write", "Guarded session: direct file writes are disabled. Switch to /implement after acquiring the worktree lease."],
 	["powershell", "Guarded session: PowerShell commands are disabled. Switch to /implement after acquiring the worktree lease."],
+	["activate_pi_package", "Guarded session: Pi package activation requires live implement mode with a held worktree lease."],
 ]);
 
 const READ_ONLY_SUBAGENT_ACTIONS = new Set([

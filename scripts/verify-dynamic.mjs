@@ -104,9 +104,12 @@ try {
 	const first = await launch("first"), peer = await launch("peer", ["--lease-roots", JSON.stringify([repos.web])]);
 	await first.roots([work]); await peer.roots([repos.web]);
 	const tools = (await first.snapshot()).tools;
+	assert.ok(tools.includes("activate_pi_package"));
+	let results = await first.turn("activation-rpc-denied", [{ name: "activate_pi_package", arguments: { package: "session-mode", version: "v0.4.0", expectedCommit: "2".repeat(40) } }]);
+	assert.equal(results.length, 1); assert.equal(results[0].isError, true);
 	await first.turn("selection-only", []);
 	await first.roots([work]);
-	let results = await first.turn("native-write", [write("repos/api/new")]);
+	results = await first.turn("native-write", [write("repos/api/new")]);
 	assert.equal(results.length, 1); assert.equal(results[0].isError, false);
 	assert.equal(await readFile(join(repos.api, "new"), "utf8"), "fixture");
 	await first.roots([work, repos.api]);
@@ -155,7 +158,7 @@ try {
 	for (const call of calls) assert.equal(resultsInSession.filter((entry) => entry.message.toolCallId === call.id).length, 1, `Unpaired ${call.id}`);
 	const locks = JSON.parse(execFileSync("lslocks", ["--json", "--output", "PATH"], { encoding: "utf8" }));
 	assert.equal((locks.locks ?? []).some((row) => row.path?.startsWith(runtime)), false);
-	console.log("Dynamic RPC PASS: real Pi native write/edit, atomic wrapper, sibling preflights, contention, cancellation, v2 in-turn persistence and reload, paired tool results, unchanged active tools, selection-only no-op, guarded rejection, clean shutdown. Scripted fixture only; no external model requests.");
+	console.log("Dynamic RPC PASS: real Pi native write/edit, atomic wrapper, sibling preflights, contention, cancellation, v2 in-turn persistence and reload, paired tool results, unchanged active tools, selection-only no-op, guarded rejection, RPC package-activation denial, clean shutdown. Scripted fixture only; no external model requests.");
 } finally {
 	for (const client of clients) await client.stop();
 	await rm(base, { recursive: true, force: true });

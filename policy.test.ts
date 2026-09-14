@@ -6,6 +6,7 @@ test("blocks direct writes while leaving reads available", () => {
 	assert.match(guardedToolBlockReason("edit") ?? "", /guarded session/i);
 	assert.match(guardedToolBlockReason("write") ?? "", /guarded session/i);
 	assert.match(guardedToolBlockReason("powershell") ?? "", /guarded session/i);
+	assert.match(guardedToolBlockReason("activate_pi_package") ?? "", /guarded session/i);
 	assert.equal(guardedToolBlockReason("read"), undefined);
 	assert.equal(guardedToolBlockReason("jira_issue"), undefined);
 });

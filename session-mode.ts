@@ -1,10 +1,12 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { realpath } from "node:fs/promises";
 import { isAbsolute, relative, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { acquireFileLease, acquireWorktreeLease, type FileLeaseResult, type WorktreeLeaseResult } from "./lease.ts";
 import { LeaseSet, type HeldScopes, type LeaseSetResult, type ScopeSetRequest } from "./lease-set.ts";
 import { probeWorktreeLeaseOccupancies } from "./lease-observer.ts";
+import { defaultPackageActivationDependencies, activatePreparedPackage, preparePackageActivation, type PackageActivationEvidence, type PackageActivationLaunchOptions, type PackageActivationRequest, type PreparedPackageActivation } from "./package-activation.ts";
 import { guardedToolBlockReason } from "./policy.ts";
 import { scopedWriteBlockReason } from "./scoped-policy.ts";
 import { resolveExplicitFiles } from "./file-scope.ts";
@@ -14,12 +16,18 @@ import { verifiedReadOnlySubagents } from "./subagent-policy.ts";
 
 export type SessionMode = "implement" | "plan";
 export type SessionGuardState = "acquiring" | "implement" | "plan" | "implement-blocked" | "lost" | "unguarded";
+export interface PackageActivationAdapter {
+	prepare(request: PackageActivationRequest, signal?: AbortSignal): Promise<PreparedPackageActivation>;
+	activate(request: PackageActivationRequest, prepared: PreparedPackageActivation, options?: PackageActivationLaunchOptions): Promise<PackageActivationEvidence>;
+	acquireSettingsLease(file: string, options: { sessionId: string; signal?: AbortSignal; expectedFile?: string }): Promise<FileLeaseResult>;
+}
 export interface SessionModeDependencies {
 	acquireLease(cwd: string, options: { sessionId: string; signal?: AbortSignal; expectedRoot?: string }): Promise<WorktreeLeaseResult>;
 	acquireFile?(file: string, options: { sessionId: string; signal?: AbortSignal; expectedFile?: string }): Promise<FileLeaseResult>;
 	resolveFiles?(paths: string[], cwd: string, signal?: AbortSignal): Promise<string[]>;
 	isDisabled(): boolean;
 	readOnlySubagents(cwd: string, preferredProvider?: string): Promise<ReadonlySet<string>>;
+	packageActivation?: PackageActivationAdapter;
 }
 export interface SessionModeController {
 	readonly mode: SessionMode;
@@ -72,7 +80,16 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	let currentContext: ExtensionContext | undefined;
 	let implementation: Implementation | undefined;
 	let dynamicAcquisition: symbol | undefined;
+	let packageActivationOperation: symbol | undefined;
+	let packageActivationDrain: Promise<void> | undefined;
 	let lastFailure: { requested: readonly string[]; result: LeaseSetResult | string } | undefined;
+	let activationDependencies: ReturnType<typeof defaultPackageActivationDependencies> | undefined;
+	const defaultActivationDependencies = () => activationDependencies ??= defaultPackageActivationDependencies();
+	const packageActivation: PackageActivationAdapter = dependencies.packageActivation ?? {
+		prepare: (request, signal) => preparePackageActivation(request, defaultActivationDependencies(), signal),
+		activate: (request, prepared, options) => activatePreparedPackage(request, prepared, defaultActivationDependencies(), options),
+		acquireSettingsLease: (file, options) => acquireFileLease(file, options),
+	};
 	const leases = new LeaseSet(dependencies.acquireLease, resolveExplicitRoots, () => {
 		generation++;
 		mode = "plan";
@@ -388,6 +405,84 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		},
 	});
 
+	pi.registerTool({
+		name: "activate_pi_package",
+		label: "Activate Pi Package",
+		description: "Update one already-installed, allowlisted user-level Pi Git package to an exact published version tag after verifying its expected commit and obtaining fresh TUI confirmation. This does not publish or reload anything.",
+		promptSnippet: "Activate one reviewed, already-installed Pi Git package with explicit confirmation",
+		promptGuidelines: ["Use activate_pi_package only after the user has separately published and verified the exact version tag and commit. Never use it for first installation, npm packages, project packages, branches, or reloads."],
+		parameters: Type.Object({
+			package: Type.String({ description: "Exact key from the user-owned package activation allowlist" }),
+			version: Type.String({ description: "Strict version tag such as v0.4.0" }),
+			expectedCommit: Type.String({ description: "Expected lowercase full 40-character commit SHA" }),
+		}, { additionalProperties: false }),
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			if (packageActivationOperation) throw new Error("Another Pi package activation is already running");
+			if (ctx.mode !== "tui" || !ctx.hasUI) throw new Error("Pi package activation requires interactive TUI confirmation");
+			const ticket = generation;
+			const sessionId = ctx.sessionManager.getSessionId();
+			const eligible = () => {
+				try {
+					return current(ticket)
+						&& currentContext?.sessionManager.getSessionId() === sessionId
+						&& ctx.sessionManager.getSessionId() === sessionId
+						&& ctx.mode === "tui" && ctx.hasUI
+						&& state === "implement" && leases.live && leases.roots.length > 0
+						&& !dependencies.isDisabled() && !implementation && !dynamicAcquisition && !signal?.aborted;
+				} catch { return false; }
+			};
+			if (!eligible()) throw new Error("Pi package activation requires live implement mode with a held worktree lease and no scope transition");
+			const operation = Symbol("package-activation");
+			packageActivationOperation = operation;
+			let finishActivation!: () => void;
+			packageActivationDrain = new Promise<void>((done) => { finishActivation = done; });
+			let settingsLease: Extract<FileLeaseResult, { kind: "held" }> | undefined;
+			try {
+				const request: PackageActivationRequest = {
+					package: params.package,
+					version: params.version,
+					expectedCommit: params.expectedCommit,
+				};
+				const prepared = await packageActivation.prepare(request, signal);
+				if (!eligible()) throw new Error("Pi package activation authorization context changed before confirmation");
+				const display = prepared.display;
+				const confirmation = [
+					`Package: ${safeDisplay(JSON.stringify(display.package))}`,
+					`Current: ${safeDisplay(JSON.stringify(display.currentSource))}`,
+					`Current commit: ${safeDisplay(display.currentCommit)}`,
+					`Requested: ${safeDisplay(JSON.stringify(display.requestedSource))}`,
+					`Expected commit: ${safeDisplay(display.expectedCommit)}`,
+					`User settings: ${safeDisplay(JSON.stringify(display.settingsPath))}`,
+					`Managed checkout: ${safeDisplay(JSON.stringify(display.checkoutPath))}`,
+					"",
+					"Pi will update this checkout and may execute reviewed package/dependency install scripts. This does not reload the running session.",
+				].join("\n");
+				if (confirmation.length > 10_000) throw new Error("Pi package activation confirmation is too large");
+				const confirmed = await ctx.ui.confirm("Activate pinned Pi package?", confirmation, { timeout: 60_000 });
+				if (!confirmed) return { content: [{ type: "text" as const, text: "Pi package activation cancelled; no activation command was started." }], details: { status: "cancelled" } };
+				if (!eligible()) throw new Error("Pi package activation authorization context changed after confirmation");
+				const acquired = await packageActivation.acquireSettingsLease(display.settingsPath, { sessionId, expectedFile: display.settingsPath, ...(signal ? { signal } : {}) });
+				if (acquired.kind === "contended") throw new Error("Another Pi package activation or exact-file writer is already running");
+				if (acquired.kind !== "held") throw new Error(`Pi package activation settings lease is unavailable (${acquired.reason})`);
+				settingsLease = acquired;
+				if (!eligible() || !settingsLease.alive) throw new Error("Pi package activation authorization context changed before process launch");
+				const beforeLaunch = () => {
+					if (!eligible() || !settingsLease?.alive) throw new Error("Pi package activation authorization context changed during final preflight");
+				};
+				const evidence = await packageActivation.activate(request, prepared, { ...(signal ? { signal } : {}), beforeLaunch });
+				return { content: [{ type: "text" as const, text: JSON.stringify(evidence) }], details: evidence };
+			} catch (error) {
+				throw new Error(safeDisplay(String(error)).slice(0, 4000));
+			} finally {
+				try { await settingsLease?.release(); }
+				finally {
+					if (packageActivationOperation === operation) { packageActivationOperation = undefined; packageActivationDrain = undefined; }
+					finishActivation();
+				}
+			}
+		},
+	});
+
 	async function acquireWriteTargets(tool: string, input: unknown, ctx: ExtensionContext): Promise<string | undefined> {
 		if (!["edit", "write", "multi_tool_use.parallel"].includes(tool) || leases.roots.length === 0 || dependencies.isDisabled()) return;
 		if (dynamicAcquisition || (implementation && current(implementation.generation))) return "Another scope acquisition is busy; write blocked.";
@@ -496,6 +591,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	});
 	pi.on("session_shutdown", async (_event, ctx) => {
 		shuttingDown = true; generation++; guardTools();
+		await packageActivationDrain;
 		await leases.releaseAll();
 		resetDiscovery(); restoreTools();
 		try { ctx.ui.setStatus("session-mode-leases", undefined); ctx.ui.setStatus("session-mode-grants", undefined); ctx.ui.setStatus("session-mode", undefined); ctx.ui.setWidget("session-mode-grants", undefined); } catch { /* Teardown is already complete. */ }

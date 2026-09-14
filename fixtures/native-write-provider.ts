@@ -3,7 +3,7 @@ import { createAssistantMessageEventStream, type AssistantMessage } from "@earen
 import { createEditToolDefinition, createWriteToolDefinition, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-type Call = { name: "write" | "edit" | "multi_tool_use.parallel"; arguments: any };
+type Call = { name: "write" | "edit" | "multi_tool_use.parallel" | "activate_pi_package"; arguments: any };
 export default function (pi: ExtensionAPI) {
 	globalThis.fetch = async () => { throw new Error("Network is forbidden in the native-write fixture"); };
 	pi.registerProvider("lease-fixture", {
