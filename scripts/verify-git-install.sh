@@ -6,7 +6,7 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
 	echo "verify-git-install requires a clean tracked working tree" >&2
 	exit 1
 fi
-git ls-files --error-unmatch package.json >/dev/null
+git ls-files --error-unmatch package.json scripts/verify-dynamic.mjs fixtures/native-write-provider.ts >/dev/null
 commit=$(git rev-parse HEAD)
 mkdir -p "$root/.artifacts"
 temporary_root=$(mktemp -d "$root/.artifacts/git-install.XXXXXX")
@@ -52,4 +52,5 @@ mkdir -p "$agent_dir" "$work_dir"
 installed="$agent_dir/git/localhost/flurdy/pi-session-mode"
 test "$(git -C "$installed" rev-parse HEAD)" = "$commit"
 node "$root/scripts/verify-installed.mjs" "$agent_dir" "$work_dir" "$installed"
+node "$root/scripts/verify-dynamic.mjs" "$installed"
 echo "Immutable Git package and lease lifecycle: PASS ($commit)"

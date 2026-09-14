@@ -74,16 +74,21 @@ export class LeaseSet {
 		);
 	}
 
-	addScopes(request: ScopeSetRequest, cwd: string, sessionId: string, beforeCommit?: (scopes: HeldScopes) => void, expected?: { roots?: readonly string[]; files?: readonly string[] }): Promise<LeaseSetResult> {
+	addScopes(request: ScopeSetRequest, cwd: string, sessionId: string, beforeCommit?: (scopes: HeldScopes) => void, expected?: { roots?: readonly string[]; files?: readonly string[] }, signal?: AbortSignal): Promise<LeaseSetResult> {
+		if (signal?.aborted) return Promise.resolve({ kind: "cancelled" });
 		const key = JSON.stringify([cwd, sessionId, request, expected]);
 		if (this.#operation) return this.#operation.key === key ? this.#operation.promise : Promise.resolve({ kind: "busy" });
 		const priorDrain = this.#drain;
 		const operation: Operation = { key, epoch: ++this.#epoch, controller: new AbortController(), added: new Set(), promise: undefined! };
 		this.#operation = operation;
 		this.#lost = false;
-		const timer = setTimeout(() => operation.controller.abort(), this.options.timeoutMs ?? ADDITION_TIMEOUT_MS);
+		const cancel = () => operation.controller.abort();
+		signal?.addEventListener("abort", cancel, { once: true });
+		if (signal?.aborted) cancel();
+		const timer = setTimeout(cancel, this.options.timeoutMs ?? ADDITION_TIMEOUT_MS);
 		operation.promise = this.execute(operation, request, cwd, sessionId, priorDrain, beforeCommit, expected).finally(() => {
 			clearTimeout(timer);
+			signal?.removeEventListener("abort", cancel);
 			if (this.#operation === operation) this.#operation = undefined;
 		});
 		return operation.promise;

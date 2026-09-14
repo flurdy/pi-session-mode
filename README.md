@@ -1,6 +1,6 @@
 # Pi Session Mode
 
-A [Pi](https://pi.dev) extension for guarded plan mode, explicitly scoped Git-worktree writer leases, and confirmed exact-file grants outside Git. Disjoint repositories and configuration files can be coordinated independently. This is an accidental-change guard, not a sandbox.
+A [Pi](https://pi.dev) extension for guarded plan mode, Git-worktree writer leases with native-write-driven expansion, and confirmed exact-file grants outside Git. Disjoint repositories and configuration files can be coordinated independently. This is an accidental-change guard, not a sandbox.
 
 See [the guard contract](docs/guard.md) for policy, lease lifetime, compatibility, failure behavior, and explicit bypasses.
 
@@ -33,11 +33,13 @@ For a reviewed mutable checkout, run `make apply`. It owns the existing `~/.pi/a
 - `pi --implement --lease-roots '["repos/api","repos/web"]'` selects explicit startup roots. `--plan` wins; explicit startup flags override saved selection.
 - `PI_SESSION_GUARD=0` is the explicit, visibly unguarded emergency bypass.
 
-**Compatibility change in 0.2:** native `edit`/`write` calls require the target's owning worktree lease, including from default cwd-only sessions. A workspace-root lease no longer lets those tools edit linked or nested repositories. Select each target explicitly. Bash/script effects remain outside path enforcement. Legacy non-Git or unavailable implicit-cwd sessions remain visibly `unguarded` and bypass native checks; start in plan mode or select explicit valid roots to obtain protection.
+**Current checkout policy change:** once an implement session holds at least one live worktree lease, native `edit`/`write` preflight can acquire and persist additional canonical target worktrees without another prompt. Linked, nested and sibling repositories still require their own locks; a supported parallel wrapper acquires all missing roots atomically. This replaces the explicit-only expansion policy in released 0.2.1: leases now prevent writer collisions, not accidental targeting of a different repository. Plan, conflict, lost, unguarded and file-only sessions never auto-expand.
+
+Bash/script effects remain outside path enforcement and cannot trigger expansion. Legacy non-Git or unavailable implicit-cwd sessions remain visibly `unguarded`; start in plan mode or explicitly select valid roots to obtain protection.
 
 A failed addition preserves previously held worktree and file scopes. Any lost lease guards the whole session and releases the combined set. File grants are limited to exact regular files with one filesystem link, or one missing leaf beneath an existing canonical parent; directories, missing parents, filesystem-marker-detectable Git ownership or administration, reserved Git marker names, hardlinks, dangling links, and special files fail closed. Marker-less or externally redirected worktrees are not detectable from an ordinary file path and remain outside this cooperative guarantee. Revalidation before every native edit/write catches identity and scope-revision changes.
 
-There is no automatic authority from Beads, prompts, environment variables, project configuration, or model tools; `/grant-file` is interactive-only. There is also no automatic release on completion/idle, individual release, or special cross-repository owner. Narrow a set with `/plan`, then select the desired scopes again. Separate `leases:N` and `grants:N` extension statuses plus `/leases` and `/grants` expose the active identities. A bounded grant widget remains visible even when a custom footer ignores extension statuses.
+Beads claims, prose, reads, environment variables, project configuration, and arbitrary model tools cannot trigger expansion. Only concrete native-write targets in an eligible session do so; `/grant-file` remains interactive-only. There is also no automatic release on completion/idle, individual release, or special cross-repository owner. Narrow a set with `/plan`, then select the desired scopes again. Separate `leases:N` and `grants:N` extension statuses plus `/leases` and `/grants` expose the active identities. A bounded grant widget remains visible even when a custom footer ignores extension statuses.
 
 ## Observer integration
 
@@ -56,7 +58,7 @@ npm ci
 npm run check
 ```
 
-After committing, run `npm run verify:git-install`. It installs the exact local commit through a temporary loopback Git server into an isolated Pi agent directory, verifies commands and real lease lifecycle without a provider request, and checks the exported observer from a scratch consumer. No user installation is modified.
+After committing, run `npm run verify:git-install`. It installs the exact local commit through a temporary loopback Git server into an isolated Pi agent directory, verifies commands and real lease lifecycle, and checks the exported observer from a scratch consumer. It also runs the `verify:dynamic` helper against the installed package using a local scripted provider fixture: actual Pi native tools, contention, cancellation, in-turn persistence and reload, with no external model requests. No user installation is modified.
 
 `make verify-apply` verifies a checkout link; `make check` runs tests, typechecking, and the exact package allowlist. History provenance is recorded in [the extraction record](https://github.com/flurdy/pi-session-mode/blob/main/docs/extraction-history.md).
 

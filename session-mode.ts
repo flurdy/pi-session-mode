@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { realpath } from "node:fs/promises";
+import { isAbsolute, relative, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { acquireFileLease, acquireWorktreeLease, type FileLeaseResult, type WorktreeLeaseResult } from "./lease.ts";
 import { LeaseSet, type HeldScopes, type LeaseSetResult, type ScopeSetRequest } from "./lease-set.ts";
@@ -7,7 +8,7 @@ import { probeWorktreeLeaseOccupancies } from "./lease-observer.ts";
 import { guardedToolBlockReason } from "./policy.ts";
 import { scopedWriteBlockReason } from "./scoped-policy.ts";
 import { resolveExplicitFiles } from "./file-scope.ts";
-import { parseRootArguments, parseRootFlag, resolveExplicitRoots, safeDisplay, scopeStatus } from "./scope.ts";
+import { ADDITION_TIMEOUT_MS, parseRootArguments, parseRootFlag, resolveExplicitRoots, safeDisplay, scopeStatus } from "./scope.ts";
 import { restoreSelection, selectionEntries, selectionFiles, type Selection, type WorktreeSelection } from "./selection.ts";
 import { verifiedReadOnlySubagents } from "./subagent-policy.ts";
 
@@ -70,6 +71,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	let generation = 0, shuttingDown = false;
 	let currentContext: ExtensionContext | undefined;
 	let implementation: Implementation | undefined;
+	let dynamicAcquisition: symbol | undefined;
 	let lastFailure: { requested: readonly string[]; result: LeaseSetResult | string } | undefined;
 	const leases = new LeaseSet(dependencies.acquireLease, resolveExplicitRoots, () => {
 		generation++;
@@ -386,11 +388,71 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		},
 	});
 
+	async function acquireWriteTargets(tool: string, input: unknown, ctx: ExtensionContext): Promise<string | undefined> {
+		if (!["edit", "write", "multi_tool_use.parallel"].includes(tool) || leases.roots.length === 0 || dependencies.isDisabled()) return;
+		if (dynamicAcquisition || (implementation && current(implementation.generation))) return "Another scope acquisition is busy; write blocked.";
+		const operation = Symbol("native-write");
+		dynamicAcquisition = operation;
+		const ticket = generation, revision = leases.revision;
+		const missing = new Set<string>();
+		const abort = ctx.signal;
+		const deadline = AbortSignal.timeout(ADDITION_TIMEOUT_MS);
+		const signal = abort ? AbortSignal.any([abort, deadline]) : deadline;
+		const eligible = () => current(ticket) && state === "implement" && leases.live && leases.roots.length > 0 && !dependencies.isDisabled() && !signal.aborted;
+		const unchanged = () => eligible() && leases.revision === revision;
+		try {
+			const reason = await scopedWriteBlockReason(tool, input, ctx.cwd, leases.roots, { files: leases.files, collectMissingRoots: missing, signal, isCurrent: unchanged });
+			if (reason) return reason;
+			if (!unchanged()) return "Scope changed or tool cancelled during native-write validation; write blocked.";
+			if (!missing.size) return;
+			for (const root of missing) {
+				if (leases.files.some((file) => {
+					const path = relative(root, file);
+					return path === "" || (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path));
+				})) return `Worktree ${safeDisplay(JSON.stringify(root))} overlaps an exact-file grant; reselect scopes explicitly.`;
+			}
+			const originCwd = await realpath(ctx.cwd);
+			if (!unchanged()) return "Scope changed or tool cancelled before acquisition; write blocked.";
+			if (selection.mode !== "implement") return "Implementation selection changed; write blocked.";
+			if (selection.scope.kind === "roots" && selection.scope.originCwd !== originCwd) return "Origin cwd changed; reselect scopes explicitly.";
+			const roots = [...missing].sort();
+			let candidate: Selection = selection;
+			const result = await leases.addScopes(
+				{ worktrees: { kind: "paths", paths: roots.map((root) => pathToFileURL(root).href) }, files: [] },
+				ctx.cwd, ctx.sessionManager.getSessionId(),
+				(scopes) => {
+					if (!unchanged()) throw new Error("Native-write acquisition superseded or cancelled");
+					candidate = selected({ kind: "roots", roots: scopes.roots, originCwd }, scopes);
+					persistSelection(candidate);
+				},
+				{ roots }, signal,
+			);
+			if (result.kind === "held" && current(ticket) && state === "implement" && leases.live) {
+				selection = candidate; lastFailure = undefined;
+				setState(ctx, "implement");
+			}
+			if (!eligible()) return "Scope changed or tool cancelled during acquisition; write blocked.";
+			if (result.kind !== "held") {
+				lastFailure = { requested: roots, result };
+				const detail = result.kind === "contended" && "root" in result
+					? `Worktree ${JSON.stringify(result.root)} is held by another live session`
+					: `${result.kind}${"detail" in result ? `: ${result.detail}` : ""}`;
+				return safeDisplay(`Dynamic lease acquisition blocked for ${boundedScopeList(roots)}: ${detail.slice(0, 2000)}. Existing valid scopes are retained.`);
+			}
+		} catch (error) {
+			return safeDisplay(`Native-write scope acquisition failed for ${boundedScopeList([...missing])}: ${String(error).slice(0, 2000)}. Write blocked.`);
+		} finally {
+			if (dynamicAcquisition === operation) dynamicAcquisition = undefined;
+		}
+	}
+
 	pi.on("tool_call", async (event, ctx) => {
 		if (state === "unguarded") return;
 		if (state === "implement" && leases.live) {
-			const revision = leases.revision;
-			const reason = await scopedWriteBlockReason(event.toolName, event.input, ctx.cwd, leases.roots, { files: leases.files, isCurrent: () => state === "implement" && leases.live && revision === leases.revision });
+			const acquisitionReason = await acquireWriteTargets(event.toolName, event.input, ctx);
+			if (acquisitionReason) return { block: true, reason: acquisitionReason };
+			const ticket = generation, revision = leases.revision;
+			const reason = await scopedWriteBlockReason(event.toolName, event.input, ctx.cwd, leases.roots, { files: leases.files, signal: ctx.signal, isCurrent: () => current(ticket) && state === "implement" && leases.live && revision === leases.revision });
 			if (reason) return { block: true, reason };
 			if (leases.roots.length === 0) {
 				const guardedReason = guardedToolBlockReason(event.toolName, event.input, { readOnlySubagents, allowNativeWrites: true });
@@ -408,7 +470,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	pi.on("before_agent_start", (event) => {
 		if (state === "unguarded") return;
 		const guidance = state === "implement" && leases.live
-			? `Leased worktrees: ${boundedScopeList(leases.roots)}. Exact-file grants: ${boundedScopeList(leases.files)}. Repository changes must stay within the leased worktrees; exact-file grants authorize native edit/write only. File-only sessions retain the bounded guarded shell and subagent policy. Shell/script effects are not automatically scoped. Ask the user to add repository scopes with /implement or exact non-repository files with /grant-file while idle; Beads claims do not grant write authority.`
+			? `Leased worktrees: ${boundedScopeList(leases.roots)}. Exact-file grants: ${boundedScopeList(leases.files)}. ${leases.roots.length ? "Native edit/write calls can acquire and persist their canonical target worktree leases automatically; do not ask for a redundant /implement command for that supported path. Contention or unavailable identity blocks the write." : "File-only sessions cannot auto-acquire worktrees and retain the bounded guarded shell/subagent policy; ask for /implement while idle before repository work."} Exact non-repository files still require explicit /grant-file confirmation. Shell/script effects are not automatically scoped: never use them as a scope-expansion workaround. Reads, Beads claims, prose and subagent requests do not acquire leases.`
 			: "[GUARDED SESSION]\nDo not modify files or repository state. Read-only analysis, ordinary local Beads triage, safe subagent management and verified direct read-only reviewers are allowed. Ask the user to select /implement scopes before source changes.";
 		return { systemPrompt: `${event.systemPrompt}\n\n${guidance}` };
 	});

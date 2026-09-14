@@ -5,12 +5,14 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { acquireFileLease, acquireWorktreeLease, lockIdentity } from "./lease.ts";
 import { registerSessionMode } from "./session-mode.ts";
 
 type Handler = (event: any, ctx: any) => any;
 class Pi {
 	tools = ["read", "bash", "edit", "write"];
+	toolChanges = 0;
 	flags = new Map<string, unknown>();
 	commands = new Map<string, { handler: Handler }>();
 	handlers = new Map<string, Handler>();
@@ -20,7 +22,7 @@ class Pi {
 	registerCommand(name: string, value: { handler: Handler }) { this.commands.set(name, value); }
 	on(name: string, value: Handler) { this.handlers.set(name, value); }
 	getActiveTools() { return [...this.tools]; }
-	setActiveTools(tools: string[]) { this.tools = tools; }
+	setActiveTools(tools: string[]) { this.toolChanges++; this.tools = tools; }
 	appendEntry(customType: string, data: unknown) { this.entries.push({ type: "custom", customType, data }); }
 	async exec() { return { code: 0, stdout: "", stderr: "" }; }
 }
@@ -38,19 +40,23 @@ async function fixture(run: (root: string, start: (flags?: Record<string, unknow
 			const widgets = new Map<string, string[] | undefined>();
 			const notices: string[] = [], acquired: string[] = [], acquiredFiles: string[] = [], confirmations: string[] = [];
 			let confirmResult = true, confirmationHook: () => void | Promise<void> = () => {}, idle = true, pendingMessages = false;
+			let acquireHook: (path: string, signal?: AbortSignal) => void | Promise<void> = () => {};
+			let disabled = false;
 			let fileResolution = (path: string) => path.startsWith("file://") ? fileURLToPath(path) : path;
 			const sessionId = `session-${sessions.length}`;
-			const ctx = { cwd: root, mode: "tui", hasUI: true, isIdle: () => idle, hasPendingMessages: () => pendingMessages, model: { provider: "test" },
+			const ctx = { cwd: root, mode: "tui", hasUI: true, signal: undefined as AbortSignal | undefined, isIdle: () => idle, hasPendingMessages: () => pendingMessages, model: { provider: "test" },
 				sessionManager: { getBranch: () => pi.entries, getSessionId: () => sessionId },
 				ui: { theme: { fg: (_: string, value: string) => value }, setWidget: (key: string, value: string[] | undefined) => widgets.set(key, value), setStatus: (key: string, value: string) => statuses.set(key, value), notify: (text: string) => notices.push(text), confirm: async (_title: string, text: string) => { confirmations.push(text); await confirmationHook(); return confirmResult; } } };
 			const controller = registerSessionMode(pi as never, {
-				acquireLease: async (path, options) => { acquired.push(path); return acquireWorktreeLease(path, { ...options, runtimeDir: join(root, "runtime") }); },
+				acquireLease: async (path, options) => { acquired.push(path); await acquireHook(path, options.signal); return acquireWorktreeLease(path, { ...options, runtimeDir: join(root, "runtime") }); },
 				acquireFile: async (path, options) => { acquiredFiles.push(path); return acquireFileLease(path, { ...options, runtimeDir: join(root, "runtime"), resolveFile: async (file) => file }); },
 				resolveFiles: async (paths) => [...new Set(paths.map(fileResolution))].sort(),
-				isDisabled: () => false, readOnlySubagents: async () => new Set(),
+				isDisabled: () => disabled, readOnlySubagents: async () => new Set(),
 			});
 			const session = { pi, ctx, controller, statuses, widgets, notices, acquired, acquiredFiles, confirmations,
 				setConfirm: (value: boolean) => { confirmResult = value; },
+				setAcquireHook: (hook: typeof acquireHook) => { acquireHook = hook; },
+				setDisabled: (value: boolean) => { disabled = value; },
 				setConfirmationHook: (hook: () => void | Promise<void>) => { confirmationHook = hook; },
 				setFileResolution: (resolve: (path: string) => string) => { fileResolution = resolve; },
 				setIdle: (value: boolean) => { idle = value; },
@@ -68,16 +74,264 @@ async function fixture(run: (root: string, start: (flags?: Record<string, unknow
 	}
 }
 
-test("explicit child scopes escape root contention and reject unleased native writes", async () => fixture(async (root, start) => {
+test("explicit child scopes escape root contention and dynamically acquire native-write targets", async () => fixture(async (root, start) => {
 	const rootWriter = await start({});
 	const child = await start();
 	await child.command("implement", '"api"');
 	assert.equal(child.controller.state, "implement");
 	assert.deepEqual(child.acquired, [join(root, "api")]);
-	assert.equal(await child.tool("write", { path: "api/new/file" }), undefined);
-	assert.equal((await child.tool("edit", { path: "web/file" }))?.block, true);
-	assert.equal((await rootWriter.tool("write", { path: "api/file" }))?.block, true);
-	assert.match(child.statuses.get("session-mode-leases"), /^leases:1/);
+	assert.equal(await child.tool("write", { path: "api/new/file", content: "x" }), undefined);
+	child.setIdle(false);
+	const toolChanges = child.pi.toolChanges;
+	assert.equal(await child.tool("edit", { path: "web/file", edits: [{ oldText: "a", newText: "b" }] }), undefined);
+	assert.equal(child.pi.toolChanges, toolChanges);
+	assert.deepEqual(child.controller.roots, [join(root, "api"), join(root, "web")]);
+	assert.deepEqual(child.pi.entries.at(-1).data.scope.roots, child.controller.roots);
+	assert.deepEqual(child.confirmations, []);
+	assert.equal((await rootWriter.tool("write", { path: "api/file", content: "x" }))?.block, true);
+	assert.match(child.statuses.get("session-mode-leases"), /^leases:2/);
+}));
+
+test("a native wrapper acquires every missing root atomically", async () => fixture(async (root, start) => {
+	const session = await start({});
+	const toolsBefore = session.pi.toolChanges;
+	const input = { tool_uses: [
+		{ recipient_name: "functions.write", parameters: { path: "api/new", content: "x" } },
+		{ recipient_name: "functions.write", parameters: { path: "web/new", content: "y" } },
+	] };
+	assert.equal(await session.tool("multi_tool_use.parallel", input), undefined);
+	assert.deepEqual(session.controller.roots, [root, join(root, "api"), join(root, "web")]);
+	assert.equal(session.pi.toolChanges, toolsBefore);
+	assert.equal(session.pi.entries.length, 2);
+}));
+
+test("wrapper contention rolls back new roots and retains the old set", async () => fixture(async (root, start) => {
+	const session = await start({}), holder = await start();
+	await holder.command("implement", "web");
+	const result = await session.tool("multi_tool_use.parallel", { tool_uses: [
+		{ recipient_name: "functions.write", parameters: { path: "api/new", content: "x" } },
+		{ recipient_name: "functions.write", parameters: { path: "web/new", content: "y" } },
+	] });
+	assert.equal(result?.block, true);
+	assert.match(result.reason, /web/);
+	assert.match(result.reason, /contended|held by another/i);
+	assert.deepEqual(session.controller.roots, [root]);
+	assert.deepEqual(session.pi.entries, []);
+	const free = await acquireWorktreeLease(join(root, "api"), { runtimeDir: join(root, "runtime") });
+	try { assert.equal(free.kind, "held"); }
+	finally { if (free.kind === "held") await free.release(); }
+}));
+
+test("a wrapper containing an ungranted non-repository file takes no new leases", async () => fixture(async (root, start) => {
+	const session = await start({});
+	const before = session.acquired.length;
+	const result = await session.tool("multi_tool_use.parallel", { tool_uses: [
+		{ recipient_name: "functions.write", parameters: { path: "api/new", content: "x" } },
+		{ recipient_name: "functions.write", parameters: { path: join(dirname(root), "ungranted.json"), content: "x" } },
+	] });
+	assert.equal(result?.block, true);
+	assert.deepEqual(session.controller.roots, [root]);
+	assert.equal(session.acquired.length, before);
+}));
+
+test("dynamic additions support sibling repositories and aliases without losing exact-file selection", async () => fixture(async (root, start) => {
+	const outside = await mkdtemp(join(tmpdir(), "dynamic-sibling-"));
+	try {
+		execFileSync("git", ["-C", outside, "init", "-q", "-b", "main"]);
+		await symlink(outside, join(root, "alias"));
+		const session = await start({});
+		const file = join(dirname(root), `${basename(root)}-config`);
+		await session.command("grant-file", JSON.stringify(file));
+		assert.equal(await session.tool("write", { path: "alias/new", content: "x" }), undefined);
+		assert.deepEqual(session.controller.roots, [root, outside].sort());
+		assert.deepEqual(session.controller.files, [file]);
+		assert.equal(session.pi.entries.at(-1).data.version, 3);
+		const entries = structuredClone(session.pi.entries);
+		await session.command("plan");
+		const restored = await start({}, entries);
+		assert.deepEqual(restored.controller.roots, [root, outside].sort());
+		assert.deepEqual(restored.controller.files, [file]);
+	} finally { await rm(outside, { recursive: true, force: true }); }
+}));
+
+test("dynamic acquisition refuses a newly Git-owned exact-file grant", async () => fixture(async (root, start) => {
+	const outside = await mkdtemp(join(tmpdir(), "dynamic-file-git-"));
+	try {
+		const file = join(outside, "config.json"); await writeFile(file, "{}");
+		const session = await start({});
+		await session.command("grant-file", JSON.stringify(file));
+		execFileSync("git", ["-C", outside, "init", "-q", "-b", "main"]);
+		const before = session.acquired.length;
+		const result = await session.tool("write", { path: file, content: "x" });
+		assert.equal(result?.block, true);
+		assert.match(result.reason, /overlaps an exact-file grant/);
+		assert.equal(session.acquired.length, before);
+		assert.deepEqual(session.controller.roots, [root]);
+	} finally { await rm(outside, { recursive: true, force: true }); }
+}));
+
+test("a failed dynamic checkpoint retains old authority and blocks the write", async () => fixture(async (root, start) => {
+	const session = await start({});
+	session.pi.appendEntry = () => { throw new Error("checkpoint unavailable"); };
+	const result = await session.tool("write", { path: "api/new", content: "x" });
+	assert.equal(result?.block, true);
+	assert.match(result.reason, /checkpoint unavailable/);
+	assert.deepEqual(session.controller.roots, [root]);
+	assert.equal(session.controller.state, "implement");
+	const free = await acquireWorktreeLease(join(root, "api"), { runtimeDir: join(root, "runtime") });
+	try { assert.equal(free.kind, "held"); }
+	finally { if (free.kind === "held") await free.release(); }
+}));
+
+test("a partial dynamic checkpoint restores conservatively while retaining live old scopes", async () => fixture(async (root, start) => {
+	const session = await start({});
+	const append = session.pi.appendEntry.bind(session.pi);
+	session.pi.appendEntry = (type: string, data: any) => {
+		if (data.version === 2) throw new Error("second checkpoint failed");
+		append(type, data);
+	};
+	const result = await session.tool("write", { path: "api/new", content: "x" });
+	assert.equal(result?.block, true);
+	assert.deepEqual(session.controller.roots, [root]);
+	assert.deepEqual(session.pi.entries.at(-1).data, { version: 1, mode: "plan" });
+	const restored = await start({}, structuredClone(session.pi.entries));
+	assert.equal(restored.controller.state, "plan");
+	assert.deepEqual(restored.acquired, []);
+}));
+
+test("dynamic expansion refuses to silently change an explicit selection origin", async () => fixture(async (root, start) => {
+	const session = await start(); await session.command("implement", "api");
+	session.ctx.cwd = join(root, "api");
+	const result = await session.tool("write", { path: "../web/new", content: "x" });
+	assert.equal(result?.block, true); assert.match(result.reason, /Origin cwd changed/);
+	assert.deepEqual(session.acquired, [join(root, "api")]);
+	assert.equal(session.pi.entries.at(-1).data.scope.originCwd, root);
+}));
+
+test("the production ten-second deadline cancels a stalled native acquisition", async () => fixture(async (root, start) => {
+	const session = await start({});
+	session.setAcquireHook((_root: string, signal?: AbortSignal) => new Promise<void>((done) => {
+		assert.ok(signal);
+		if (signal.aborted) done();
+		else signal.addEventListener("abort", () => done(), { once: true });
+	}));
+	const result = await session.tool("write", { path: "api/new", content: "x" });
+	assert.equal(result?.block, true); assert.match(result.reason, /cancelled/);
+	assert.deepEqual(session.controller.roots, [root]);
+	assert.deepEqual(session.pi.entries, []);
+}));
+
+test("abort cancels dynamic acquisition and a simultaneous write is rejected as busy", async () => fixture(async (root, start) => {
+	const session = await start({});
+	let begun!: () => void, finish!: () => void;
+	const ready = new Promise<void>((resolve) => { begun = resolve; });
+	const gate = new Promise<void>((resolve) => { finish = resolve; });
+	session.setAcquireHook(async () => { begun(); await gate; });
+	const controller = new AbortController(); session.ctx.signal = controller.signal;
+	const pending = session.tool("write", { path: "api/new", content: "x" });
+	await ready;
+	const busy = await session.tool("write", { path: "web/new", content: "y" });
+	assert.equal(busy?.block, true); assert.match(busy.reason, /busy/);
+	controller.abort(); finish();
+	const result = await pending;
+	assert.equal(result?.block, true); assert.match(result.reason, /cancelled/);
+	assert.deepEqual(session.controller.roots, [root]);
+	assert.deepEqual(session.pi.entries, []);
+}));
+
+test("post-commit cancellation retains the committed selection for later file grants", async () => fixture(async (root, start) => {
+	const session = await start({});
+	const controller = new AbortController(); session.ctx.signal = controller.signal;
+	const append = session.pi.appendEntry.bind(session.pi);
+	session.pi.appendEntry = (kind: string, data: any) => {
+		append(kind, data);
+		if (data.version === 2 && data.mode === "implement") queueMicrotask(() => controller.abort());
+	};
+	assert.equal((await session.tool("write", { path: "api/new", content: "x" }))?.block, true);
+	assert.deepEqual(session.controller.roots, [root, join(root, "api")]);
+	session.ctx.signal = undefined;
+	await session.command("grant-file", JSON.stringify(join(dirname(root), `${basename(root)}-config.json`)));
+	assert.deepEqual(session.pi.entries.at(-1).data.scope, { kind: "roots", roots: [root, join(root, "api")], originCwd: root });
+}));
+
+test("holder loss during dynamic acquisition cannot revive implementation or saved authority", async () => fixture(async (root, start) => {
+	const session = await start({});
+	let begun!: () => void, finish!: () => void;
+	const ready = new Promise<void>((resolve) => { begun = resolve; });
+	const gate = new Promise<void>((resolve) => { finish = resolve; });
+	session.setAcquireHook(async () => { begun(); await gate; });
+	const pending = session.tool("write", { path: "api/new", content: "x" });
+	await ready;
+	const metadata = JSON.parse(await readFile(join(root, "runtime", `${lockIdentity(root)}.json`), "utf8"));
+	assert.equal(metadata.parentPid, process.pid);
+	process.kill(metadata.pid, "SIGKILL");
+	try {
+		for (let i = 0; session.controller.state !== "lost" && i < 100; i++) await delay(10);
+		assert.equal(session.controller.state, "lost");
+	} finally { finish(); }
+	assert.equal((await pending)?.block, true);
+	assert.deepEqual(session.controller.roots, []);
+	assert.equal(session.pi.entries.at(-1).data.mode, "plan");
+}));
+
+test("shutdown drains an in-hook acquisition and leaves no owned scopes", async () => fixture(async (_root, start) => {
+	const session = await start({});
+	let begun!: () => void, finish!: () => void;
+	const ready = new Promise<void>((resolve) => { begun = resolve; });
+	const gate = new Promise<void>((resolve) => { finish = resolve; });
+	session.setAcquireHook(async () => { begun(); await gate; });
+	const pending = session.tool("write", { path: "api/new", content: "x" });
+	await ready;
+	const shutdown = session.pi.handlers.get("session_shutdown")?.({}, session.ctx);
+	finish();
+	assert.equal((await pending)?.block, true);
+	await shutdown;
+	assert.deepEqual(session.controller.roots, []);
+	assert.deepEqual(session.pi.entries, []);
+}));
+
+test("reads, Bash, plan, conflict, and a disabled guard cannot add worktree leases", async () => fixture(async (root, start) => {
+	const holder = await start({});
+	const before = holder.acquired.length;
+	await holder.tool("read", { path: "api/new" });
+	await holder.tool("bash", { command: "touch api/new" });
+	assert.equal(holder.acquired.length, before);
+	holder.setDisabled(true);
+	assert.equal((await holder.tool("write", { path: "api/new", content: "x" }))?.block, true);
+	assert.equal(holder.acquired.length, before);
+	const conflict = await start({});
+	assert.equal((await conflict.tool("write", { path: "api/new", content: "x" }))?.block, true);
+	assert.deepEqual(conflict.controller.roots, []);
+	const plan = await start();
+	assert.equal((await plan.tool("write", { path: "api/new", content: "x" }))?.block, true);
+	assert.deepEqual(plan.acquired, []);
+	holder.setDisabled(false);
+	assert.deepEqual(holder.controller.roots, [root]);
+}));
+
+test("dynamic wrapper expansion enforces the combined 32-root limit before acquisition", async () => fixture(async (root, start) => {
+	const session = await start({});
+	const calls = [];
+	for (let index = 0; index < 32; index++) {
+		const repo = join(root, `extra-${index}`); await mkdir(repo);
+		execFileSync("git", ["-C", repo, "init", "-q", "-b", "main"]);
+		calls.push({ recipient_name: "functions.write", parameters: { path: join(repo, "new"), content: "x" } });
+	}
+	const result = await session.tool("multi_tool_use.parallel", { tool_uses: calls });
+	assert.equal(result?.block, true); assert.match(result.reason, /32/);
+	assert.deepEqual(session.acquired, [root]);
+	assert.deepEqual(session.controller.roots, [root]);
+}));
+
+test("post-acquisition revalidation blocks a retargeted symlink without acquiring its new owner", async () => fixture(async (root, start) => {
+	const session = await start({});
+	const alias = join(root, "alias"); await symlink(join(root, "api"), alias);
+	session.setAcquireHook(async () => { await rm(alias); await symlink(join(root, "web"), alias); });
+	const result = await session.tool("write", { path: "alias/file", content: "x" });
+	assert.equal(result?.block, true);
+	assert.match(result.reason, /web/);
+	assert.deepEqual(session.controller.roots, [root, join(root, "api")]);
+	assert.deepEqual(session.acquired, [root, join(root, "api")]);
 }));
 
 test("exact-file grants are confirmed, persisted, inspectable and compose with worktree leases", async () => fixture(async (root, start) => {
@@ -98,6 +352,8 @@ test("exact-file grants are confirmed, persisted, inspectable and compose with w
 	assert.equal(grantedInput.path, file);
 	assert.match((await session.tool("edit", { path: `${file}.other` }))?.reason ?? "", /\/grant-file/);
 	assert.equal((await session.tool("bash", { command: "touch /tmp/outside" }))?.block, true);
+	assert.equal((await session.tool("write", { path: "api/new", content: "x" }))?.block, true);
+	assert.deepEqual(session.controller.roots, []);
 	await session.command("grants");
 	assert.deepEqual(JSON.parse(session.notices.at(-1)).held, [file]);
 	await session.command("implement");

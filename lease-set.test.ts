@@ -134,6 +134,27 @@ test("failed mixed checkpoint releases only the new file and root handles", asyn
 	await set.releaseAll();
 });
 
+test("an external tool abort cancels acquisition while retaining prior scopes", async () => {
+	const released: string[] = [];
+	let start!: () => void, finish!: (value: WorktreeLeaseResult) => void;
+	let received: AbortSignal | undefined;
+	const ready = new Promise<void>((resolve) => { start = resolve; });
+	const set = new LeaseSet(async (root, options) => {
+		if (root === "old") return handle(root, released).lease;
+		received = options.signal; start();
+		return new Promise((resolve) => { finish = resolve; });
+	}, resolveRoots);
+	await set.add(["old"], "/cwd", "session");
+	const abort = new AbortController();
+	const pending = set.addScopes({ worktrees: { kind: "paths", paths: ["new"] }, files: [] }, "/cwd", "session", undefined, undefined, abort.signal);
+	await ready;
+	abort.abort();
+	try { assert.equal(received?.aborted, true); }
+	finally { finish(handle("new", released).lease); await pending; await set.releaseAll(); }
+	assert.equal((await pending).kind, "cancelled");
+	assert.deepEqual(released, ["new", "old"]);
+});
+
 test("an obsolete rejected loss notification cannot invalidate a later held set", async () => {
 	const released: string[] = [];
 	let rejectOld!: (error: Error) => void;

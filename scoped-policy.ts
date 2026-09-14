@@ -7,6 +7,8 @@ interface ScopePolicyOptions {
 	resolveRoot?: typeof resolveWriteRoot;
 	resolveFile?: typeof resolveGrantFile;
 	files?: readonly string[];
+	collectMissingRoots?: Set<string>;
+	signal?: AbortSignal;
 	isCurrent?: () => boolean;
 }
 function record(value: unknown): value is Record<string, unknown> {
@@ -23,6 +25,7 @@ export async function scopedWriteBlockReason(
 	options: ScopePolicyOptions = {},
 	depth = 0,
 ): Promise<string | undefined> {
+	if (options.signal?.aborted) return "Tool validation cancelled";
 	if (tool === "multi_tool_use.parallel") {
 		if (!record(input) || !Array.isArray(input.tool_uses) || input.tool_uses.length === 0 || depth >= MAX_PARALLEL_DEPTH) return "Malformed or excessively nested parallel call blocked";
 		for (const nested of input.tool_uses) {
@@ -35,18 +38,24 @@ export async function scopedWriteBlockReason(
 		return options.isCurrent?.() === false ? "Lease scope changed during tool validation" : undefined;
 	}
 	if (tool !== "edit" && tool !== "write") return undefined;
+	if (options.collectMissingRoots && (!record(input) || typeof input.path !== "string"
+		|| (tool === "write" ? typeof input.content !== "string"
+			: !Array.isArray(input.edits) || input.edits.length === 0 || input.edits.some((edit) => !record(edit) || typeof edit.oldText !== "string" || typeof edit.newText !== "string")))) {
+		return "Malformed native write input; dynamic acquisition blocked.";
+	}
 	const target = record(input) ? input.path : undefined;
 	try {
-		const root = await (options.resolveRoot ?? resolveWriteRoot)(target, cwd);
+		const root = await (options.resolveRoot ?? resolveWriteRoot)(target, cwd, options.signal);
 		if (options.isCurrent?.() === false) return "Lease scope changed during tool validation";
 		if (!roots.includes(root)) {
+			if (options.collectMissingRoots) { options.collectMissingRoots.add(root); return undefined; }
 			const argument = pathArgument(root, cwd);
 			return `Worktree is not leased. Ask the user to run /implement ${JSON.stringify(argument)} while idle.`;
 		}
 		return undefined;
 	} catch {
 		try {
-			const file = await (options.resolveFile ?? resolveGrantFile)(target, cwd);
+			const file = await (options.resolveFile ?? resolveGrantFile)(target, cwd, options.signal);
 			if (options.isCurrent?.() === false) return "Lease scope changed during tool validation";
 			if (!options.files?.includes(file)) {
 				return `Exact file is not granted. Ask the user to run /grant-file ${JSON.stringify(pathArgument(file, cwd))} while idle.`;

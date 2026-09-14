@@ -9,6 +9,7 @@ The current contract uses explicit, incrementally growing sets of canonical Git-
 | Fresh session / bare `/implement`, no leases | Request the cwd Git worktree. |
 | Bare `/implement` with a healthy set | No-op; keep existing scopes. |
 | `/implement path-a path-b` | Add the named roots; never implicitly add cwd. |
+| Native `edit`/`write` in a healthy repository implementation session | Acquire missing canonical target worktrees without another prompt, then revalidate the write. |
 | `/grant-file path-a path-b` | Resolve exact non-Git files, require interactive confirmation, then add their file leases. |
 | `/plan` | Guard writes, cancel/drain acquisition, release every worktree and file lease, clear selection. |
 | `/leases [paths...]` | Read-only worktree diagnostics, or explicit occupancy inspection. |
@@ -24,7 +25,7 @@ Worktrees and files each have an independent limit of 32. Each combined addition
 
 `/new` starts an empty session rather than inheriting interactive `/plan` selection. Without an explicit startup override, it attempts the cwd lease. If another live session holds that worktree, the replacement stays guarded in `conflict`; the warning identifies the root without exposing holder metadata. Use `/leases` to inspect, `/plan` for read-only work, or `/implement <root>` for a disjoint worktree. A failed addition reports retained leases only when a healthy prior set remains.
 
-Two plain workspace-root implementation sessions still contend. To work concurrently, choose disjoint member scopes. Workspace files require the workspace lease; tracking-only local Beads operations remain permitted without it. A Beads store identifies tracking ownership, not every source repository a task needs.
+Two plain workspace-root implementation sessions still contend. To work concurrently, choose disjoint member scopes. Workspace files require the workspace lease; tracking-only local Beads operations remain permitted without it. A Beads store identifies tracking ownership, not every source repository a task needs. Claims and `/next` selections have no runtime lease side effect; a subsequent concrete native write is the dynamic trigger.
 
 ## Kernel authority and transitions
 
@@ -32,9 +33,9 @@ The identity remains SHA-256 of the canonical Git top-level path. Git's answer m
 
 Worktree lock filenames and the public observer remain unchanged. File locks use a separate `file-<sha256>` namespace keyed by the canonical exact path. Both kinds reuse the fixed holder process and metadata-publication handshake; metadata is diagnostic only.
 
-The controller keeps one combined committed live set H and transaction-local acquisitions N. It validates, canonicalizes, deduplicates and sorts targets, temporarily guards writes, then acquires missing worktrees and files sequentially and nonblockingly. It publishes the union only after all handles and the scope checkpoint are valid. A failed addition drains N and retains healthy H. Per-handle release promises are separate from the aggregate drain barrier.
+The controller keeps one combined committed live set H and transaction-local acquisitions N. It validates, canonicalizes, deduplicates and sorts targets, then acquires missing worktrees and files sequentially and nonblockingly. Explicit mode commands temporarily guard writes; dynamic tool preflight does not change the active tool list or visible implement state. It publishes the union only after all handles and the scope checkpoint are valid. A failed addition drains N and retains healthy H. Per-handle release promises are separate from the aggregate drain barrier.
 
-Different overlapping transitions are rejected; identical requests share their operation. User scope changes require Pi to be idle with no pending messages. Superseded callbacks cannot publish scope, restore tools or persist success. Unexpected loss of any handle guards immediately, invalidates the operation, drains the entire set and reports `lost`.
+Different overlapping transitions are rejected; identical explicit requests share their operation. User scope commands require Pi to be idle with no pending messages. Dynamic acquisitions run inside native tool preflight and use its blocking result instead of waiting for idle; simultaneous dynamic requests fail busy rather than queuing. Superseded callbacks cannot publish scope, restore tools or persist success. Unexpected loss of any handle guards immediately, invalidates the operation, drains the entire set and reports `lost`.
 
 There is no waiting/retry loop, stealing, preemption, idle expiry, completion-triggered release or individual release. Two sessions holding opposite roots may both fail to expand; one must voluntarily enter `/plan`. Sorting does not eliminate this human coordination stand-off. Shutdown, reload and session replacement drain all handles; children do not inherit authority. Release closes the holder pipe, then force-terminates that owned child after one second if necessary and still waits for close. A failed drain remains fail-closed rather than being treated as successful cleanup.
 
@@ -52,11 +53,23 @@ While implementing, a separate native-write checker:
 - rejects ambiguous ownership and rechecks the combined scope revision after asynchronous resolution;
 - recursively checks supported parallel wrappers with the existing bounded/malformed-call rules.
 
-A parent lease does not cover a nested repository or initialized submodule. Repository denials supply `/implement`; independently proven non-Git files supply `/grant-file`. Neither path acquires authority mid-tool or from a Beads event. This intentionally tightens default workspace sessions: their native file tools cannot modify members until the member leases are added.
+A parent lease does not cover a nested repository or initialized submodule. Independently proven non-Git files still require `/grant-file`. Repository targets can trigger dynamic acquisition as described below; unresolvable identity or contention blocks the native call. No Beads event grants authority.
 
 File locks provide cooperating-session exclusion, not content compare-and-swap. Scope-revision rechecks catch loss or selection changes during asynchronous preflight. External content changes, hostile filesystem races, and holder loss between preflight and the actual write remain outside the same documented TOCTOU boundary as worktree scopes. Native Pi serializes same-process operations for the canonical file; this extension does not override edit/write implementations or claim atomic file writes.
 
 A file-only implementation session retains the guarded bounded Bash, package, Git, system and writer-subagent policy while allowing native edit/write through the exact-file checker. Adding any worktree lease selects the ordinary implementation boundary, where shell/script effects are explicitly unscoped. This avoids turning confirmation of one configuration file into general obvious shell-mutation authority.
+
+## Dynamic native-write acquisition
+
+This deliberately replaces released 0.2.1's explicit-only expansion policy. A healthy `implement` session with at least one held worktree may acquire additional canonical owners identified by native `edit`/`write` arguments. This includes implicit-cwd sessions, nested repositories, symlinked workspace members and siblings outside cwd. There is no topology-file or tracker authority. Consequently, an accidental write to another valid, uncontended repository can acquire that repository; leases are coordination, not a wrong-repository safety boundary.
+
+Plan, conflict, acquiring, lost, unguarded and file-only sessions never auto-expand. Reads, Bash, arbitrary tools and subagent cwd requests are not triggers. Existing explicit `/implement` and `/grant-file` controls remain available. A candidate root containing any held exact-file grant is rejected for explicit reselection, so a newly initialized Git repository cannot silently convert a file grant into repository authority.
+
+Preflight first validates every supported nested call and collects canonical missing owners. Malformed wrappers/native arguments, unknown nested tools, ungranted non-repository files, unavailable identity or an oversized combined set take no new leases. A complete wrapper's missing roots are acquired as one transaction, with the unchanged 32-root limit. Separate assistant sibling calls are independently preflighted by Pi before execution in parallel mode; a failed sibling does not roll back a different sibling's completed acquisition. Sequential calls use the same gate.
+
+Generation, live-set revision, origin cwd and cancellation are checked before acquisition and again in the persistence callback. The tool's abort signal and a ten-second acquisition deadline cancel and drain pending additions. Active tools remain unchanged during this preflight. On commit, the full worktree set is saved as explicit roots with canonical origin cwd, retaining file selections via v3 when needed. Existing explicit origin must match rather than being silently replaced.
+
+After acquisition, the original call is checked afresh against the committed set and revision. A retargeted path is blocked, not repeatedly auto-acquired. If the tool is aborted or fails after acquisition has committed, those roots remain held and selected until `/plan`; no individual release is implied. A loss or shutdown cannot be overridden by a late preflight completion. This remains the existing cooperative, non-atomic preflight-to-write boundary, not filesystem isolation.
 
 ## Failure and persistence
 
@@ -89,7 +102,7 @@ The statusline suppresses its own holder during plan release. Explicit `/leases`
 
 ## Runtime and distribution
 
-Development pins Pi 0.85.1. Its reload path awaits session shutdown before resource reload/rebinding; the package drains acquisition and release there. Native tests, real temporary Git/flock fixtures and isolated RPC installation checks cover scope transitions, loss, reload and restoration. Interactive footer checks supplement—not replace—those contracts. Recheck on upgrades; an open host peer range does not certify future Pi behavior.
+Development pins Pi 0.85.1. Its reload path awaits session shutdown before resource reload/rebinding; the package drains acquisition and release there. Native tests, real temporary Git/flock fixtures and isolated RPC installation checks cover scope transitions, loss, reload and restoration. Interactive footer checks supplement—not replace—those contracts. The scripted local provider fixture runs actual Pi native tool preflight, sibling execution and wrapper dispatch, validates tool-call/result pairing through in-turn checkpoints, and checks cancellation and reload without external model requests. Recheck on upgrades; an open host peer range does not certify future Pi behavior.
 
 The optional reviewer seam was checked with pi-subagents 0.65.1. It deep-imports `src/agents/agents.ts` under the active Pi agent directory and expects `discoverAgents(cwd, "both", provider)` to return `{ scope: "both", agents: [...] }`. This internal API is not a stability guarantee. Keep absence, malformed definitions and unsafe contracts fail-closed; do not vendor the resolver or turn discovery failures into approval.
 

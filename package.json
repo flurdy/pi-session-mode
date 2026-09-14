@@ -42,7 +42,8 @@
     "typecheck": "tsc --noEmit",
     "pack:check": "node scripts/check-package.mjs",
     "check": "npm test && npm run typecheck && npm run pack:check",
-    "verify:git-install": "bash scripts/verify-git-install.sh"
+    "verify:git-install": "bash scripts/verify-git-install.sh",
+    "verify:dynamic": "node scripts/verify-dynamic.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"

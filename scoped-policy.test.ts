@@ -19,6 +19,40 @@ test("native writes require exact root membership while reads and shell remain o
 	assert.equal(await scopedWriteBlockReason("bash", { command: "arbitrary-script" }, "/cwd", []), undefined);
 });
 
+test("collection validates a whole wrapper without granting missing roots", async () => {
+	const missing = new Set<string>();
+	const input = { tool_uses: [
+		{ recipient_name: "functions.write", parameters: { path: "/new", content: "x" } },
+		{ recipient_name: "functions.edit", parameters: { path: "/another", edits: [{ oldText: "a", newText: "b" }] } },
+	] };
+	assert.equal(await scopedWriteBlockReason("multi_tool_use.parallel", input, "/cwd", ["/held"], { resolveRoot, collectMissingRoots: missing }), undefined);
+	assert.deepEqual([...missing], ["/new", "/another"]);
+	assert.ok(await scopedWriteBlockReason("multi_tool_use.parallel", input, "/cwd", ["/held"], { resolveRoot }));
+	input.tool_uses.push({ recipient_name: "unknown-wrapper", parameters: { path: "/ignored", content: "x" } });
+	assert.ok(await scopedWriteBlockReason("multi_tool_use.parallel", input, "/cwd", ["/held"], { resolveRoot, collectMissingRoots: new Set() }));
+});
+
+test("collection rejects malformed native mutations before resolving or acquiring scopes", async () => {
+	for (const [tool, input] of [["write", { path: "/new" }], ["edit", { path: "/new", edits: [] }], ["edit", { path: "/new", edits: [{ oldText: 1, newText: "x" }] }]] as const) {
+		const missing = new Set<string>();
+		assert.ok(await scopedWriteBlockReason(tool, input, "/cwd", ["/held"], { resolveRoot, collectMissingRoots: missing }));
+		assert.equal(missing.size, 0);
+	}
+});
+
+test("collection forwards cancellation and does not accept ungranted non-repository targets", async () => {
+	const controller = new AbortController();
+	let observed: AbortSignal | undefined;
+	assert.ok(await scopedWriteBlockReason("write", { path: "/file", content: "x" }, "/cwd", ["/held"], {
+		collectMissingRoots: new Set(), signal: controller.signal,
+		resolveRoot: async (_path, _cwd, signal) => { observed = signal; throw new Error("non-git"); },
+		resolveFile: async () => "/file",
+	}));
+	assert.equal(observed, controller.signal);
+	controller.abort();
+	assert.match(await scopedWriteBlockReason("write", { path: "/new" }, "/cwd", ["/held"], { resolveRoot, signal: controller.signal, collectMissingRoots: new Set() }) ?? "", /cancelled/i);
+});
+
 test("missing-scope guidance round-trips unusual literal roots", async () => {
 	for (const root of ["/repo\r", "/repo\u009b", "/repo\u00a0", "/repo\u202f", "/repo"]) {
 		const reason = await scopedWriteBlockReason("write", { path: root }, "/cwd", [], { resolveRoot });
