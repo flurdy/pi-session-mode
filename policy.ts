@@ -33,7 +33,7 @@ const READ_ONLY_SUBAGENT_ACTIONS = new Set([
 ]);
 
 const READ_ONLY_SUPERVISOR_ACTIONS = new Set(["list", "pending", "status"]);
-const GUARDED_MUTATION_REASON = "Guarded session: obvious source, Git, package, system, or remote Beads mutation blocked. Use /implement first.";
+const GUARDED_MUTATION_REASON = "Guarded session: obvious source, Git, package, system, or destructive/remote Beads command blocked. Source/Git/package/system changes need /implement scopes; /implement alone does not authorize destructive or remote actions. Local Beads triage needs no source lease; pass prose as literal quoted arguments.";
 const SUBAGENT_BLOCK_REASON = "Guarded session: this subagent operation may launch or control a writer in the current worktree. Use a verified read-only agent or switch to /implement.";
 
 export interface GuardedToolPolicyOptions {

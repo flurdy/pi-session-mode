@@ -27,6 +27,29 @@ Worktrees and files each have an independent limit of 32. Each combined addition
 
 Two plain workspace-root implementation sessions still contend. To work concurrently, choose disjoint member scopes. Workspace files require the workspace lease; tracking-only local Beads operations remain permitted without it. A Beads store identifies tracking ownership, not every source repository a task needs. Claims and `/next` selections have no runtime lease side effect; a subsequent concrete native write is the dynamic trigger.
 
+## Local Beads triage in guarded sessions
+
+Local Beads means a local issue mutation in the resolver-proven owning store, not only the
+invoking cwd. A plan-mode session in repository A may use `bd -C <proven directory>` to add
+comments or create, update and close issues in repository B without `/implement` or a source
+worktree lease. Ambiguous, unavailable or not-found ownership resolution writes nothing, and
+repository-specific tracker rules still win. The guard does not resolve tracking ownership;
+follow the shared Beads resolver workflow before a mutation. No Beads operation grants or
+acquires source authority.
+
+Keep local issue updates, remote synchronization and source/Git/package/system changes distinct.
+A configured Dolt remote alone does not make a comment a sync request. Verify effective export,
+backup, hook and synchronization settings and actual side effects, not commented examples or
+local-looking command syntax. Effects beyond local tracking require their own applicable
+authority; `/implement` alone does not authorize remote or destructive actions. This clarification
+does not change remote-sync policy or the destructive-command safeguards.
+
+The bounded Bash checker permits ordinary triage with literal quoted prose, including words such
+as `delete`, `git push` and `npm install`. It still checks executable command chains and constant
+shell-wrapper payloads; a triage command does not exempt a following source or destructive
+mutation. Quoting is not shell isolation: substitutions and arbitrary script side effects remain
+outside this accidental-change guard's guarantee.
+
 ## Kernel authority and transitions
 
 The identity remains SHA-256 of the canonical Git top-level path. Git's answer must match the nearest filesystem `.git` marker. Ambient location overrides, redirected `core.worktree` configurations and marker-less setups that disagree are unavailable, not alternate ownership. Normal clones, linked worktrees and initialized submodules remain supported. Each root has a stable private-runtime `flock` file plus diagnostic-only holder metadata. The fixed holder process publishes a ready handshake only after metadata publication. No JSON file or tracker claim proves ownership.

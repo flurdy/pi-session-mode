@@ -352,6 +352,38 @@ test("guarded state independently blocks hidden tools, mutating Bash, and writer
 	assert.equal(readResult, undefined);
 });
 
+test("plan guidance allows resolver-proven local Beads writes beyond cwd without source authority", async () => {
+	const { pi, controller, acquisitions } = harness([]);
+	const ctx = context();
+	pi.planFlag = true;
+	await pi.emit("session_start", ctx);
+	const [prompt] = await pi.emit("before_agent_start", ctx, { systemPrompt: "base prompt" });
+	const text = (prompt as { systemPrompt: string }).systemPrompt;
+	assert.match(text, /base prompt/);
+	assert.match(text, /local mutation in any resolver-proven owning store, not only cwd/);
+	assert.match(text, /bd -C <proven directory>/);
+	assert.match(text, /without \/implement or a worktree lease/);
+	assert.match(text, /ambiguous, unavailable or not-found.*write nothing/);
+	assert.match(text, /repository-specific tracker rules still win/);
+	assert.match(text, /Beads writes do not acquire source leases/);
+	assert.match(text, /export, backup and synchronization side effects/);
+	assert.match(text, /\/implement alone does not authorize remote or destructive actions/);
+	for (const command of [
+		"bd -C /abs/other-store comments add fixture-1 'git push; rm file > out'",
+		"bd -C /abs/other-store create 'delete cleanup' --type task",
+		"bd -C /abs/other-store update fixture-1 --append-notes 'npm install'",
+		"bd -C /abs/other-store close fixture-1 --reason 'done'",
+	]) {
+		assert.deepEqual(await pi.emit("tool_call", ctx, { toolName: "bash", input: { command } }), [undefined]);
+	}
+	assert.equal(controller.state, "plan");
+	assert.deepEqual(controller.roots, []);
+	assert.deepEqual(acquisitions, []);
+	assert.deepEqual(pi.execCalls, []);
+	assert.deepEqual(pi.appended, []);
+	assert.equal(pi.activeTools.includes("write"), false);
+});
+
 test("guarded mode permits verified read-only delegation and inspected composites", async () => {
 	const { pi } = harness([], { readOnlySubagents: async () => new Set(["reviewer"]) });
 	const ctx = context();

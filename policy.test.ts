@@ -147,6 +147,37 @@ test("permits reads and ordinary local Beads triage", () => {
 	}
 });
 
+test("permits cross-store local triage with mutation words in quoted prose", () => {
+	for (const command of [
+		"bd -C /abs/other-store comments add fixture-1 'rm file; git push > out && npm install; delete purge migrate cleanup'",
+		"bd -C /abs/other-store create 'Clarify delete and purge' --type task",
+		'bd -C /abs/other-store update fixture-1 --append-notes "git commit | tee file; cleanup"',
+		"bd -C /abs/other-store close fixture-1 --reason 'Document bash -c commands and source writes'",
+	]) {
+		assert.equal(guardedToolBlockReason("bash", { command }), undefined, command);
+	}
+});
+
+test("local triage does not exempt chained or shell-wrapped source and destructive commands", () => {
+	for (const command of [
+		"bd -C /abs/other-store comments add fixture-1 'note' && git -C /abs/other-store commit -m no",
+		"bd -C /abs/other-store update fixture-1 --append-notes 'note'; rm -f tracked.txt",
+		"bd -C /abs/other-store close fixture-1; bd -C /abs/other-store delete fixture-2",
+		"bd -C /abs/other-store comments add fixture-1 'note' > tracked.txt",
+		"bash -c 'bd -C /abs/other-store comments add fixture-1 note && npm install lodash'",
+		'sh -lc "bd -C /abs/other-store update fixture-1 --append-notes note; bd purge"',
+	]) {
+		assert.match(guardedToolBlockReason("bash", { command }) ?? "", /blocked/, command);
+	}
+});
+
+test("mutation diagnostics separate source authority from destructive and remote approval", () => {
+	const reason = guardedToolBlockReason("bash", { command: "bd delete fixture-1" }) ?? "";
+	assert.match(reason, /\/implement alone does not authorize destructive or remote actions/);
+	assert.match(reason, /Local Beads triage needs no source lease/);
+	assert.doesNotMatch(reason, /Use \/implement first/);
+});
+
 test("does not mistake comparison operators, quoted prose, or read-only shell payloads for mutations", () => {
 	for (const command of [
 		"test 3 -gt 2",
