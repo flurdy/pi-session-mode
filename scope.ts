@@ -1,8 +1,9 @@
 import { lstat, realpath, stat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { basename, dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { basename, dirname } from "node:path";
 import { resolveGitRoot } from "./lease.ts";
+import { normalizeToolPath } from "./path.ts";
+
+export { normalizeToolPath } from "./path.ts";
 
 export const MAX_LEASE_ROOTS = 32;
 export const ADDITION_TIMEOUT_MS = 10_000;
@@ -36,18 +37,6 @@ export function parseRootArguments(input: string): string[] {
 	if (quote || escaped) throw new Error("Unterminated quote or escape in scope arguments");
 	if (started) paths.push(word);
 	return checkedPaths(paths, true);
-}
-
-export function normalizeToolPath(value: unknown, cwd: string): string {
-	if (typeof value !== "string" || !value || value.includes("\0")) throw new Error("Invalid file path");
-	let path = value.replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, " ");
-	if (path.startsWith("@")) path = path.slice(1);
-	if (!path) throw new Error("Invalid file path");
-	if (path === "~") path = homedir();
-	else if (path.startsWith("~/")) path = resolve(homedir(), path.slice(2));
-	if (path.startsWith("file://")) path = fileURLToPath(path);
-	if (path.includes("\0")) throw new Error("Invalid file path");
-	return resolve(cwd, path);
 }
 
 export async function resolveExplicitRoots(paths: string[], cwd: string, signal?: AbortSignal): Promise<string[]> {

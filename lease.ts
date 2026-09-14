@@ -2,7 +2,9 @@ import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, readFile, realpath, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { resolveGrantFile } from "./file-scope.ts";
 
 export interface LeaseHolderMetadata {
 	root: string;
@@ -25,6 +27,28 @@ export type WorktreeLeaseResult =
 	| HeldWorktreeLease
 	| { kind: "contended"; root: string; holder?: LeaseHolderMetadata }
 	| { kind: "unguarded"; reason: "non-git" | "git-unavailable" | "flock-unavailable" | "lease-error"; detail?: string };
+
+export interface FileLeaseHolderMetadata {
+	file: string;
+	pid: number;
+	parentPid: number;
+	sessionId: string;
+	startedAt: string;
+}
+
+export interface HeldFileLease {
+	kind: "held";
+	file: string;
+	holderPid: number;
+	lost: Promise<void>;
+	readonly alive?: boolean;
+	release(): Promise<void>;
+}
+
+export type FileLeaseResult =
+	| HeldFileLease
+	| { kind: "contended"; file: string; holder?: FileLeaseHolderMetadata }
+	| { kind: "unavailable"; reason: "invalid" | "flock-unavailable" | "lease-error"; file?: string; detail?: string };
 
 export interface LeaseExecOptions {
 	timeoutMs: number;
@@ -51,6 +75,17 @@ export interface AcquireWorktreeLeaseOptions {
 	sessionId?: string;
 	readyTimeoutMs?: number;
 	writeMetadata?(path: string, contents: string): Promise<void>;
+}
+
+export interface AcquireFileLeaseOptions {
+	expectedFile?: string;
+	signal?: AbortSignal;
+	runtimeDir?: string;
+	flockCommand?: string;
+	sessionId?: string;
+	readyTimeoutMs?: number;
+	writeMetadata?(path: string, contents: string): Promise<void>;
+	resolveFile?(file: string, signal?: AbortSignal): Promise<string>;
 }
 
 function defaultExec(command: string, args: string[], options: LeaseExecOptions): Promise<LeaseCommandResult> {
@@ -81,6 +116,10 @@ export function worktreeLeaseRuntimeDir(): string {
 
 export function worktreeLeaseLockPath(root: string, runtimeDir = worktreeLeaseRuntimeDir()): string {
 	return join(runtimeDir, `${lockIdentity(root)}.lock`);
+}
+
+export function fileLeaseLockPath(file: string, runtimeDir = worktreeLeaseRuntimeDir()): string {
+	return join(runtimeDir, `file-${lockIdentity(file)}.lock`);
 }
 
 export async function resolveGitRoot(
@@ -125,62 +164,69 @@ export async function resolveGitRoot(
 	}
 }
 
-async function readHolder(path: string): Promise<LeaseHolderMetadata | undefined> {
+interface KernelLeaseOptions {
+	signal?: AbortSignal;
+	flockCommand?: string;
+	readyTimeoutMs?: number;
+	writeMetadata?(path: string, contents: string): Promise<void>;
+}
+
+interface HeldKernelLease {
+	kind: "held";
+	holderPid: number;
+	lost: Promise<void>;
+	readonly alive?: boolean;
+	release(): Promise<void>;
+}
+
+type KernelLeaseResult<Metadata> =
+	| HeldKernelLease
+	| { kind: "contended"; holder?: Metadata }
+	| { kind: "unavailable"; reason: "flock-unavailable" | "lease-error"; detail?: string };
+
+function validHolder(value: Record<string, unknown>): boolean {
+	return typeof value.pid === "number" && Number.isSafeInteger(value.pid) && value.pid > 0
+		&& typeof value.parentPid === "number" && Number.isSafeInteger(value.parentPid) && value.parentPid > 0
+		&& typeof value.sessionId === "string" && typeof value.startedAt === "string";
+}
+
+async function readHolder<Metadata>(path: string, identity: "root" | "file"): Promise<Metadata | undefined> {
 	try {
-		const value = JSON.parse(await readFile(path, "utf8")) as Partial<LeaseHolderMetadata>;
-		if (
-			typeof value.root === "string" &&
-			typeof value.pid === "number" && Number.isSafeInteger(value.pid) && value.pid > 0 &&
-			typeof value.parentPid === "number" && Number.isSafeInteger(value.parentPid) && value.parentPid > 0 &&
-			typeof value.sessionId === "string" &&
-			typeof value.startedAt === "string"
-		) {
-			return value as LeaseHolderMetadata;
-		}
+		const value = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+		if (typeof value[identity] === "string" && validHolder(value)) return value as Metadata;
 	} catch {
 		// Diagnostic metadata is best effort and never establishes ownership.
 	}
 	return undefined;
 }
 
-export async function acquireWorktreeLease(
-	cwd: string,
-	options: AcquireWorktreeLeaseOptions = {},
-): Promise<WorktreeLeaseResult> {
-	const cancelled = (): WorktreeLeaseResult => ({ kind: "unguarded", reason: "lease-error", detail: "Lease acquisition cancelled" });
-	if (options.signal?.aborted) return cancelled();
-	const resolved = await resolveGitRoot(cwd, options);
-	if (options.signal?.aborted) return cancelled();
-	if (!("root" in resolved)) return { kind: "unguarded", ...resolved };
-	if (options.expectedRoot !== undefined && options.expectedRoot !== resolved.root) return { kind: "unguarded", reason: "lease-error", detail: "Worktree identity changed before acquisition" };
-
-	const runtimeDir = options.runtimeDir ?? worktreeLeaseRuntimeDir();
+async function acquireKernelLease<Metadata>(
+	lockPath: string,
+	metadataPath: string,
+	metadataFor: (holderPid: number) => Metadata,
+	identity: "root" | "file",
+	options: KernelLeaseOptions,
+): Promise<KernelLeaseResult<Metadata>> {
+	const unavailable = (detail: string): KernelLeaseResult<Metadata> => ({ kind: "unavailable", reason: "lease-error", detail });
+	if (options.signal?.aborted) return unavailable("Lease acquisition cancelled");
+	const runtimeDir = dirname(lockPath);
 	try {
 		await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
 		await chmod(runtimeDir, 0o700);
 	} catch (error) {
-		return { kind: "unguarded", reason: "lease-error", detail: error instanceof Error ? error.message : String(error) };
+		return unavailable(error instanceof Error ? error.message : String(error));
 	}
-
-	if (options.signal?.aborted) return cancelled();
-	const identity = lockIdentity(resolved.root);
-	const lockPath = worktreeLeaseLockPath(resolved.root, runtimeDir);
-	const metadataPath = join(runtimeDir, `${identity}.json`);
+	if (options.signal?.aborted) return unavailable("Lease acquisition cancelled");
 	const metadataTempPath = `${metadataPath}.${randomUUID()}.tmp`;
-	const flockCommand = options.flockCommand ?? "flock";
-	const sessionId = options.sessionId ?? process.env.PI_SESSION_ID ?? `pid-${process.pid}`;
-	const writeMetadata = options.writeMetadata
-		?? ((path: string, contents: string) => writeFile(path, contents, { mode: 0o600 }));
+	const writeMetadata = options.writeMetadata ?? ((path: string, contents: string) => writeFile(path, contents, { mode: 0o600 }));
 	const holderScript = 'if ! IFS= read -r command || [ "$command" != publish ]; then rm -f -- "$1"; exit 70; fi; mv -f -- "$1" "$2" || exit 71; printf "ready\\n"; exec cat >/dev/null';
 	const child = spawn(
-		flockCommand,
+		options.flockCommand ?? "flock",
 		["-n", "-F", "-E", "75", lockPath, "sh", "-c", holderScript, "pi-session-guard", metadataTempPath, metadataPath],
 		{ stdio: ["pipe", "pipe", "pipe"] },
 	);
-
-	return new Promise<WorktreeLeaseResult>((resolve) => {
-		let output = "";
-		let errorOutput = "";
+	return new Promise<KernelLeaseResult<Metadata>>((resolve) => {
+		let output = "", errorOutput = "";
 		let holderPid: number | undefined;
 		let phase: "acquiring" | "held" | "finished" = "acquiring";
 		let releasing = false;
@@ -188,102 +234,63 @@ export async function acquireWorktreeLease(
 		const lost = new Promise<void>((done) => (lostResolve = done));
 		const cleanupTemp = () => void unlink(metadataTempPath).catch(() => undefined);
 		const detachAbort = () => options.signal?.removeEventListener("abort", onAbort);
-		const fail = (result: WorktreeLeaseResult) => {
+		const fail = (result: KernelLeaseResult<Metadata>) => {
 			if (phase !== "acquiring") return;
 			phase = "finished";
 			clearTimeout(readyTimer);
-			detachAbort();
-			cleanupTemp();
+			detachAbort(); cleanupTemp();
 			child.once("close", () => resolve(result));
 			child.kill("SIGKILL");
 		};
-		const onAbort = () => fail(cancelled());
-		const readyTimer = setTimeout(() => fail({ kind: "unguarded", reason: "lease-error", detail: "flock ready handshake timed out" }), options.readyTimeoutMs ?? 2000);
-
+		const onAbort = () => fail(unavailable("Lease acquisition cancelled"));
+		const readyTimer = setTimeout(() => fail(unavailable("flock ready handshake timed out")), options.readyTimeoutMs ?? 2000);
 		child.stdin.on("error", () => undefined);
 		child.stderr.on("data", (chunk) => (errorOutput += String(chunk)));
 		child.once("spawn", () => {
 			if (phase !== "acquiring") return;
-			// spawn precedes stdout data; flock -F and exec keep this PID as the lock holder.
 			holderPid = child.pid!;
-			const metadata: LeaseHolderMetadata = {
-				root: resolved.root,
-				pid: holderPid,
-				parentPid: process.pid,
-				sessionId,
-				startedAt: new Date().toISOString(),
-			};
-			void writeMetadata(metadataTempPath, `${JSON.stringify(metadata)}\n`)
+			void writeMetadata(metadataTempPath, `${JSON.stringify(metadataFor(holderPid))}\n`)
 				.then(() => {
-					if (phase !== "acquiring") {
-						cleanupTemp();
-						return;
-					}
+					if (phase !== "acquiring") { cleanupTemp(); return; }
 					child.stdin.write("publish\n");
 				})
 				.catch((error) => {
 					cleanupTemp();
-					fail({ kind: "unguarded", reason: "lease-error", detail: error instanceof Error ? error.message : String(error) });
+					fail(unavailable(error instanceof Error ? error.message : String(error)));
 				});
 		});
-		child.once("error", (error: NodeJS.ErrnoException) => {
-			fail({
-				kind: "unguarded",
-				reason: error.code === "ENOENT" ? "flock-unavailable" : "lease-error",
-				detail: error.message,
-			});
-		});
-
+		child.once("error", (error: NodeJS.ErrnoException) => fail({
+			kind: "unavailable",
+			reason: error.code === "ENOENT" ? "flock-unavailable" : "lease-error",
+			detail: error.message,
+		}));
 		child.once("close", (code) => {
 			detachAbort();
-			if (phase === "held") {
-				phase = "finished";
-				if (!releasing) lostResolve?.();
-				return;
-			}
+			if (phase === "held") { phase = "finished"; if (!releasing) lostResolve?.(); return; }
 			if (phase !== "acquiring") return;
-			phase = "finished";
-			cleanupTemp();
-			clearTimeout(readyTimer);
-			if (code === 75) {
-				void readHolder(metadataPath).then((holder) => resolve({ kind: "contended", root: resolved.root, holder }));
-				return;
-			}
-			resolve({
-				kind: "unguarded",
-				reason: "lease-error",
-				detail: errorOutput.trim() || `flock exited before ready (${code ?? "signal"})`,
-			});
+			phase = "finished"; cleanupTemp(); clearTimeout(readyTimer);
+			if (code === 75) { void readHolder<Metadata>(metadataPath, identity).then((holder) => resolve({ kind: "contended", holder })); return; }
+			resolve(unavailable(errorOutput.trim() || `flock exited before ready (${code ?? "signal"})`));
 		});
-
 		child.stdout.on("data", (chunk) => {
 			if (phase !== "acquiring") return;
 			output += String(chunk);
 			if (!output.includes("\n") || output.split("\n", 1)[0] !== "ready") return;
-			phase = "held";
-			detachAbort();
-			clearTimeout(readyTimer);
+			phase = "held"; detachAbort(); clearTimeout(readyTimer);
 			let releasePromise: Promise<void> | undefined;
 			resolve({
-				kind: "held",
-				root: resolved.root,
-				holderPid: holderPid!,
-				lost,
+				kind: "held", holderPid: holderPid!, lost,
 				get alive() { return phase === "held" && !releasing && child.exitCode === null && child.signalCode === null; },
 				release() {
 					if (releasePromise) return releasePromise;
 					releasing = true;
 					releasePromise = new Promise<void>((done) => {
-						if (phase === "finished") {
-							done();
-							return;
-						}
+						if (phase === "finished") { done(); return; }
 						const force = setTimeout(() => {
 							if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
 						}, 1000);
 						child.once("close", () => { clearTimeout(force); done(); });
-						try { child.stdin.end(); }
-						catch { child.kill("SIGKILL"); }
+						try { child.stdin.end(); } catch { child.kill("SIGKILL"); }
 					});
 					return releasePromise;
 				},
@@ -292,4 +299,55 @@ export async function acquireWorktreeLease(
 		options.signal?.addEventListener("abort", onAbort, { once: true });
 		if (options.signal?.aborted) onAbort();
 	});
+}
+
+export async function acquireWorktreeLease(cwd: string, options: AcquireWorktreeLeaseOptions = {}): Promise<WorktreeLeaseResult> {
+	if (options.signal?.aborted) return { kind: "unguarded", reason: "lease-error", detail: "Lease acquisition cancelled" };
+	const resolved = await resolveGitRoot(cwd, options);
+	if (options.signal?.aborted) return { kind: "unguarded", reason: "lease-error", detail: "Lease acquisition cancelled" };
+	if (!("root" in resolved)) return { kind: "unguarded", ...resolved };
+	if (options.expectedRoot !== undefined && options.expectedRoot !== resolved.root) return { kind: "unguarded", reason: "lease-error", detail: "Worktree identity changed before acquisition" };
+	const runtimeDir = options.runtimeDir ?? worktreeLeaseRuntimeDir();
+	const identity = lockIdentity(resolved.root);
+	const sessionId = options.sessionId ?? process.env.PI_SESSION_ID ?? `pid-${process.pid}`;
+	const result = await acquireKernelLease<LeaseHolderMetadata>(
+		worktreeLeaseLockPath(resolved.root, runtimeDir),
+		join(runtimeDir, `${identity}.json`),
+		(holderPid) => ({ root: resolved.root, pid: holderPid, parentPid: process.pid, sessionId, startedAt: new Date().toISOString() }),
+		"root",
+		options,
+	);
+	if (result.kind === "held") return {
+		kind: "held", root: resolved.root, holderPid: result.holderPid, lost: result.lost,
+		get alive() { return result.alive; }, release: () => result.release(),
+	};
+	if (result.kind === "contended") return { ...result, root: resolved.root };
+	return { kind: "unguarded", reason: result.reason, ...(result.detail ? { detail: result.detail } : {}) };
+}
+
+export async function acquireFileLease(file: string, options: AcquireFileLeaseOptions = {}): Promise<FileLeaseResult> {
+	if (!isAbsolute(file)) return { kind: "unavailable", reason: "invalid", detail: "Expected an absolute file path" };
+	let resolved: string;
+	try {
+		resolved = await (options.resolveFile ?? ((path, signal) => resolveGrantFile(pathToFileURL(path).href, "/", signal)))(file, options.signal);
+	} catch (error) {
+		return { kind: "unavailable", reason: "invalid", detail: error instanceof Error ? error.message : String(error) };
+	}
+	if (options.signal?.aborted) return { kind: "unavailable", reason: "lease-error", file: resolved, detail: "Lease acquisition cancelled" };
+	if (options.expectedFile !== undefined && options.expectedFile !== resolved) return { kind: "unavailable", reason: "invalid", file: resolved, detail: "File identity changed before acquisition" };
+	const runtimeDir = options.runtimeDir ?? worktreeLeaseRuntimeDir();
+	const identity = lockIdentity(resolved), sessionId = options.sessionId ?? process.env.PI_SESSION_ID ?? `pid-${process.pid}`;
+	const result = await acquireKernelLease<FileLeaseHolderMetadata>(
+		fileLeaseLockPath(resolved, runtimeDir),
+		join(runtimeDir, `file-${identity}.json`),
+		(holderPid) => ({ file: resolved, pid: holderPid, parentPid: process.pid, sessionId, startedAt: new Date().toISOString() }),
+		"file",
+		options,
+	);
+	if (result.kind === "held") return {
+		kind: "held", file: resolved, holderPid: result.holderPid, lost: result.lost,
+		get alive() { return result.alive; }, release: () => result.release(),
+	};
+	if (result.kind === "contended") return { ...result, file: resolved };
+	return { ...result, file: resolved };
 }

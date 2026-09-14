@@ -1,13 +1,19 @@
 import { pathToFileURL } from "node:url";
+import { resolveGrantFile } from "./file-scope.ts";
 import { MAX_PARALLEL_DEPTH, SAFE_PARALLEL_TOOL_NAMES } from "./policy.ts";
 import { normalizeToolPath, resolveWriteRoot } from "./scope.ts";
 
 interface ScopePolicyOptions {
 	resolveRoot?: typeof resolveWriteRoot;
+	resolveFile?: typeof resolveGrantFile;
+	files?: readonly string[];
 	isCurrent?: () => boolean;
 }
 function record(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function pathArgument(path: string, cwd: string): string {
+	return /[\u0000-\u001f\u007f-\u009f]/.test(path) || normalizeToolPath(path, cwd) !== path ? pathToFileURL(path).href : path;
 }
 export async function scopedWriteBlockReason(
 	tool: string,
@@ -29,15 +35,27 @@ export async function scopedWriteBlockReason(
 		return options.isCurrent?.() === false ? "Lease scope changed during tool validation" : undefined;
 	}
 	if (tool !== "edit" && tool !== "write") return undefined;
+	const target = record(input) ? input.path : undefined;
 	try {
-		const root = await (options.resolveRoot ?? resolveWriteRoot)(record(input) ? input.path : undefined, cwd);
+		const root = await (options.resolveRoot ?? resolveWriteRoot)(target, cwd);
 		if (options.isCurrent?.() === false) return "Lease scope changed during tool validation";
 		if (!roots.includes(root)) {
-			const argument = /[\u0000-\u001f\u007f-\u009f]/.test(root) || normalizeToolPath(root, cwd) !== root ? pathToFileURL(root).href : root;
+			const argument = pathArgument(root, cwd);
 			return `Worktree is not leased. Ask the user to run /implement ${JSON.stringify(argument)} while idle.`;
 		}
+		return undefined;
 	} catch {
-		return "Cannot establish this file's worktree ownership; write blocked. Select a valid scope with /implement.";
+		try {
+			const file = await (options.resolveFile ?? resolveGrantFile)(target, cwd);
+			if (options.isCurrent?.() === false) return "Lease scope changed during tool validation";
+			if (!options.files?.includes(file)) {
+				return `Exact file is not granted. Ask the user to run /grant-file ${JSON.stringify(pathArgument(file, cwd))} while idle.`;
+			}
+			if (!record(input)) return "Malformed native write input blocked";
+			input.path = pathArgument(file, cwd);
+			return options.isCurrent?.() === false ? "Lease scope changed during tool validation" : undefined;
+		} catch {
+			return "Cannot establish this file's worktree or exact-file ownership; write blocked. Select a valid /implement or /grant-file scope.";
+		}
 	}
-	return undefined;
 }

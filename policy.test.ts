@@ -85,6 +85,15 @@ test("permits parallel composites only when every nested call is safe", () => {
 });
 
 
+test("file-only policy permits prevalidated native writes but retains guarded nested mutations", () => {
+	const write = { recipient_name: "functions.write", parameters: { path: "/config", content: "value" } };
+	assert.equal(guardedToolBlockReason("write", write.parameters, { allowNativeWrites: true }), undefined);
+	assert.equal(guardedToolBlockReason("multi_tool_use.parallel", { tool_uses: [write] }, { allowNativeWrites: true }), undefined);
+	assert.ok(guardedToolBlockReason("multi_tool_use.parallel", {
+		tool_uses: [write, { recipient_name: "functions.bash", parameters: { command: "touch /tmp/outside" } }],
+	}, { allowNativeWrites: true }));
+});
+
 test("fails closed at the parallel nesting limit", () => {
 	let nested: unknown = { recipient_name: "functions.read", parameters: { path: "README.md" } };
 	for (let depth = 0; depth < 5; depth += 1) nested = { recipient_name: "multi_tool_use.parallel", parameters: { tool_uses: [nested] } };

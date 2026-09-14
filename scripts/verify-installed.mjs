@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
-import { mkdir, readFile, writeFile, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 
 const [agentDir, workDir, installed] = process.argv.slice(2).map((value) => resolve(value));
-const { acquireWorktreeLease, lockIdentity } = await import(pathToFileURL(join(installed, "lease.ts")).href);
+const { acquireFileLease, acquireWorktreeLease, lockIdentity } = await import(pathToFileURL(join(installed, "lease.ts")).href);
 const runtimeDir = join(agentDir, "runtime");
 const settingsPath = join(agentDir, "settings.json");
 const settings = JSON.parse(await readFile(settingsPath, "utf8"));
@@ -90,6 +91,8 @@ class Client {
 }
 
 const clients = [];
+// An actual non-Git parent is required; the isolated agent directory may be under the source worktree.
+const fileFixture = await mkdtemp(join(tmpdir(), "pi-file-install-"));
 function launch(flags, env) {
 	const client = new Client(flags, env);
 	clients.push(client);
@@ -100,10 +103,23 @@ async function proveFree(target = workDir) {
 	try { assert.equal(result.kind, "held", "kernel lease was not released"); }
 	finally { if (result.kind === "held") await result.release(); }
 }
+async function proveFileFree(target) {
+	const result = await acquireFileLease(target, { runtimeDir: join(runtimeDir, `pi-session-guard-${process.getuid()}`) });
+	try { assert.equal(result.kind, "held", "exact-file lease was not released"); }
+	finally { if (result.kind === "held") await result.release(); }
+}
 try {
+	const configFile = join(fileFixture, "standalone-config.json");
+	await writeFile(configFile, "{}\n");
+	const fileHolder = await acquireFileLease(configFile, { runtimeDir: join(runtimeDir, `pi-session-guard-${process.getuid()}`), sessionId: "file-holder" });
+	assert.equal(fileHolder.kind, "held");
+	const fileContender = await acquireFileLease(configFile, { runtimeDir: join(runtimeDir, `pi-session-guard-${process.getuid()}`), sessionId: "file-contender" });
+	assert.equal(fileContender.kind, "contended");
+	if (fileHolder.kind === "held") await fileHolder.release();
+	await proveFileFree(configFile);
 	const first = launch();
 	const commands = (await first.send("get_commands")).commands;
-	for (const name of ["plan", "implement"]) {
+	for (const name of ["plan", "implement", "grant-file", "grants"]) {
 		assert.equal(commands.filter((command) => command.name === name && command.source === "extension").length, 1);
 		assert.equal(commands.filter((command) => command.name.startsWith(`${name}:`)).length, 0);
 	}
@@ -146,6 +162,11 @@ assert.equal(result.kind,"held");
 	const plan = launch(["--plan", "--implement"]);
 	await plan.send("get_commands");
 	await plan.state("plan", false);
+	await plan.send("prompt", { message: `/grant-file ${JSON.stringify(configFile)}` });
+	await plan.state("plan", false);
+	assert.ok(plan.events.some((event) => event.method === "notify" && /require interactive TUI confirmation/.test(event.message)));
+	assert.equal(plan.events.some((event) => event.method === "confirm"), false);
+	await proveFileFree(configFile);
 	await proveFree();
 	await plan.stop();
 	const disabled = launch(["--plan"], { PI_SESSION_GUARD: "0" });
@@ -197,7 +218,8 @@ assert.equal(result.kind,"held");
 		assert.equal(client.events.some((event) => event.type === "agent_start" || event.type === "extension_error"), false, "unexpected model turn or extension error");
 		assert.doesNotMatch(client.stderr, /Failed to load extension/);
 	}
-	console.log("RPC: single load, plan/implement, contention, holder loss, reload, shutdown, flag precedence, missing resolver, bypass and exported observer: PASS; no model turns");
+	console.log("RPC: single load, plan/implement, exact-file command registration and kernel contention, holder loss, reload, shutdown, flag precedence, missing resolver, bypass and exported observer: PASS; no model turns");
 } finally {
 	for (const client of clients) await client.stop();
+	await rm(fileFixture, { recursive: true, force: true });
 }

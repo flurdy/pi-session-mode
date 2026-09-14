@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireWorktreeLease } from "./lease.ts";
 import { LeaseSet } from "./lease-set.ts";
-import type { HeldWorktreeLease, WorktreeLeaseResult } from "./lease.ts";
+import type { FileLeaseResult, HeldFileLease, HeldWorktreeLease, WorktreeLeaseResult } from "./lease.ts";
 
 function handle(root: string, released: string[]) {
 	let lose!: () => void;
@@ -19,7 +19,120 @@ function handle(root: string, released: string[]) {
 	};
 	return { lease, lose };
 }
+function fileHandle(file: string, released: string[]) {
+	let lose!: () => void;
+	let alive = true;
+	const lease: HeldFileLease = {
+		kind: "held", file, holderPid: 124,
+		get alive() { return alive; },
+		lost: new Promise<void>((resolve) => { lose = () => { alive = false; resolve(); }; }),
+		async release() { alive = false; released.push(file); },
+	};
+	return { lease, lose };
+}
 const resolveRoots = async (paths: string[]) => [...new Set(paths)].sort();
+const resolveFiles = async (paths: string[]) => [...new Set(paths)].sort();
+
+test("mixed additions publish atomically and retain prior scopes on failure", async () => {
+	const released: string[] = [];
+	const set = new LeaseSet(
+		async (root) => handle(root, released).lease,
+		resolveRoots,
+		() => {},
+		{
+			acquireFile: async (file): Promise<FileLeaseResult> => file === "/blocked" ? { kind: "contended", file } : fileHandle(file, released).lease,
+			resolveFiles,
+		},
+	);
+	assert.equal((await set.addFiles(["/kept"], "/cwd", "session")).kind, "held");
+	let published = false;
+	const failed = await set.addScopes(
+		{ worktrees: { kind: "paths", paths: ["repo"] }, files: ["/blocked"] },
+		"/cwd", "session", () => { published = true; },
+	);
+	assert.equal(failed.kind, "contended");
+	assert.equal(published, false);
+	assert.deepEqual(set.roots, []);
+	assert.deepEqual(set.files, ["/kept"]);
+	assert.deepEqual(released, ["repo"]);
+	await set.releaseAll();
+});
+
+test("file loss revokes mixed authority and each scope kind has an independent bound", async () => {
+	const released: string[] = [];
+	const lostFile = fileHandle("file-0", released);
+	const set = new LeaseSet(
+		async (root) => handle(root, released).lease,
+		resolveRoots,
+		() => {},
+		{
+			acquireFile: async (file) => file === "file-0" ? lostFile.lease : fileHandle(file, released).lease,
+			resolveFiles,
+		},
+	);
+	assert.equal((await set.addScopes(
+		{ worktrees: { kind: "paths", paths: Array.from({ length: 32 }, (_, index) => `root-${index}`) }, files: Array.from({ length: 32 }, (_, index) => `file-${index}`) },
+		"/cwd", "session",
+	)).kind, "held");
+	assert.equal((await set.add(["root-32"], "/cwd", "session")).kind, "invalid");
+	assert.equal((await set.addFiles(["file-32"], "/cwd", "session")).kind, "invalid");
+	lostFile.lose();
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(set.live, false);
+	assert.deepEqual(set.roots, []);
+	assert.deepEqual(set.files, []);
+	await set.releaseAll();
+});
+
+test("changed restored file identities are rejected before acquisition", async () => {
+	let acquired = 0;
+	const set = new LeaseSet(
+		async (root) => handle(root, []).lease,
+		resolveRoots,
+		() => {},
+		{ acquireFile: async (file) => { acquired++; return fileHandle(file, []).lease; }, resolveFiles: async () => ["changed"] },
+	);
+	const result = await set.addScopes(
+		{ worktrees: { kind: "none" }, files: ["saved"] },
+		"/cwd", "session", undefined, { roots: [], files: ["saved"] },
+	);
+	assert.equal(result.kind, "invalid");
+	assert.equal(acquired, 0);
+	await set.releaseAll();
+});
+
+test("cancellation drains a late file acquisition without publishing it", async () => {
+	const released: string[] = [];
+	let finish!: (result: FileLeaseResult) => void;
+	let started!: () => void;
+	const ready = new Promise<void>((resolve) => { started = resolve; });
+	const set = new LeaseSet(async (root) => handle(root, released).lease, resolveRoots, () => {}, {
+		resolveFiles,
+		acquireFile: () => { started(); return new Promise((resolve) => { finish = resolve; }); },
+	});
+	const adding = set.addFiles(["/file"], "/cwd", "session");
+	await ready;
+	const drain = set.releaseAll();
+	finish(fileHandle("/file", released).lease);
+	assert.equal((await adding).kind, "cancelled");
+	await drain;
+	assert.deepEqual(set.files, []);
+	assert.deepEqual(released, ["/file"]);
+});
+
+test("failed mixed checkpoint releases only the new file and root handles", async () => {
+	const released: string[] = [];
+	const set = new LeaseSet(async (root) => handle(root, released).lease, resolveRoots, () => {}, {
+		resolveFiles, acquireFile: async (file) => fileHandle(file, released).lease,
+	});
+	await set.addFiles(["/kept"], "/cwd", "session");
+	const result = await set.addScopes({ worktrees: { kind: "paths", paths: ["/root"] }, files: ["/new"] }, "/cwd", "session", () => { throw new Error("checkpoint failed"); });
+	assert.equal(result.kind, "invalid");
+	assert.deepEqual(set.roots, []);
+	assert.deepEqual(set.files, ["/kept"]);
+	assert.deepEqual(released.sort(), ["/new", "/root"]);
+	await set.releaseAll();
+});
 
 test("an obsolete rejected loss notification cannot invalidate a later held set", async () => {
 	const released: string[] = [];

@@ -37,6 +37,7 @@ const SUBAGENT_BLOCK_REASON = "Guarded session: this subagent operation may laun
 
 export interface GuardedToolPolicyOptions {
 	readOnlySubagents?: ReadonlySet<string>;
+	allowNativeWrites?: boolean;
 }
 
 const FILE_MUTATION = /\b(?:rm|rmdir|mv|cp|mkdir|touch|chmod|chown|chgrp|ln|tee|truncate|dd|shred|patch|rsync)\b/i;
@@ -132,7 +133,8 @@ function parallelBlockReason(input: unknown, options: GuardedToolPolicyOptions, 
 			return `Guarded session: malformed nested call ${index + 1} blocked.`;
 		}
 		const toolName = normalizedNestedToolName(nested.recipient_name);
-		if (!SAFE_PARALLEL_TOOL_NAMES.has(toolName)) return `Guarded session: unknown nested tool '${toolName}' blocked.`;
+		const allowedNativeWrite = options.allowNativeWrites === true && (toolName === "edit" || toolName === "write");
+		if (!allowedNativeWrite && !SAFE_PARALLEL_TOOL_NAMES.has(toolName)) return `Guarded session: unknown nested tool '${toolName}' blocked.`;
 		const reason = guardedToolBlockReason(toolName, nested.parameters, options, depth + 1);
 		if (reason) return `Guarded session: nested call ${index + 1} blocked. ${reason}`;
 	}
@@ -146,7 +148,7 @@ export function guardedToolBlockReason(
 	depth = 0,
 ): string | undefined {
 	const directReason = GUARDED_TOOL_REASONS.get(toolName);
-	if (directReason) return directReason;
+	if (directReason && !(options.allowNativeWrites === true && (toolName === "edit" || toolName === "write"))) return directReason;
 	if (toolName === "bash") {
 		const command = isRecord(input) ? input.command : undefined;
 		return typeof command === "string" && isObviousMutation(command) ? GUARDED_MUTATION_REASON : undefined;

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { acquireWorktreeLease, lockIdentity } from "./lease.ts";
+import { acquireFileLease, acquireWorktreeLease, fileLeaseLockPath, lockIdentity, worktreeLeaseLockPath } from "./lease.ts";
 
 async function gitRepo(): Promise<{ repo: string; runtimeDir: string; cleanup: () => Promise<void> }> {
 	const root = await mkdtemp(join(tmpdir(), "pi-session-mode-"));
@@ -20,6 +20,41 @@ async function gitRepo(): Promise<{ repo: string; runtimeDir: string; cleanup: (
 	execFileSync("git", ["-C", repo, "commit", "-qm", "fixture"]);
 	return { repo, runtimeDir, cleanup: () => rm(root, { recursive: true, force: true }) };
 }
+
+test("exact-file leases contend on canonical identity without changing worktree lock paths", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-file-lease-"));
+	const runtimeDir = join(root, "runtime"), file = join(root, "settings.json"), alias = join(root, "alias.json");
+	try {
+		await writeFile(file, "{}\n"); await symlink(file, alias);
+		const first = await acquireFileLease(file, { runtimeDir, sessionId: "first" });
+		assert.equal(first.kind, "held");
+		const second = await acquireFileLease(alias, { runtimeDir, sessionId: "second" });
+		assert.equal(second.kind, "contended");
+		if (second.kind === "contended") assert.equal(second.holder?.sessionId, "first");
+		assert.notEqual(fileLeaseLockPath(file, runtimeDir), worktreeLeaseLockPath(file, runtimeDir));
+		const mismatch = await acquireFileLease(file, { runtimeDir, expectedFile: join(root, "other") });
+		assert.equal(mismatch.kind, "unavailable");
+		if (first.kind === "held") {
+			process.kill(first.holderPid, "SIGKILL");
+			await first.lost;
+		}
+		const replacement = await acquireFileLease(alias, { runtimeDir, sessionId: "replacement" });
+		assert.equal(replacement.kind, "held");
+		if (replacement.kind === "held") await replacement.release();
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("file acquisition treats canonical identity as literal rather than normalized user input", async () => {
+	const root = await mkdtemp(join(tmpdir(), "file-lease-literal-"));
+	const file = join(root, "config\u00a0.json");
+	try {
+		const lease = await acquireFileLease(file, { runtimeDir: join(root, "runtime"), expectedFile: file });
+		try {
+			assert.equal(lease.kind, "held");
+			if (lease.kind === "held") assert.equal(lease.file, file);
+		} finally { if (lease.kind === "held") await lease.release(); }
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
 
 test("release force-terminates a stopped holder before returning", async () => {
 	const fixture = await gitRepo();

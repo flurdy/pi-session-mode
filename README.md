@@ -1,6 +1,6 @@
 # Pi Session Mode
 
-A [Pi](https://pi.dev) extension for guarded plan mode and explicitly scoped, incremental Git-worktree writer leases. Disjoint repository sets can work concurrently. This is an accidental-change guard, not a sandbox.
+A [Pi](https://pi.dev) extension for guarded plan mode, explicitly scoped Git-worktree writer leases, and confirmed exact-file grants outside Git. Disjoint repositories and configuration files can be coordinated independently. This is an accidental-change guard, not a sandbox.
 
 See [the guard contract](docs/guard.md) for policy, lease lifetime, compatibility, failure behavior, and explicit bypasses.
 
@@ -24,16 +24,20 @@ For a reviewed mutable checkout, run `make apply`. It owns the existing `~/.pi/a
 
 ## Use
 
-- `/plan` guards writes, drains pending additions, releases all leases, and saves plan mode.
-- `/implement` acquires the cwd worktree when none is held; otherwise it retains the current set.
+- `/plan` guards writes, drains pending additions, releases every worktree and file lease, and saves plan mode.
+- `/implement` acquires the cwd worktree when none is held; otherwise it retains the current worktree set.
 - `/implement repos/api repos/web` adds those worktree roots without implicitly leasing the workspace root. Quote literal paths containing spaces.
-- `/leases` shows held/requested/failed scopes. `/leases repos/api` inspects that root without acquiring.
+- `/grant-file ~/.agents/tool/config.json` resolves exact non-Git files, displays their canonical identities, and requires an interactive confirmation before acquiring them. It can establish file-only implementation mode without leasing cwd; the bounded guarded Bash/subagent policy remains active until a worktree is also leased.
+- `/leases` shows held/requested/failed worktree scopes. `/leases repos/api` inspects that root without acquiring.
+- `/grants` shows held/requested/failed exact-file scopes. `/grants path` resolves that file identity without acquiring it.
 - `pi --implement --lease-roots '["repos/api","repos/web"]'` selects explicit startup roots. `--plan` wins; explicit startup flags override saved selection.
 - `PI_SESSION_GUARD=0` is the explicit, visibly unguarded emergency bypass.
 
 **Compatibility change in 0.2:** native `edit`/`write` calls require the target's owning worktree lease, including from default cwd-only sessions. A workspace-root lease no longer lets those tools edit linked or nested repositories. Select each target explicitly. Bash/script effects remain outside path enforcement. Legacy non-Git or unavailable implicit-cwd sessions remain visibly `unguarded` and bypass native checks; start in plan mode or select explicit valid roots to obtain protection.
 
-A failed addition preserves previously held roots. Any lost lease guards the whole session and releases the set. There is no automatic acquisition from Beads, automatic release on completion/idle, per-root release, or special cross-repository owner. Narrow a set with `/plan`, then select the desired roots again. The footer keeps the guard label and adds `leases:N`; `/leases` provides full identities.
+A failed addition preserves previously held worktree and file scopes. Any lost lease guards the whole session and releases the combined set. File grants are limited to exact regular files with one filesystem link, or one missing leaf beneath an existing canonical parent; directories, missing parents, filesystem-marker-detectable Git ownership or administration, reserved Git marker names, hardlinks, dangling links, and special files fail closed. Marker-less or externally redirected worktrees are not detectable from an ordinary file path and remain outside this cooperative guarantee. Revalidation before every native edit/write catches identity and scope-revision changes.
+
+There is no automatic authority from Beads, prompts, environment variables, project configuration, or model tools; `/grant-file` is interactive-only. There is also no automatic release on completion/idle, individual release, or special cross-repository owner. Narrow a set with `/plan`, then select the desired scopes again. Separate `leases:N` and `grants:N` extension statuses plus `/leases` and `/grants` expose the active identities. A bounded grant widget remains visible even when a custom footer ignores extension statuses.
 
 ## Observer integration
 
@@ -58,7 +62,7 @@ After committing, run `npm run verify:git-install`. It installs the exact local 
 
 ## Rollback
 
-Enter `/plan`, remove only the selected package or checkout link, then restart Pi. Do not delete runtime lock files to force takeover. Version 0.2 writes safe v1 plan checkpoints before v2 scope records so older versions resume guarded instead of reviving stale implementation mode. Removing the extension makes its custom entries inert. Downgrading also removes scoped native-write enforcement; do not assume mixed-version sessions provide the same protection.
+Enter `/plan`, remove only the selected package or checkout link, then restart Pi. Do not delete runtime lock files to force takeover. Worktree-only selections keep the safe v1-plan-plus-v2 checkpoint format. Selections containing file grants write a safe v1 plan checkpoint before their v3 combined record, so v2 readers resume guarded rather than retaining only part of the authority. Removing the extension makes its custom entries inert. Downgrading also removes exact-file and scoped native-write enforcement; do not assume mixed-version sessions provide the same protection.
 
 ## License
 

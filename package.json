@@ -24,10 +24,12 @@
   "files": [
     "README.md",
     "docs/guard.md",
+    "file-scope.ts",
     "index.ts",
     "lease-observer.ts",
     "lease-set.ts",
     "lease.ts",
+    "path.ts",
     "policy.ts",
     "scope.ts",
     "scoped-policy.ts",

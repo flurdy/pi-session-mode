@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
+import { resolveExplicitFiles } from "./file-scope.ts";
 import { parseRootArguments, parseRootFlag, resolveExplicitRoots, resolveWriteRoot, normalizeToolPath, scopeStatus } from "./scope.ts";
 
 test("root arguments are quoted literals, not shell syntax", () => {
@@ -44,6 +45,50 @@ test("explicit scopes deduplicate aliases and refuse ancestor widening", async (
 			assert.deepEqual(await resolveExplicitRoots([spaced], root), [spaced]);
 			assert.equal(await resolveWriteRoot("new-file", spaced), spaced);
 		}
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("explicit files canonicalize existing files and one missing leaf", async () => {
+	const root = await mkdtemp(join(tmpdir(), "grant-scope-"));
+	try {
+		const config = join(root, "config");
+		await mkdir(config);
+		await writeFile(join(config, "settings.json"), "{}\n");
+		await symlink(config, join(root, "alias"));
+		assert.deepEqual(
+			await resolveExplicitFiles(["config/settings.json", "alias/settings.json", "alias/new.json"], root),
+			[join(config, "new.json"), join(config, "settings.json")],
+		);
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("file grants reject repository ownership and ambiguous Git administration", async () => {
+	const root = await mkdtemp(join(tmpdir(), "grant-git-scope-"));
+	try {
+		const repo = join(root, "repo"), marker = join(root, "marker"), bare = join(root, "bare");
+		await mkdir(repo); execFileSync("git", ["-C", repo, "init", "-q", "-b", "main"]);
+		await writeFile(join(repo, "settings.json"), "{}\n");
+		await mkdir(marker); await writeFile(join(marker, ".git"), "gitdir: unavailable\n");
+		await writeFile(join(marker, "settings.json"), "{}\n");
+		await mkdir(join(bare, "objects"), { recursive: true }); await mkdir(join(bare, "refs"));
+		await writeFile(join(bare, "HEAD"), "ref: refs/heads/main\n"); await writeFile(join(bare, "config"), "");
+		for (const path of [join(repo, "settings.json"), join(marker, "settings.json"), join(bare, "config")]) {
+			await assert.rejects(resolveExplicitFiles([path], root), /Git|repository/i);
+		}
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("file grants reject unstable identities and broad or missing scopes", async () => {
+	const root = await mkdtemp(join(tmpdir(), "grant-unsafe-scope-"));
+	try {
+		await writeFile(join(root, "file"), "data");
+		await link(join(root, "file"), join(root, "hardlink"));
+		await symlink(join(root, "absent"), join(root, "dangling"));
+		for (const path of [root, join(root, "file"), join(root, "hardlink"), join(root, "dangling"), join(root, "missing", "file"), ...[".git", "HEAD", "objects", "refs"].map((name) => join(root, name))]) {
+			await assert.rejects(resolveExplicitFiles([path], root));
+		}
+		await assert.rejects(resolveExplicitFiles([], root));
+		await assert.rejects(resolveExplicitFiles(Array.from({ length: 33 }, (_, index) => join(root, `file-${index}`)), root));
 	} finally { await rm(root, { recursive: true, force: true }); }
 });
 
