@@ -1,6 +1,6 @@
 {
   "name": "@flurdy/pi-session-mode",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "description": "Guarded plan mode and canonical Git-worktree writer leases for Pi",
   "license": "MIT",
