@@ -57,6 +57,30 @@ shell-wrapper payloads; a triage command does not exempt a following source or d
 mutation. Quoting is not shell isolation: substitutions and arbitrary script side effects remain
 outside this accidental-change guard's guarantee.
 
+## Read-only second opinions
+
+Direct read-only second-opinion routes do not require a source lease. Eligibility is not proof
+of executable availability, authentication, billing consent or successful launch. Verified external
+children retain the inherited-cwd async-only contract; never pass native child options to expand
+an external runner's tools. Current discovery and runner preflight must both succeed.
+
+Named panels are unsupported in guarded states, including file-only implementation sessions.
+Their multi-stage coordinator requires caller-owned prompt and result files; no private-artifact
+capability is provided. Stop before context artifacts or panel consent, and never emulate a panel
+with direct calls or silently substitute a peer. The bounded Bash checker rejects recognizable
+`review-panel.sh` and `openrouter-panel.sh` invocations (literal paths, shell/`env` wrappers and
+constant shell payloads) with a panel-specific reason. `mktemp` is also an obvious file mutation.
+Existing input files do not authorize panel execution. This is not shell isolation: renamed
+scripts, arbitrary indirection and hidden subprocess effects remain outside detection and must
+not be used as workarounds.
+
+There is no broad temporary-directory or home grant, no new native-write exception, and no change
+to panel selection, digests, limits, billing or quorum/consensus interpretation. The owning skill's
+[support matrix](https://github.com/flurdy/agent-skills/blob/main/skills/second-opinion/references/guarded-plan.md)
+separates policy from actual runtime evidence and explains unsupported options, plan-policy denial,
+unavailable executable/auth, version incompatibility and billing consent. It never recommends
+implementation mode solely for a supported read-only consultation.
+
 ## Kernel authority and transitions
 
 The identity remains SHA-256 of the canonical Git top-level path. Git's answer must match the nearest filesystem `.git` marker. Ambient location overrides, redirected `core.worktree` configurations and marker-less setups that disagree are unavailable, not alternate ownership. Normal clones, linked worktrees and initialized submodules remain supported. Each root has a stable private-runtime `flock` file plus diagnostic-only holder metadata. The fixed holder process publishes a ready handshake only after metadata publication. No JSON file or tracker claim proves ownership.
@@ -143,6 +167,9 @@ The statusline suppresses its own holder during plan release. Explicit `/leases`
 
 Development pins Pi 0.85.1. Its reload path awaits session shutdown before resource reload/rebinding; the package drains acquisition and release there. Confirmed activation also treats the public `getAgentDir`/`getPackageDir` exports and package CLI entry as a version-tested compatibility seam; it never imports private package-manager modules. Native tests, real temporary Git/flock fixtures and isolated RPC installation checks cover scope transitions, loss, reload and restoration. Interactive footer checks supplement—not replace—those contracts. The scripted local provider fixture runs actual Pi native tool preflight, sibling execution and wrapper dispatch, validates tool-call/result pairing through in-turn checkpoints, and checks cancellation and reload without external model requests. Recheck on upgrades; an open host peer range does not certify future Pi behavior.
 
-The optional reviewer seam was checked with pi-subagents 0.65.1. It deep-imports `src/agents/agents.ts` under the active Pi agent directory and expects `discoverAgents(cwd, "both", provider)` to return `{ scope: "both", agents: [...] }`. This internal API is not a stability guarantee. Keep absence, malformed definitions and unsafe contracts fail-closed; do not vendor the resolver or turn discovery failures into approval.
+The optional reviewer discovery seam was initially checked with pi-subagents 0.65.1; that version's
+background launcher incorrectly depended on experimental packages absent from published Pi 0.85.1.
+The upstream 0.67.0 fix restored the inherited-cwd async external path. Discovery eligibility alone
+never proves launch compatibility or auth. It deep-imports `src/agents/agents.ts` under the active Pi agent directory and expects `discoverAgents(cwd, "both", provider)` to return `{ scope: "both", agents: [...] }`. This internal API is not a stability guarantee. Keep absence, malformed definitions and unsafe contracts fail-closed; do not vendor the resolver or turn discovery failures into approval.
 
 Consumers use `@flurdy/pi-session-mode/lease-observer`; do not copy the implementation. Its new batch function supplements the existing single-root function. See the [README](../README.md) for installation, verification and downgrade boundaries.

@@ -41,7 +41,9 @@ export interface GuardedToolPolicyOptions {
 	allowNativeWrites?: boolean;
 }
 
-const FILE_MUTATION = /\b(?:rm|rmdir|mv|cp|mkdir|touch|chmod|chown|chgrp|ln|tee|truncate|dd|shred|patch|rsync)\b/i;
+const FILE_MUTATION = /\b(?:rm|rmdir|mv|cp|mkdir|mktemp|touch|chmod|chown|chgrp|ln|tee|truncate|dd|shred|patch|rsync)\b/i;
+const PANEL_SCRIPTS = new Set(["review-panel.sh", "openrouter-panel.sh"]);
+const PANEL_BLOCK_REASON = "Guarded session: named second-opinion panels are unsupported, including quorum, premium and consensus profiles. No private-artifact capability is available. Stop before artifacts or billing consent; a direct read-only peer requires separate route selection, not source-write authority.";
 const IN_PLACE_MUTATION = /\b(?:sed\s+(?:-[A-Za-z]*i[A-Za-z]*\b|--in-place\b)|perl\s+-[A-Za-z]*p?i[A-Za-z]*\b|tar\s+[^\n;&|]*-[A-Za-z]*x|unzip\b|vim?\b|nano\b|emacs\b|subl\b|code\s+[^\n;&|]*--wait\b)/i;
 const PACKAGE_MUTATION =
 	/\b(?:npm\s+(?:install|uninstall|update|ci|link|publish)|yarn\s+(?:add|remove|install|publish)|pnpm\s+(?:add|remove|install|update|publish)|pipx?\s+(?:install|uninstall)|cargo\s+(?:add|remove|install|uninstall|update|publish)|go\s+(?:get|install)|go\s+mod\s+(?:download|edit|init|tidy|vendor)|bundle\s+(?:install|update)|gem\s+(?:install|uninstall|update)|composer\s+(?:install|update|require|remove)|apt(?:-get)?\s+(?:install|remove|purge|update|upgrade)|brew\s+(?:install|uninstall|upgrade))\b/i;
@@ -152,7 +154,9 @@ export function guardedToolBlockReason(
 	if (directReason && !(options.allowNativeWrites === true && (toolName === "edit" || toolName === "write"))) return directReason;
 	if (toolName === "bash") {
 		const command = isRecord(input) ? input.command : undefined;
-		return typeof command === "string" && isObviousMutation(command) ? GUARDED_MUTATION_REASON : undefined;
+		if (typeof command !== "string") return undefined;
+		if (isPanelInvocation(command)) return PANEL_BLOCK_REASON;
+		return isObviousMutation(command) ? GUARDED_MUTATION_REASON : undefined;
 	}
 	if (toolName === "subagent") return subagentBlockReason(input, options);
 	if (toolName === "subagent_supervisor") {
@@ -200,7 +204,7 @@ function withoutQuotedText(command: string): string {
 	return result;
 }
 
-function shellWords(command: string): string[] {
+function shellWords(command: string, keepSeparators = false): string[] {
 	const words: string[] = [];
 	let word = "";
 	let started = false;
@@ -236,6 +240,7 @@ function shellWords(command: string): string[] {
 		}
 		if (/\s/.test(character) || /[;&|()]/.test(character)) {
 			push();
+			if (keepSeparators && /[;&|()\n]/.test(character)) words.push(";");
 			continue;
 		}
 		word += character;
@@ -302,6 +307,43 @@ function constantShellPayloads(command: string): string[] {
 		}
 	}
 	return payloads;
+}
+
+function isPanelCommand(words: string[]): boolean {
+	let index = 0;
+	while (index < words.length) {
+		if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index]!)) { index++; continue; }
+		const executable = words[index++]!.split("/").at(-1)!;
+		if (["env", "command", "exec"].includes(executable)) {
+			while (words[index]?.startsWith("-")) {
+				const option = words[index++];
+				if (executable === "env" && (option === "-u" || option === "--unset" || option === "-C" || option === "--chdir")) index++;
+			}
+			continue;
+		}
+		if (["bash", "sh", "zsh", "dash", "fish"].includes(executable)) {
+			while (words[index]?.startsWith("-")) {
+				const option = words[index++]!;
+				if (/^-[A-Za-z]*c[A-Za-z]*$/.test(option)) return false; // Constant payloads are checked separately.
+				index += shellOptionValueCount(executable, option);
+			}
+			return PANEL_SCRIPTS.has(words[index]?.split("/").at(-1) ?? "");
+		}
+		return PANEL_SCRIPTS.has(executable);
+	}
+	return false;
+}
+
+function isPanelInvocation(command: string, depth = 0): boolean {
+	if (depth < MAX_INSPECTION_DEPTH && constantShellPayloads(command).some((payload) => isPanelInvocation(payload, depth + 1))) return true;
+	const words: string[] = [];
+	for (const word of [...shellWords(command, true), ";"]) {
+		if (word === ";") {
+			if (isPanelCommand(words)) return true;
+			words.length = 0;
+		} else words.push(word);
+	}
+	return false;
 }
 
 function isObviousMutationAtDepth(command: string, depth: number): boolean {

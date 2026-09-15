@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
@@ -21,6 +21,12 @@ for (const path of [work, ...Object.values(repos)]) execFileSync("git", ["-C", p
 await mkdir(join(work, "repos"));
 for (const [name, path] of Object.entries(repos)) await symlink(path, join(work, "repos", name));
 const slowKey = createHash("sha256").update(repos.slow).digest("hex");
+const panelDispatched = join(base, "panel-dispatched");
+const panelArtifacts = join(base, "panel-artifacts");
+await mkdir(panelArtifacts);
+for (const helper of ["review-panel.sh", "openrouter-panel.sh"]) {
+	await writeFile(join(bin, helper), `#!/bin/sh\nprintf dispatched > '${panelDispatched}'\nexit 99\n`, { mode: 0o700 });
+}
 const started = join(base, "slow-started");
 const flock = execFileSync("which", ["flock"], { encoding: "utf8" }).trim();
 await writeFile(join(bin, "flock"), `#!/bin/sh\ncase "$5" in *${slowKey}.lock) printf ready > '${started}'; sleep 0.5;; esac\nexec '${flock}' "$@"\n`, { mode: 0o700 });
@@ -34,7 +40,7 @@ class Client {
 	pending = new Map(); events = []; sequence = 0; buffer = ""; stderr = "";
 	constructor(agent, flags) {
 		this.child = spawn("pi", ["--mode", "rpc", "--offline", "--no-skills", "--no-context-files", "--no-approve", "--session", join(agent, "session.jsonl"), "--provider", "lease-fixture", "--model", "fixed", "-e", join(target, "index.ts"), "-e", join(source, "fixtures", "native-write-provider.ts"), ...flags], {
-			cwd: work, env: { HOME: agent, PATH: `${bin}:${process.env.PATH}`, TERM: "xterm-256color", PI_CODING_AGENT_DIR: agent, XDG_RUNTIME_DIR: runtime, PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" }, stdio: ["pipe", "pipe", "pipe"],
+			cwd: work, env: { HOME: agent, PATH: `${bin}:${process.env.PATH}`, TERM: "xterm-256color", PI_CODING_AGENT_DIR: agent, XDG_RUNTIME_DIR: runtime, TMPDIR: panelArtifacts, PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" }, stdio: ["pipe", "pipe", "pipe"],
 		});
 		this.closed = new Promise((done) => this.child.once("close", done));
 		this.child.stdout.setEncoding("utf8");
@@ -146,6 +152,23 @@ try {
 	const guarded = await first.turn("guarded", [write("repos/slow/guarded")]);
 	assert.equal(guarded.length, 1); assert.equal(guarded[0].isError, true);
 	await first.roots([]); await absent(join(repos.slow, "guarded"));
+	const beforePanelArtifacts = await readdir(panelArtifacts);
+	for (const [index, command] of [
+		"review-panel.sh check --prompt-file repos/api/new",
+		"bash review-panel.sh run-local --prompt-file repos/api/new",
+		"env -i openrouter-panel.sh run --confirmed --prompt-file repos/api/new",
+		"mktemp",
+	].entries()) {
+		const denied = await first.turn(`panel-denied-${index}`, [{ name: "bash", arguments: { command } }]);
+		assert.equal(denied.length, 1); assert.equal(denied[0].isError, true);
+		assert.match(JSON.stringify(denied[0].result), index < 3 ? /named second-opinion panels are unsupported/i : /command blocked/i);
+	}
+	await absent(panelDispatched);
+	assert.deepEqual(await readdir(panelArtifacts), beforePanelArtifacts);
+	await first.roots([]);
+	assert.equal((await first.snapshot()).saved.data.mode, "plan");
+	const directPolicy = await first.turn("direct-packet", [{ name: "bash", arguments: { command: "printf '%s' 'sanitized direct peer packet'" } }]);
+	assert.equal(directPolicy[0].isError, false);
 	for (const client of clients) {
 		assert.doesNotMatch(client.stderr, /Failed to load extension|Network is forbidden/);
 		assert.equal(client.events.some((event) => event.type === "extension_error"), false);
@@ -158,7 +181,7 @@ try {
 	for (const call of calls) assert.equal(resultsInSession.filter((entry) => entry.message.toolCallId === call.id).length, 1, `Unpaired ${call.id}`);
 	const locks = JSON.parse(execFileSync("lslocks", ["--json", "--output", "PATH"], { encoding: "utf8" }));
 	assert.equal((locks.locks ?? []).some((row) => row.path?.startsWith(runtime)), false);
-	console.log("Dynamic RPC PASS: real Pi native write/edit, atomic wrapper, sibling preflights, contention, cancellation, v2 in-turn persistence and reload, paired tool results, unchanged active tools, selection-only no-op, guarded rejection, RPC package-activation denial, clean shutdown. Scripted fixture only; no external model requests.");
+	console.log("Dynamic RPC PASS: real Pi native write/edit, atomic wrapper, sibling preflights, contention, cancellation, v2 in-turn persistence and reload, paired tool results, unchanged active tools, selection-only no-op, guarded rejection, RPC package-activation denial, guarded panel pre-dispatch refusal with no artifacts or helper execution, clean shutdown. Scripted fixture only; no external model requests or real CLI/auth/billing proof.");
 } finally {
 	for (const client of clients) await client.stop();
 	await rm(base, { recursive: true, force: true });
