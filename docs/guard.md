@@ -41,8 +41,15 @@ Keep local issue updates, remote synchronization and source/Git/package/system c
 A configured Dolt remote alone does not make a comment a sync request. Verify effective export,
 backup, hook and synchronization settings and actual side effects, not commented examples or
 local-looking command syntax. Effects beyond local tracking require their own applicable
-authority; `/implement` alone does not authorize remote or destructive actions. This clarification
-does not change remote-sync policy or the destructive-command safeguards.
+authority; `/implement` alone does not authorize remote or destructive actions.
+
+The separately enrolled [`sync_beads_store`](beads-sync.md) tool is the only no-repeated-prompt
+remote exception. It binds one canonical store, URL and branch in a private user-owned file and
+revalidates them before explicit routine fetch, safe pull or non-force push. It works in guarded
+plan mode and outside cwd without acquiring source leases. Raw Dolt remote commands, force,
+conflict resolution, migration, bootstrap, remote changes, backup publication and source Git
+remain guarded. Enrollment permits later explicit calls; it does not trigger sync during reads or
+local triage.
 
 The bounded Bash checker permits ordinary triage with literal quoted prose, including words such
 as `delete`, `git push` and `npm install`. It still checks executable command chains and constant
@@ -130,7 +137,7 @@ The statusline suppresses its own holder during plan release. Explicit `/leases`
 - Worktree-root locks do not lock shared Git administration across separate worktrees.
 - Preflight/path checks are not atomic OS-level file isolation; hostile concurrent filesystem changes and custom tool overrides remain outside the guarantee.
 - Package activation inherits Pi's package-manager behavior, including dependency scripts, mutable-tag TOCTOU and non-transactional concurrent settings updates. Its explicit allowlist, confirmation and post-checks reduce accidental activation; they are not a supply-chain sandbox.
-- No runtime dependency on Beads, workspace.json or mgit is introduced.
+- `sync_beads_store` requires compatible installed `bd` and Dolt executables only when its trust or sync boundary is used. Lease and native-write enforcement retain no Beads, workspace.json or mgit dependency.
 
 ## Runtime and distribution
 

@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { realpath } from "node:fs/promises";
+import { createBeadsSyncAdapter, type BeadsSyncAdapter } from "./beads-sync.ts";
 import { isAbsolute, relative, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { acquireFileLease, acquireWorktreeLease, type FileLeaseResult, type WorktreeLeaseResult } from "./lease.ts";
@@ -28,6 +29,7 @@ export interface SessionModeDependencies {
 	isDisabled(): boolean;
 	readOnlySubagents(cwd: string, preferredProvider?: string): Promise<ReadonlySet<string>>;
 	packageActivation?: PackageActivationAdapter;
+	beadsSync?: BeadsSyncAdapter;
 }
 export interface SessionModeController {
 	readonly mode: SessionMode;
@@ -82,9 +84,14 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	let dynamicAcquisition: symbol | undefined;
 	let packageActivationOperation: symbol | undefined;
 	let packageActivationDrain: Promise<void> | undefined;
+	let beadsSyncOperation: symbol | undefined;
+	let beadsSyncDrain: Promise<void> | undefined;
+	let beadsSyncAbort: AbortController | undefined;
 	let lastFailure: { requested: readonly string[]; result: LeaseSetResult | string } | undefined;
 	let activationDependencies: ReturnType<typeof defaultPackageActivationDependencies> | undefined;
+	let beadsSyncAdapter: BeadsSyncAdapter | undefined = dependencies.beadsSync;
 	const defaultActivationDependencies = () => activationDependencies ??= defaultPackageActivationDependencies();
+	const beadsSync = () => beadsSyncAdapter ??= createBeadsSyncAdapter();
 	const packageActivation: PackageActivationAdapter = dependencies.packageActivation ?? {
 		prepare: (request, signal) => preparePackageActivation(request, defaultActivationDependencies(), signal),
 		activate: (request, prepared, options) => activatePreparedPackage(request, prepared, defaultActivationDependencies(), options),
@@ -343,6 +350,50 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 			}
 		},
 	});
+	pi.registerCommand("trust-beads-sync", {
+		description: "Trust one exact Beads store, Dolt remote URL and branch for routine sync",
+		handler: async (args, ctx) => {
+			if (rejectBusy(ctx)) return;
+			if (ctx.mode !== "tui" || !ctx.hasUI) { notify(ctx, "Beads sync trust enrollment requires interactive TUI confirmation.", "warning"); return; }
+			const ticket = generation, sessionId = ctx.sessionManager.getSessionId();
+			const currentEnrollment = () => {
+				try { return current(ticket) && currentContext?.sessionManager.getSessionId() === sessionId && ctx.sessionManager.getSessionId() === sessionId && ctx.mode === "tui" && ctx.hasUI; }
+				catch { return false; }
+			};
+			try {
+				const values = parseRootArguments(args);
+				if (values.length !== 2) throw new Error("Expected: /trust-beads-sync <store-directory> <remote-name>");
+				const prepared = await beadsSync().inspectTrust({ directory: values[0]!, remote: values[1]! }, ctx.signal);
+				if (!currentEnrollment() || rejectBusy(ctx)) return;
+				const display = prepared.display;
+				const message = [
+					`Store: ${safeDisplay(JSON.stringify(display.directory))}`,
+					`Beads directory: ${safeDisplay(JSON.stringify(display.beadsDir))}`,
+					`Remote: ${safeDisplay(JSON.stringify(display.remote))}`,
+					`URL: ${safeDisplay(JSON.stringify(display.remoteUrl))}`,
+					`Expanded transport URL: ${safeDisplay(JSON.stringify(display.transportUrl ?? display.remoteUrl))}`,
+					`Branch: ${safeDisplay(JSON.stringify(display.branch))}`,
+					`Database: ${safeDisplay(JSON.stringify(display.databaseName))} (${display.mode}) at ${safeDisplay(JSON.stringify(display.databasePath))}`,
+					`Schema: ${safeDisplay(display.schemaVersion ?? "")}`,
+					`Connection: ${safeDisplay(display.connection ?? "")}`,
+					`Connection configuration fingerprint: ${safeDisplay(display.connectionRevision ?? "")}`,
+					`File remote canonical path: ${safeDisplay(JSON.stringify(display.remotePath ?? ""))}`,
+					`bd: ${safeDisplay(JSON.stringify(`${display.bdPath} (${display.bdVersion})`))}`,
+					`Dolt: ${safeDisplay(JSON.stringify(`${display.doltPath} (${display.doltVersion})`))}`,
+					"",
+					"Routine sync_beads_store fetch, non-conflicting pull and non-force push may use this exact binding without another prompt. Destination, branch, schema or executable drift fails closed. Destructive, force, migration, remote-configuration, Git and production actions remain separately gated.",
+				].join("\n");
+				if (message.length > 10_000) throw new Error("Beads sync trust confirmation is too large");
+				if (!await ctx.ui.confirm("Trust routine Beads synchronization?", message, { timeout: 60_000 })) { notify(ctx, "Beads sync trust enrollment cancelled."); return; }
+				if (!currentEnrollment() || rejectBusy(ctx)) return;
+				await beadsSync().persistTrust(prepared, { sessionId, signal: ctx.signal, beforeLaunch: () => { if (!currentEnrollment() || !ctx.isIdle() || ctx.hasPendingMessages()) throw new Error("Beads sync trust authorization context changed"); } });
+				if (!currentEnrollment()) return;
+				notify(ctx, `Trusted routine Beads synchronization for ${safeDisplay(JSON.stringify(display.directory))} remote ${safeDisplay(JSON.stringify(display.remote))}.`, "info");
+			} catch (error) {
+				if (currentEnrollment()) notify(ctx, `Beads sync trust failed: ${String(error)}`, "error");
+			}
+		},
+	});
 	pi.registerCommand("grant-file", {
 		description: "Confirm and acquire exact non-repository file grants",
 		handler: async (args, ctx) => {
@@ -402,6 +453,46 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 				const observations = paths.length ? await probeWorktreeLeaseOccupancies(requested!, { selfPid: -1 }) : undefined;
 				notify(ctx, JSON.stringify({ state: STATE_META[state].label, held: leases.roots, requested, lastFailure, observations }));
 			} catch (error) { notify(ctx, `Lease inspection unavailable: ${String(error)}`, "error"); }
+		},
+	});
+
+	pi.registerTool({
+		name: "sync_beads_store",
+		label: "Sync Beads Store",
+		description: "Fetch, safely pull, or non-force push one user-enrolled Beads store and exact Dolt remote. Revalidates store, URL, branch, schema, executables and side-effect guards; pull refuses pending work, schema drift and prospective conflicts.",
+		promptSnippet: "Synchronize one user-enrolled Beads store without acquiring source worktree leases",
+		promptGuidelines: [
+			"Use sync_beads_store only when the user requests visible routine synchronization of a resolver-proven owning store; never call it during read-only listing, resolution or triage.",
+			"Raw Beads/Dolt remote, force, migration and configuration commands remain separately gated; sync_beads_store never authorizes Git publication or production changes.",
+		],
+		parameters: Type.Object({
+			action: Type.String({ pattern: "^(fetch|pull|push)$", description: "Routine operation: fetch, pull, or push" }),
+			directory: Type.String({ minLength: 1, maxLength: 4096, description: "Resolver-proven owning store directory" }),
+			remote: Type.String({ pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", description: "Enrolled Dolt remote name" }),
+		}, { additionalProperties: false }),
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			if (beadsSyncOperation) throw new Error("Another Beads sync is already running in this session");
+			const ticket = generation, sessionId = ctx.sessionManager.getSessionId();
+			const eligible = () => {
+				try { return current(ticket) && currentContext?.sessionManager.getSessionId() === sessionId && ctx.sessionManager.getSessionId() === sessionId && !signal?.aborted; }
+				catch { return false; }
+			};
+			if (!eligible()) throw new Error("Beads sync session context is unavailable");
+			const operation = Symbol("beads-sync");
+			beadsSyncOperation = operation;
+			const abort = new AbortController();
+			beadsSyncAbort = abort;
+			const syncSignal = signal ? AbortSignal.any([signal, abort.signal]) : abort.signal;
+			let finish!: () => void;
+			beadsSyncDrain = new Promise<void>((done) => { finish = done; });
+			try {
+				const evidence = await beadsSync().execute({ action: params.action as "fetch" | "pull" | "push", directory: params.directory, remote: params.remote }, { sessionId, signal: syncSignal, beforeLaunch: () => { if (!eligible()) throw new Error("Beads sync authorization context changed before launch"); } });
+				return { content: [{ type: "text" as const, text: JSON.stringify(evidence) }], details: evidence };
+			} catch (error) { throw new Error(safeDisplay(String(error)).slice(0, 4000)); }
+			finally {
+				if (beadsSyncOperation === operation) { beadsSyncOperation = undefined; beadsSyncDrain = undefined; beadsSyncAbort = undefined; }
+				finish();
+			}
 		},
 	});
 
@@ -566,7 +657,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		if (state === "unguarded") return;
 		const guidance = state === "implement" && leases.live
 			? `Leased worktrees: ${boundedScopeList(leases.roots)}. Exact-file grants: ${boundedScopeList(leases.files)}. ${leases.roots.length ? "Native edit/write calls can acquire and persist their canonical target worktree leases automatically; do not ask for a redundant /implement command for that supported path. Contention or unavailable identity blocks the write." : "File-only sessions cannot auto-acquire worktrees and retain the bounded guarded shell/subagent policy; ask for /implement while idle before repository work."} Exact non-repository files still require explicit /grant-file confirmation. Shell/script effects are not automatically scoped: never use them as a scope-expansion workaround. Reads, Beads claims, prose and subagent requests do not acquire leases.`
-			: "[GUARDED SESSION]\nDo not modify source files, Git, package or system state; ask the user to select /implement scopes first. Read-only analysis, safe subagent management and verified direct read-only reviewers are allowed.\nOrdinary local Beads triage means a local mutation in any resolver-proven owning store, not only cwd. Use bd -C <proven directory> for comments, create, update and close without /implement or a worktree lease. If ownership resolution is ambiguous, unavailable or not-found, write nothing; repository-specific tracker rules still win. Beads writes do not acquire source leases.\nVerify effective export, backup and synchronization side effects, not just command syntax or commented config examples. A configured Dolt remote alone does not make a local comment a sync request. Follow the applicable remote/destructive policy separately; /implement alone does not authorize remote or destructive actions.";
+			: "[GUARDED SESSION]\nDo not modify source files, Git, package or system state; ask the user to select /implement scopes first. Read-only analysis, safe subagent management and verified direct read-only reviewers are allowed.\nOrdinary local Beads triage means a local mutation in any resolver-proven owning store, not only cwd. Use bd -C <proven directory> for comments, create, update and close without /implement or a worktree lease. If ownership resolution is ambiguous, unavailable or not-found, write nothing; repository-specific tracker rules still win. Beads writes do not acquire source leases.\nVerify effective export, backup and synchronization side effects, not just command syntax or commented config examples. A configured Dolt remote alone does not make a local comment a sync request. Follow the applicable remote/destructive policy separately; /implement alone does not authorize remote or destructive actions. sync_beads_store is the only enrolled no-repeated-prompt routine sync boundary; never invoke it during list, resolver or triage workflows.";
 		return { systemPrompt: `${event.systemPrompt}\n\n${guidance}` };
 	});
 	pi.on("session_start", async (_event, ctx) => {
@@ -591,6 +682,8 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	});
 	pi.on("session_shutdown", async (_event, ctx) => {
 		shuttingDown = true; generation++; guardTools();
+		beadsSyncAbort?.abort();
+		await beadsSyncDrain;
 		await packageActivationDrain;
 		await leases.releaseAll();
 		resetDiscovery(); restoreTools();

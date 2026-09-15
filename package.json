@@ -1,6 +1,6 @@
 {
   "name": "@flurdy/pi-session-mode",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "description": "Guarded plan mode and canonical Git-worktree writer leases for Pi",
   "license": "MIT",
@@ -23,6 +23,8 @@
   },
   "files": [
     "README.md",
+    "beads-sync.ts",
+    "docs/beads-sync.md",
     "docs/guard.md",
     "docs/package-activation.md",
     "file-scope.ts",
@@ -45,7 +47,8 @@
     "pack:check": "node scripts/check-package.mjs",
     "check": "npm test && npm run typecheck && npm run pack:check",
     "verify:git-install": "bash scripts/verify-git-install.sh",
-    "verify:dynamic": "node scripts/verify-dynamic.mjs"
+    "verify:dynamic": "node scripts/verify-dynamic.mjs",
+    "verify:beads-sync": "node scripts/verify-beads-sync.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

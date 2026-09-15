@@ -127,7 +127,9 @@ test("blocks obvious file, package, Git, and remote Beads mutations", () => {
 		"exec 3<>tracked.txt",
 		"bd delete ai-tools-1",
 		"bd dolt push",
-		"bd dolt pull",
+		"bd -C \"/a b\" --json dolt push --remote origin",
+		"bd --db=/x dolt pull",
+		"bd dolt fetch",
 	]) {
 		assert.equal(isObviousMutation(command), true, command);
 	}
@@ -169,6 +171,26 @@ test("local triage does not exempt chained or shell-wrapped source and destructi
 	]) {
 		assert.match(guardedToolBlockReason("bash", { command }) ?? "", /blocked/, command);
 	}
+});
+
+test("routine Beads sync is allowed only through its direct typed boundary", () => {
+	const input = { action: "fetch", directory: "/abs/other-store", remote: "origin" };
+	assert.equal(guardedToolBlockReason("sync_beads_store", input), undefined);
+	const nested = guardedToolBlockReason("multi_tool_use.parallel", { tool_uses: [{ recipient_name: "functions.sync_beads_store", parameters: input }] }) ?? "";
+	assert.match(nested, /unknown nested tool.*sync_beads_store/i);
+	for (const command of [
+		"bash -c 'bd -C /abs/other-store dolt fetch'",
+		"bd -C /abs/other-store dolt remote add origin file:///tmp/other",
+		"bd -C /abs/other-store dolt push --force",
+		"bd -C /store federation status --peer origin --readonly",
+		"bd --profile federation status --peer origin",
+		"bd --json -C '/a b' federation sync --peer origin",
+		"bd vc merge 'remote/main'",
+		"bd sql \"CALL DOLT_PUSH('--force','origin','main')\"",
+		"dolt --data-dir '/a b' push --force origin main",
+		"dolt sql -q \"CALL DOLT_FETCH('origin')\"",
+		"bash -lc 'bd federation status --peer origin'",
+	]) assert.match(guardedToolBlockReason("bash", { command }) ?? "", /blocked/, command);
 });
 
 test("mutation diagnostics separate source authority from destructive and remote approval", () => {

@@ -33,7 +33,7 @@ const READ_ONLY_SUBAGENT_ACTIONS = new Set([
 ]);
 
 const READ_ONLY_SUPERVISOR_ACTIONS = new Set(["list", "pending", "status"]);
-const GUARDED_MUTATION_REASON = "Guarded session: obvious source, Git, package, system, or destructive/remote Beads command blocked. Source/Git/package/system changes need /implement scopes; /implement alone does not authorize destructive or remote actions. Local Beads triage needs no source lease; pass prose as literal quoted arguments.";
+const GUARDED_MUTATION_REASON = "Guarded session: obvious source, Git, package, system, or raw destructive/remote Beads command blocked. Source/Git/package/system changes need /implement scopes; /implement alone does not authorize destructive or remote actions. Local Beads triage needs no source lease; pass prose as literal quoted arguments. User-enrolled routine sync uses the typed sync_beads_store boundary.";
 const SUBAGENT_BLOCK_REASON = "Guarded session: this subagent operation may launch or control a writer in the current worktree. Use a verified read-only agent or switch to /implement.";
 
 export interface GuardedToolPolicyOptions {
@@ -245,6 +245,36 @@ function shellWords(command: string): string[] {
 	return words;
 }
 
+function databaseMutation(command: string): boolean {
+	const words = shellWords(command);
+	const sqlIsReadOnly = (sql: string) => /^(?:SELECT|SHOW|DESCRIBE|EXPLAIN)\s/i.test(sql.trim())
+		&& !/;|\bCALL\b|\bDOLT_(?:PUSH|PULL|FETCH|MERGE|RESET|CHECKOUT|COMMIT|REMOTE|BACKUP|BRANCH|CLEAN|GC)\s*\(/i.test(sql);
+	for (let index = 0; index < words.length; index++) {
+		const executable = words[index]?.split("/").at(-1);
+		if (executable !== "bd" && executable !== "dolt") continue;
+		let start = index + 1;
+		while (words[start]?.startsWith("-")) {
+			const option = words[start++]!;
+			if (["-C", "--directory", "--db", "--actor", "--dolt-auto-commit", "--data-dir", "--use-db", "--host", "--port", "--user", "--password"].includes(option) || (executable === "dolt" && option === "--profile")) start++;
+		}
+		const operation = words[start];
+		if (executable === "bd") {
+			if (operation === "federation" && words[start + 1] !== "list-peers") return true;
+			if (operation === "vc" && words[start + 1] === "merge") return true;
+			if (operation === "sql" && !sqlIsReadOnly(words[start + 1] ?? "")) return true;
+		} else {
+			if (["push", "pull", "fetch", "reset", "checkout", "merge", "remote", "backup", "commit", "init", "clone", "clean", "gc", "branch", "conflicts", "rebase", "filter-branch", "sql-server"].includes(operation ?? "")) return true;
+			if (operation === "sql") {
+				const args = words.slice(start + 1);
+				const queryIndex = args.findIndex((word) => word === "-q" || word === "--query");
+				const query = queryIndex >= 0 ? args[queryIndex + 1] : args.find((word) => word.startsWith("--query="))?.slice(8);
+				if (!query || !sqlIsReadOnly(query)) return true;
+			}
+		}
+	}
+	return false;
+}
+
 function shellOptionValueCount(executable: string, option: string): number {
 	if (/^--(?:rcfile|init-file)=/.test(option)) return 0;
 	if (option === "--rcfile" || option === "--init-file") return 1;
@@ -289,6 +319,7 @@ function isObviousMutationAtDepth(command: string, depth: number): boolean {
 		PACKAGE_MUTATION.test(inspectable) ||
 		GIT_MUTATION.test(inspectable) ||
 		BEADS_DESTRUCTIVE_OR_REMOTE.test(inspectable) ||
+		databaseMutation(command) ||
 		SYSTEM_MUTATION.test(inspectable)
 	);
 }
