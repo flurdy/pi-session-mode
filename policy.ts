@@ -33,7 +33,7 @@ const READ_ONLY_SUBAGENT_ACTIONS = new Set([
 ]);
 
 const READ_ONLY_SUPERVISOR_ACTIONS = new Set(["list", "pending", "status"]);
-const GUARDED_MUTATION_REASON = "Guarded session: obvious source, Git, package, system, or raw destructive/remote Beads command blocked. Source/Git/package/system changes need /implement scopes; /implement alone does not authorize destructive or remote actions. Local Beads triage needs no source lease; pass prose as literal quoted arguments. User-enrolled routine sync uses the typed sync_beads_store boundary.";
+const GUARDED_MUTATION_REASON = "Guarded session: obvious source, Git, package, system, or raw destructive/remote Beads command blocked. Source/Git/package/system changes need /implement scopes; /implement alone does not authorize destructive or remote actions. Local Beads triage needs no source lease; pass prose as literal quoted arguments. Workspace synchronization uses make beads-sync after fresh explicit confirmation.";
 const SUBAGENT_BLOCK_REASON = "Guarded session: this subagent operation may launch or control a writer in the current worktree. Use a verified read-only agent or switch to /implement.";
 
 export interface GuardedToolPolicyOptions {
@@ -155,7 +155,7 @@ export function guardedToolBlockReason(
 	if (toolName === "bash") {
 		const command = isRecord(input) ? input.command : undefined;
 		if (typeof command !== "string") return undefined;
-		if (isPanelInvocation(command)) return PANEL_BLOCK_REASON;
+		if (hasCommand(command, isPanelCommand)) return PANEL_BLOCK_REASON;
 		return isObviousMutation(command) ? GUARDED_MUTATION_REASON : undefined;
 	}
 	if (toolName === "subagent") return subagentBlockReason(input, options);
@@ -334,12 +334,30 @@ function isPanelCommand(words: string[]): boolean {
 	return false;
 }
 
-function isPanelInvocation(command: string, depth = 0): boolean {
-	if (depth < MAX_INSPECTION_DEPTH && constantShellPayloads(command).some((payload) => isPanelInvocation(payload, depth + 1))) return true;
+function isWorkspaceSyncCommand(words: string[]): boolean {
+	let index = 0;
+	while (index < words.length) {
+		if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index]!)) { index++; continue; }
+		const executable = words[index++]!.split("/").at(-1)!;
+		if (["env", "command", "exec"].includes(executable)) {
+			while (words[index]?.startsWith("-")) {
+				const option = words[index++];
+				if (executable === "env" && ["-u", "--unset", "-C", "--chdir"].includes(option!)) index++;
+			}
+			continue;
+		}
+		if (executable === "make" || executable === "gmake") return words.slice(index).includes("beads-sync");
+		return executable === "project-workspace" && words[index] === "beads-sync" && !words.slice(index + 1).includes("--dry-run");
+	}
+	return false;
+}
+
+function hasCommand(command: string, matches: (words: string[]) => boolean, depth = 0): boolean {
+	if (depth < MAX_INSPECTION_DEPTH && constantShellPayloads(command).some((payload) => hasCommand(payload, matches, depth + 1))) return true;
 	const words: string[] = [];
 	for (const word of [...shellWords(command, true), ";"]) {
 		if (word === ";") {
-			if (isPanelCommand(words)) return true;
+			if (matches(words)) return true;
 			words.length = 0;
 		} else words.push(word);
 	}
@@ -362,6 +380,7 @@ function isObviousMutationAtDepth(command: string, depth: number): boolean {
 		GIT_MUTATION.test(inspectable) ||
 		BEADS_DESTRUCTIVE_OR_REMOTE.test(inspectable) ||
 		databaseMutation(command) ||
+		hasCommand(command, isWorkspaceSyncCommand) ||
 		SYSTEM_MUTATION.test(inspectable)
 	);
 }

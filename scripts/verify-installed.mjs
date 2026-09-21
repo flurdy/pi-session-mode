@@ -119,10 +119,8 @@ try {
 	await proveFileFree(configFile);
 	const first = launch();
 	const commands = (await first.send("get_commands")).commands;
-	for (const name of ["plan", "implement", "grant-file", "grants"]) {
-		assert.equal(commands.filter((command) => command.name === name && command.source === "extension").length, 1);
-		assert.equal(commands.filter((command) => command.name.startsWith(`${name}:`)).length, 0);
-	}
+	assert.deepEqual(commands.filter((command) => command.source === "extension" && command.sourceInfo?.path === join(installed, "index.ts")).map((command) => command.name).sort(),
+		["grant-file", "grants", "implement", "leases", "plan"]);
 	await first.state("implement", true);
 	const second = launch();
 	await second.send("get_commands");

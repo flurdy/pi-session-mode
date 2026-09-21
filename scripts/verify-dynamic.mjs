@@ -21,6 +21,10 @@ for (const path of [work, ...Object.values(repos)]) execFileSync("git", ["-C", p
 await mkdir(join(work, "repos"));
 for (const [name, path] of Object.entries(repos)) await symlink(path, join(work, "repos", name));
 const slowKey = createHash("sha256").update(repos.slow).digest("hex");
+const syncDispatched = join(base, "sync-dispatched");
+for (const helper of ["make", "project-workspace"]) {
+	await writeFile(join(bin, helper), `#!/bin/sh\nprintf dispatched > '${syncDispatched}'\nexit 99\n`, { mode: 0o700 });
+}
 const panelDispatched = join(base, "panel-dispatched");
 const panelArtifacts = join(base, "panel-artifacts");
 await mkdir(panelArtifacts);
@@ -164,6 +168,12 @@ try {
 		assert.match(JSON.stringify(denied[0].result), index < 3 ? /named second-opinion panels are unsupported/i : /command blocked/i);
 	}
 	await absent(panelDispatched);
+	for (const [index, command] of ["make beads-sync", "project-workspace beads-sync --workspace ."].entries()) {
+		const denied = await first.turn(`sync-denied-${index}`, [{ name: "bash", arguments: { command } }]);
+		assert.equal(denied.length, 1); assert.equal(denied[0].isError, true);
+		assert.match(JSON.stringify(denied[0].result), /command blocked/i);
+	}
+	await absent(syncDispatched);
 	assert.deepEqual(await readdir(panelArtifacts), beforePanelArtifacts);
 	await first.roots([]);
 	assert.equal((await first.snapshot()).saved.data.mode, "plan");
@@ -181,7 +191,7 @@ try {
 	for (const call of calls) assert.equal(resultsInSession.filter((entry) => entry.message.toolCallId === call.id).length, 1, `Unpaired ${call.id}`);
 	const locks = JSON.parse(execFileSync("lslocks", ["--json", "--output", "PATH"], { encoding: "utf8" }));
 	assert.equal((locks.locks ?? []).some((row) => row.path?.startsWith(runtime)), false);
-	console.log("Dynamic RPC PASS: real Pi native write/edit, atomic wrapper, sibling preflights, contention, cancellation, v2 in-turn persistence and reload, paired tool results, unchanged active tools, selection-only no-op, guarded rejection, RPC package-activation denial, guarded panel pre-dispatch refusal with no artifacts or helper execution, clean shutdown. Scripted fixture only; no external model requests or real CLI/auth/billing proof.");
+	console.log("Dynamic RPC PASS: real Pi native write/edit, atomic wrapper, sibling preflights, contention, cancellation, v2 in-turn persistence and reload, paired tool results, unchanged active tools, selection-only no-op, guarded rejection, RPC package-activation denial, guarded panel and workspace-sync pre-dispatch refusal with no artifacts or helper execution, clean shutdown. Scripted fixture only; no external model requests or real CLI/auth/billing proof.");
 } finally {
 	for (const client of clients) await client.stop();
 	await rm(base, { recursive: true, force: true });

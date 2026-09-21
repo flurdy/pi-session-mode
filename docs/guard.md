@@ -43,13 +43,14 @@ backup, hook and synchronization settings and actual side effects, not commented
 local-looking command syntax. Effects beyond local tracking require their own applicable
 authority; `/implement` alone does not authorize remote or destructive actions.
 
-The separately enrolled [`sync_beads_store`](beads-sync.md) tool is the only no-repeated-prompt
-remote exception. It binds one canonical store, URL and branch in a private user-owned file and
-revalidates them before explicit routine fetch, safe pull or non-force push. It works in guarded
-plan mode and outside cwd without acquiring source leases. Raw Dolt remote commands, force,
-conflict resolution, migration, bootstrap, remote changes, backup publication and source Git
-remain guarded. Enrollment permits later explicit calls; it does not trigger sync during reads or
-local triage.
+Synchronization belongs to the workspace tooling, not this extension. Where available, use
+`make beads-sync-check` for a local preview and `make beads-sync` only after fresh explicit human
+confirmation of that workspace operation. Guarded and file-only sessions block recognizable
+`make beads-sync` and `project-workspace beads-sync` invocations; the check target and explicit
+`--dry-run` remain available. Raw Dolt remote commands, force, conflict resolution, migration,
+bootstrap, remote changes, backup publication and source Git remain guarded. Never synchronize
+during reads or local triage. Renamed targets, aliases and arbitrary script side effects remain
+outside the bounded shell check; they are not authorization workarounds.
 
 The bounded Bash checker permits ordinary triage with literal quoted prose, including words such
 as `delete`, `git push` and `npm install`. It still checks executable command chains and constant
@@ -161,7 +162,7 @@ The statusline suppresses its own holder during plan release. Explicit `/leases`
 - Worktree-root locks do not lock shared Git administration across separate worktrees.
 - Preflight/path checks are not atomic OS-level file isolation; hostile concurrent filesystem changes and custom tool overrides remain outside the guarantee.
 - Package activation inherits Pi's package-manager behavior, including dependency scripts, mutable-tag TOCTOU and non-transactional concurrent settings updates. Its explicit allowlist, confirmation and post-checks reduce accidental activation; they are not a supply-chain sandbox.
-- `sync_beads_store` requires compatible installed `bd` and Dolt executables only when its trust or sync boundary is used. Lease and native-write enforcement retain no Beads, workspace.json or mgit dependency.
+- Lease and native-write enforcement have no Beads, Dolt, workspace.json or mgit runtime dependency.
 
 ## Runtime and distribution
 

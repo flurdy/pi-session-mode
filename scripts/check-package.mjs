@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const manifest = JSON.parse(readFileSync(resolve(root, "package.json"), "utf8"));
-const runtimeFiles = ["README.md", "beads-sync.ts", "docs/beads-sync.md", "docs/guard.md", "docs/package-activation.md", "file-scope.ts", "index.ts", "lease-observer.ts", "lease-set.ts", "lease.ts", "package-activation.ts", "path.ts", "policy.ts", "scope.ts", "scoped-policy.ts", "selection.ts", "session-mode.ts", "subagent-policy.ts"];
+const runtimeFiles = ["README.md", "docs/guard.md", "docs/package-activation.md", "file-scope.ts", "index.ts", "lease-observer.ts", "lease-set.ts", "lease.ts", "package-activation.ts", "path.ts", "policy.ts", "scope.ts", "scoped-policy.ts", "selection.ts", "session-mode.ts", "subagent-policy.ts"];
 
 assert.ok(manifest.keywords?.includes("pi-package"), "package discovery metadata is required");
 assert.deepEqual(manifest.pi, { extensions: ["./index.ts"] });

@@ -82,114 +82,16 @@ function harness(results: WorktreeLeaseResult[] = [held()], options: Partial<Ses
 		},
 		isDisabled: () => false,
 		readOnlySubagents: async () => new Set(),
-		beadsSync: {
-			inspectTrust: async () => { throw new Error("Beads sync trust is not configured in this fixture"); },
-			persistTrust: async () => { throw new Error("Beads sync trust is not configured in this fixture"); },
-			execute: async () => { throw new Error("Beads sync trust is not configured in this fixture"); },
-		},
 		...options,
 	};
 	const controller = registerSessionMode(pi as never, dependencies);
 	return { pi, acquisitions, controller };
 }
 
-test("trusted Beads sync stays available in plan mode without acquiring a source lease", async () => {
-	const syncCalls: unknown[] = [];
-	const beadsSync = {
-		inspectTrust: async () => { throw new Error("not used"); },
-		persistTrust: async () => { throw new Error("not used"); },
-		execute: async (request: unknown, options: unknown) => {
-			syncCalls.push({ request, options });
-			return { action: "fetch", status: "fetched", directory: "/store", remote: "origin", branch: "main", verified: true };
-		},
-	};
-	const { pi, acquisitions, controller } = harness([], { beadsSync } as never);
-	pi.planFlag = true;
-	const ctx = context();
-	await pi.emit("session_start", ctx);
-	assert.equal(controller.state, "plan");
-	assert.deepEqual(acquisitions, []);
-	const policy = await pi.emit("tool_call", ctx, { toolName: "sync_beads_store", input: { action: "fetch", directory: "/store", remote: "origin" } });
-	assert.deepEqual(policy, [undefined]);
-	const tool = pi.tools.get("sync_beads_store");
-	assert.ok(tool);
-	const output = await tool.execute("call-1", { action: "fetch", directory: "/store", remote: "origin" }, undefined, undefined, ctx);
-	assert.deepEqual(JSON.parse(output.content[0].text), { action: "fetch", status: "fetched", directory: "/store", remote: "origin", branch: "main", verified: true });
-	assert.deepEqual((syncCalls[0] as any).request, { action: "fetch", directory: "/store", remote: "origin" });
-	assert.equal((syncCalls[0] as any).options.sessionId, "session-1");
-	assert.equal(typeof (syncCalls[0] as any).options.beforeLaunch, "function");
-	assert.deepEqual(controller.roots, []);
-});
-
-test("shutdown aborts Beads sync before later operations and drains the adapter", async () => {
-	let release!: () => void;
-	const waiting = new Promise<void>((done) => { release = done; });
-	let received: any;
-	const { pi } = harness([], { beadsSync: {
-		inspectTrust: async () => { throw new Error("unused"); },
-		persistTrust: async () => {},
-		execute: async (_request, options) => {
-			received = options;
-			await waiting;
-			options.signal?.throwIfAborted();
-			return { action: "fetch", status: "fetched", directory: "/store", remote: "origin", branch: "main", verified: true };
-		},
-	} });
-	pi.planFlag = true;
-	const ctx = context();
-	await pi.emit("session_start", ctx);
-	const execution = pi.tools.get("sync_beads_store")!.execute("sync", { action: "fetch", directory: "/store", remote: "origin" }, undefined, undefined, ctx);
-	const rejection = assert.rejects(execution, /abort|cancel/i);
-	const shutdown = pi.emit("session_shutdown", ctx);
-	const aborted = received?.signal?.aborted;
-	release();
-	await Promise.all([shutdown, rejection]);
-	assert.equal(aborted, true);
-});
-
-test("user-typed trust enrollment binds fresh evidence without changing session mode", async (t) => {
-	const calls: unknown[] = [];
-	const prepared = { revision: "revision", display: { directory: "/store", beadsDir: "/store/.beads", remote: "origin", remoteUrl: "file:///trusted", branch: "main", bdPath: "/bin/bd", bdVersion: "bd 1", doltPath: "/bin/dolt", doltVersion: "dolt 1", databasePath: "/store/.beads/embeddeddolt", databaseName: "fixture", mode: "embedded", schemaVersion: "1.2.2", connectionRevision: "fingerprint", remotePath: "/trusted" }, entry: {} };
-	const beadsSync = {
-		inspectTrust: async (request: unknown) => { calls.push({ inspect: request }); return prepared; },
-		persistTrust: async (value: unknown, options: unknown) => { calls.push({ persist: value, options }); },
-		execute: async () => { throw new Error("not used"); },
-	};
-	const { pi, controller } = harness([], { beadsSync } as never);
-	pi.planFlag = true;
-	const ctx = context();
-	await pi.emit("session_start", ctx);
-	const command = pi.commands.get("trust-beads-sync");
-	assert.ok(command);
-	await command.handler('"/store" origin', ctx);
-	assert.deepEqual(calls[0], { inspect: { directory: "/store", remote: "origin" } });
-	assert.equal((calls[1] as any).persist, prepared);
-	assert.equal((calls[1] as any).options.sessionId, "session-1");
-	assert.equal(typeof (calls[1] as any).options.beforeLaunch, "function");
-	assert.equal(controller.state, "plan");
-	assert.deepEqual(controller.roots, []);
-	assert.match(ctx.notifications.at(-1)!.message, /trusted/i);
-	for (const scenario of ["declined", "rpc", "stale", "busy"]) {
-		await t.test(scenario, async () => {
-			calls.length = 0;
-			const session = harness([], { beadsSync } as never);
-			session.pi.planFlag = true;
-			const contextValue = context();
-			let confirmations = 0;
-			contextValue.ui.confirm = async () => {
-				confirmations++;
-				if (scenario === "stale") contextValue.sessionManager.getSessionId = () => "replacement-session";
-				return scenario !== "declined";
-			};
-			if (scenario === "rpc") contextValue.mode = "rpc";
-			if (scenario === "busy") contextValue.idle = false;
-			await session.pi.emit("session_start", contextValue);
-			await session.pi.commands.get("trust-beads-sync")!.handler('"/store" origin', contextValue);
-			assert.equal(calls.some((call: any) => call.persist), false);
-			assert.equal(confirmations, scenario === "rpc" || scenario === "busy" ? 0 : 1);
-			assert.deepEqual(session.controller.roots, []);
-		});
-	}
+test("registers only scope controls and confirmed package activation", () => {
+	const { pi } = harness();
+	assert.deepEqual([...pi.commands.keys()].sort(), ["grant-file", "grants", "implement", "leases", "plan"]);
+	assert.deepEqual([...pi.tools.keys()], ["activate_pi_package"]);
 });
 
 test("defaults to implement and acquires before reporting write authority", async () => {
@@ -472,7 +374,7 @@ test("plan guidance allows resolver-proven local Beads writes beyond cwd without
 	assert.match(text, /Beads writes do not acquire source leases/);
 	assert.match(text, /export, backup and synchronization side effects/);
 	assert.match(text, /\/implement alone does not authorize remote or destructive actions/);
-	assert.match(text, /sync_beads_store.*enrolled.*routine sync/i);
+	assert.match(text, /make beads-sync after fresh explicit confirmation/i);
 	assert.match(text, /never.*list.*resolver.*triage/i);
 	for (const command of [
 		"bd -C /abs/other-store comments add fixture-1 'git push; rm file > out'",

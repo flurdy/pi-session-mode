@@ -173,11 +173,21 @@ test("local triage does not exempt chained or shell-wrapped source and destructi
 	}
 });
 
-test("routine Beads sync is allowed only through its direct typed boundary", () => {
-	const input = { action: "fetch", directory: "/abs/other-store", remote: "origin" };
-	assert.equal(guardedToolBlockReason("sync_beads_store", input), undefined);
-	const nested = guardedToolBlockReason("multi_tool_use.parallel", { tool_uses: [{ recipient_name: "functions.sync_beads_store", parameters: input }] }) ?? "";
-	assert.match(nested, /unknown nested tool.*sync_beads_store/i);
+test("guarded workspace synchronization blocks mutations but permits previews and prose", () => {
+	for (const command of [
+		"make beads-sync", "gmake -C /workspace beads-sync", "make 'beads-sync'",
+		"project-workspace beads-sync --workspace /workspace",
+		"env -C /workspace make beads-sync", "command make beads-sync", "exec project-workspace beads-sync",
+		"bash -lc 'cd /workspace && make beads-sync'", "make beads-sync-check; make beads-sync",
+		"project-workspace beads-sync; echo --dry-run",
+	]) assert.match(guardedToolBlockReason("bash", { command }) ?? "", /blocked/, command);
+	for (const command of [
+		"make beads-sync-check", "project-workspace beads-sync --workspace /workspace --dry-run",
+		"echo 'make beads-sync'", "bd -C /store comments add fixture-1 'make beads-sync'",
+	]) assert.equal(guardedToolBlockReason("bash", { command }), undefined, command);
+});
+
+test("raw Beads remote and destructive commands remain guarded", () => {
 	for (const command of [
 		"bash -c 'bd -C /abs/other-store dolt fetch'",
 		"bd -C /abs/other-store dolt remote add origin file:///tmp/other",

@@ -6,7 +6,7 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
 	echo "verify-git-install requires a clean tracked working tree" >&2
 	exit 1
 fi
-git ls-files --error-unmatch package.json scripts/verify-dynamic.mjs scripts/verify-beads-sync.mjs fixtures/native-write-provider.ts >/dev/null
+git ls-files --error-unmatch package.json scripts/verify-dynamic.mjs fixtures/native-write-provider.ts >/dev/null
 commit=$(git rev-parse HEAD)
 mkdir -p "$root/.artifacts"
 temporary_root=$(mktemp -d "$root/.artifacts/git-install.XXXXXX")
@@ -53,6 +53,4 @@ installed="$agent_dir/git/localhost/flurdy/pi-session-mode"
 test "$(git -C "$installed" rev-parse HEAD)" = "$commit"
 node "$root/scripts/verify-installed.mjs" "$agent_dir" "$work_dir" "$installed"
 node "$root/scripts/verify-dynamic.mjs" "$installed"
-node "$root/scripts/verify-beads-sync.mjs" "$installed"
-node "$root/scripts/verify-beads-sync.mjs" "$installed" --server
-echo "Immutable Git package, lease lifecycle and trusted Beads sync: PASS ($commit)"
+echo "Immutable Git package and lease lifecycle: PASS ($commit)"
