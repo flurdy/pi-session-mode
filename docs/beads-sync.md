@@ -16,7 +16,11 @@ The version-1 file must be a regular, single-link, user-owned `0600` file outsid
 
 ## Supported state
 
-The adapter is verified with **Beads 1.2.2 (53 migrations), Dolt 2.3.1 and Pi 0.85.1**. Unsupported versions need an implementation compatibility review, not merely re-enrollment. Supported storage is canonical `.beads/embeddeddolt` or `.beads/dolt`, with matching SQL/on-disk database and remote identities. Redirected storage and embedded URL credentials are refused.
+The adapter supports **Beads 1.2.2 (53 migrations), stable Dolt >=2.3.0 <=2.3.1 and Pi 0.85.1**. The Dolt bound applies to both the CLI and the queried SQL engine; prereleases, build-suffixed versions, later patches and unknown major/minor versions are refused. Admitting another patch requires extending the bound after running the same tests and live probes, not merely re-enrolling. Supported storage is canonical `.beads/embeddeddolt` or `.beads/dolt`, with matching SQL/on-disk database and remote identities. Redirected storage and embedded URL credentials are refused.
+
+Compatibility is separate from enrollment identity: each machine may use either supported patch, but the executable path and observed version remain exact local trust bindings. A supported CLI upgrade still requires interactive re-enrollment. Existing version-1 trust entries remain valid when their bound identities have not changed.
+
+Enrollment and every execution revalidation run uncached, read-only capability probes: fetch refspec syntax, Beads merge/push flags (including safety controls), and SQL hash, ancestry, schema diff, migration diff and prospective-conflict functions against the same local commit. Missing commands, unsupported engines, malformed output or unexpected results fail closed. These probes do not fetch, merge or push and do not prove authentication or remote transport compatibility. Existing clean-state, schema/migration and post-operation checks remain authoritative.
 
 All versioned working state must be clean, including the `config` table. The tool never commits pending work to make synchronization possible. Server-mode `bd dolt commit` can leave configuration changes pending; those require separate review, not automatic inclusion in a push.
 
@@ -41,5 +45,16 @@ Beads 1.2.2 has no `bd dolt fetch`. Its `federation status` command fetches even
 No force, reset, conflict resolution, migration, bootstrap, remote repair, backup publication, source Git push or production operation is authorized. Raw remote/destructive commands retain their existing gates, including federation fetches. Routine permission never triggers synchronization during listing, resolution, local triage or another read-only workflow.
 
 Failures report the execution phase without exposing raw CLI output that might contain credentials. There are no automatic retries or recovery commands. Cancellation/revocation prevents later steps; an already-started transfer or merge may have effects. A post-operation failure is not reported as an untouched store: inspect the state before retrying.
+
+## Compatibility verification
+
+Run `npm run check`, then test each admitted Dolt patch with the real executable first on `PATH`:
+
+```bash
+PATH="/path/to/dolt-version/bin:$PATH" npm run verify:beads-sync
+PATH="/path/to/dolt-version/bin:$PATH" npm run verify:beads-sync -- --server
+```
+
+The initial matrix is 2.3.0 and 2.3.1, each in embedded and server mode. The harness uses isolated configuration, a local scripted Pi provider and disposable file remotes; its PASS line records the CLI versions. Unit fixtures additionally cover unsupported versions, failed/malformed probes, changed enrollment evidence, cancellation and revalidation. No global Dolt installation or live store needs changing.
 
 Other processes, machines, raw shells, trusted extensions and user-managed transport/DNS configuration remain outside this cooperative guard. External writers can race between checks and execution; the lock is not database isolation. SSH behavior and authentication remain owned by the existing user configuration. Tests use disposable local remotes, not live Git-hosted remotes.

@@ -13,6 +13,7 @@ const REMOTE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const COMMIT = /^[0-9a-v]{32}$/;
 const SUPPORTED_SCHEMA = "1.2.2";
+const MAX_DOLT_PATCH = 1;
 
 export type BeadsSyncAction = "fetch" | "pull" | "push";
 export interface BeadsSyncRequest { action: BeadsSyncAction; directory: string; remote: string; }
@@ -117,11 +118,18 @@ function bdCommand(entry: Pick<TrustEntry, "directory" | "beadsDir" | "bdPath">,
 async function bd(entry: Pick<TrustEntry, "directory" | "beadsDir" | "bdPath">, args: string[], label: string, dependencies: BeadsSyncDependencies, signal?: AbortSignal): Promise<string> {
 	return run(dependencies, label, bdCommand(entry, args, dependencies, signal));
 }
+function supportedDoltVersion(value: unknown): boolean {
+	if (typeof value !== "string") return false;
+	const match = /^2\.3\.(0|[1-9]\d*)$/.exec(value);
+	return match !== null && Number(match[1]) <= MAX_DOLT_PATCH;
+}
 async function version(name: "bd" | "dolt", dependencies: BeadsSyncDependencies, signal?: AbortSignal): Promise<{ path: string; version: string }> {
 	const path = await dependencies.resolveExecutable(name);
 	const text = (await run(dependencies, `${name} version check`, { command: path, args: name === "bd" ? ["--version"] : ["version"], cwd: dependencies.agentDir, env: environment(dependencies), signal, timeoutMs: 5000 })).trim();
 	const versionLines = text.split(/\r?\n/).filter((line) => line.startsWith(`${name} version `));
-	if (versionLines.length !== 1 || !(name === "bd" ? /^bd version 1\.2\.2(?:\s|$)/ : /^dolt version 2\.3\.1$/).test(versionLines[0]!)) throw new Error(`Unsupported ${name} version; routine sync is verified only for Beads 1.2.2 and Dolt 2.3.1`);
+	if (versionLines.length !== 1 || !(name === "bd" ? /^bd version 1\.2\.2(?:\s|$)/.test(versionLines[0]!) : supportedDoltVersion(versionLines[0]!.slice("dolt version ".length)))) {
+		throw new Error(`Unsupported ${name} version; routine sync requires Beads 1.2.2 and stable Dolt >=2.3.0 <=2.3.${MAX_DOLT_PATCH}, with live capability checks`);
+	}
 	return { path, version: versionLines[0]! };
 }
 function configMap(value: unknown): Map<string, string> {
@@ -197,6 +205,7 @@ async function inspectStore(input: { directory: string; remote: string }, depend
 		bdVersion: bdVersion.version, doltPath: doltVersion.path, doltVersion: doltVersion.version, schemaVersion: SUPPORTED_SCHEMA,
 		connectionRevision: createHash("sha256").update(JSON.stringify(connectionSettings)).digest("hex"), connection, transportUrl,
 		transportRevision: createHash("sha256").update(JSON.stringify(cliRemote)).digest("hex") };
+	await probeCapabilities(entry, status.commit, dependencies, signal);
 	return { entry, config, head: status.commit };
 }
 export async function inspectBeadsSyncTrust(input: { directory: string; remote: string }, dependencies: BeadsSyncDependencies, signal?: AbortSignal): Promise<PreparedBeadsSyncTrust> {
@@ -272,6 +281,28 @@ async function oneRow(entry: TrustEntry, query: string, dependencies: BeadsSyncD
 	const rows = await sql(entry, query, dependencies, signal);
 	if (rows.length !== 1) throw new Error("Dolt inspection did not return one evidence row");
 	return rows[0]!;
+}
+async function probeCapabilities(entry: TrustEntry, head: string, dependencies: BeadsSyncDependencies, signal?: AbortSignal): Promise<void> {
+	const fetchHelp = await run(dependencies, "Dolt fetch capability", { command: entry.doltPath, args: ["fetch", "--help"],
+		cwd: entry.directory, env: environment(dependencies, entry.beadsDir), signal, timeoutMs: 5000 });
+	if (!/dolt fetch\s+\[<remote>\]\s+\[<refspec> \.\.\.\]/.test(fetchHelp)) throw new Error("Dolt fetch refspec capability is unavailable");
+	for (const [args, syntax, flag] of [
+		[["vc", "merge", "--help"], /bd vc merge <branch> \[flags\]/, "--json"],
+		[["dolt", "push", "--help"], /bd dolt push \[flags\]/, "--remote"],
+	] as const) {
+		const help = await bd(entry, [...args], "Beads command capability", dependencies, signal);
+		if (!syntax.test(help) || [flag, "--sandbox", "--dolt-auto-commit"].some((option) => !new RegExp(`${option}(?=[\\s=]|$)`).test(help))) {
+			throw new Error("Required Beads command capability is unavailable");
+		}
+	}
+	const row = await oneRow(entry, `SELECT DOLT_VERSION() AS version, DOLT_HASHOF('HEAD') AS head,
+DOLT_MERGE_BASE('${head}', '${head}') AS base,
+(SELECT COUNT(*) FROM dolt_schema_diff('${head}', '${head}')) AS schema_changes,
+(SELECT COUNT(*) FROM dolt_diff('${head}', '${head}', 'schema_migrations')) AS migrations,
+(SELECT COUNT(*) FROM DOLT_PREVIEW_MERGE_CONFLICTS_SUMMARY('${head}', '${head}')) AS conflicts /*capabilities*/`, dependencies, signal);
+	if (!supportedDoltVersion(row.version) || row.head !== head || row.base !== head || row.schema_changes !== 0 || row.migrations !== 0 || row.conflicts !== 0) {
+		throw new Error("Dolt SQL capabilities returned incompatible evidence");
+	}
 }
 async function workingHead(entry: TrustEntry, dependencies: BeadsSyncDependencies, signal?: AbortSignal): Promise<string> {
 	const state = await oneRow(entry, `SELECT active_branch() AS branch, DOLT_HASHOF('HEAD') AS head,

@@ -14,6 +14,10 @@ import {
 } from "./beads-sync.ts";
 
 interface FixtureOptions {
+	doltVersion?: string;
+	bdVersion?: string;
+	capabilities?: Record<string, unknown>;
+	help?: Partial<Record<"fetch" | "merge" | "push", string>>;
 	mode?: "embedded" | "server";
 	remoteUrl?: string;
 	transportUrl?: string;
@@ -43,7 +47,8 @@ const SAFETY_FLAGS = ["--sandbox", "--dolt-auto-commit=off"];
 
 function result(stdout: string, code = 0) { return { code, stdout, stderr: code ? "fixture failure" : "" }; }
 function json(value: unknown) { return result(`${JSON.stringify(value)}\n`); }
-function isFetch(command: BeadsSyncCommand): boolean { return command.command === DOLT_PATH && command.args[0] === "fetch"; }
+function isOperation(command: BeadsSyncCommand, name: string): boolean { return command.args.includes(name) && !command.args.includes("--help"); }
+function isFetch(command: BeadsSyncCommand): boolean { return command.command === DOLT_PATH && isOperation(command, "fetch"); }
 function commandKey(command: BeadsSyncCommand): string { return `${command.command} ${command.args.join(" ")}`; }
 
 async function fixture(options: FixtureOptions = {}) {
@@ -78,8 +83,14 @@ async function fixture(options: FixtureOptions = {}) {
 		await options.onCommand?.(command);
 		const key = commandKey(command);
 		if (options.fail?.test(key)) return result("", 1);
-		if (key === `${BD_PATH} --version`) return result("bd version 1.2.2 (fixture)\n");
-		if (key === `${DOLT_PATH} version`) return result("dolt version 2.3.1\n");
+		if (key === `${BD_PATH} --version`) return result(`bd version ${options.bdVersion ?? "1.2.2"} (fixture)\n`);
+		if (key === `${DOLT_PATH} version`) return result(`dolt version ${options.doltVersion ?? "2.3.1"}\n`);
+		if (command.args.includes("--help")) {
+			if (command.command === DOLT_PATH && command.args.includes("fetch")) return result(options.help?.fetch ?? "dolt fetch [<remote>] [<refspec> ...]\n");
+			if (command.args.includes("merge")) return result(options.help?.merge ?? "bd vc merge <branch> [flags]\n--json --sandbox --dolt-auto-commit\n");
+			if (command.args.includes("push")) return result(options.help?.push ?? "bd dolt push [flags]\n--remote --sandbox --dolt-auto-commit\n");
+		}
+		if (key.includes("/*capabilities*/")) return json({ rows: [{ version: options.doltVersion ?? "2.3.1", head: merged ? REMOTE_HEAD : LOCAL_HEAD, base: merged ? REMOTE_HEAD : LOCAL_HEAD, schema_changes: 0, migrations: 0, conflicts: 0, ...options.capabilities }] });
 		if (command.command === "/opt/bin/git" && command.args.includes("--get-url")) return result(`${options.transportUrl ?? options.remoteUrl?.replace(/^git\+/, "")}\n`);
 		if (key.includes(" where --json --readonly")) return json({ database_path: mode === "embedded" ? DATABASE_PATH : "/store/.beads/dolt", path: BEADS_DIR, prefix: "beads", schema_version: 1 });
 		if (key.includes(" dolt remote list --json --readonly")) {
@@ -189,7 +200,7 @@ test("pull previews the fixed fetched commit then merges that commit through Bea
 	assert.equal(evidence.status, "pulled");
 	assert.equal(evidence.before, LOCAL_HEAD);
 	assert.equal(evidence.remoteHead, REMOTE_HEAD);
-	const merge = commands.find((command) => command.args.includes("merge"))!;
+	const merge = commands.find((command) => isOperation(command, "merge"))!;
 	assert.deepEqual(merge.args, ["-C", DIRECTORY, "vc", "merge", REMOTE_HEAD, "--json", ...SAFETY_FLAGS]);
 	assert.ok(commands.some((command) => commandKey(command).includes("/*preview*/")));
 	assert.ok(commands.some((command) => commandKey(command).includes("/*schema*/")));
@@ -206,7 +217,7 @@ test("pull refuses pending work, schema changes, conflicts and changed destinati
 		await t.test(name, async () => {
 			const { dependencies, commands } = await enrolled(options);
 			await assert.rejects(executeBeadsSync({ action: "pull", directory: DIRECTORY, remote: "origin" }, dependencies, { sessionId: "fixture-session" }), pattern);
-			assert.equal(commands.some((command) => command.args.includes("merge")), false);
+			assert.equal(commands.some((command) => isOperation(command, "merge")), false);
 		});
 	}
 });
@@ -216,27 +227,27 @@ test("push respects no-push, refuses remote-ahead state and never uses force", a
 		const { dependencies, commands } = await enrolled({ config: { "no-push": "true" } });
 		const evidence = await executeBeadsSync({ action: "push", directory: DIRECTORY, remote: "origin" }, dependencies, { sessionId: "fixture-session" });
 		assert.equal(evidence.status, "skipped");
-		assert.equal(commands.some((command) => command.args.includes("push")), false);
+		assert.equal(commands.some((command) => isOperation(command, "push")), false);
 	});
 	await t.test("remote ahead", async () => {
 		const { dependencies, commands } = await enrolled({ behind: 1, ahead: 1 });
 		await assert.rejects(executeBeadsSync({ action: "push", directory: DIRECTORY, remote: "origin" }, dependencies, { sessionId: "fixture-session" }), /remote is ahead/i);
-		assert.equal(commands.some((command) => command.args.includes("push")), false);
+		assert.equal(commands.some((command) => isOperation(command, "push")), false);
 	});
 	await t.test("ordinary push", async () => {
 		const { dependencies, commands } = await enrolled({ behind: 0, ahead: 1 });
 		const evidence = await executeBeadsSync({ action: "push", directory: DIRECTORY, remote: "origin" }, dependencies, { sessionId: "fixture-session" });
 		assert.equal(evidence.status, "pushed");
-		const push = commands.find((command) => command.args.includes("push"))!;
+		const push = commands.find((command) => isOperation(command, "push"))!;
 		assert.deepEqual(push.args, ["-C", DIRECTORY, "dolt", "push", "--remote", "origin", ...SAFETY_FLAGS]);
 		assert.equal(push.args.includes("--force"), false);
 	});
 });
 
 test("a failed operation is not retried", async () => {
-	const { dependencies, commands } = await enrolled({ behind: 0, ahead: 1, fail: /dolt push/ });
+	const { dependencies, commands } = await enrolled({ behind: 0, ahead: 1, fail: /dolt push --remote/ });
 	await assert.rejects(executeBeadsSync({ action: "push", directory: DIRECTORY, remote: "origin" }, dependencies, { sessionId: "fixture-session" }), /failed/i);
-	assert.equal(commands.filter((command) => command.args.includes("push")).length, 1);
+	assert.equal(commands.filter((command) => isOperation(command, "push")).length, 1);
 });
 
 test("authorization revoked after fetch prevents push", async () => {
@@ -247,7 +258,7 @@ test("authorization revoked after fetch prevents push", async () => {
 	await assert.rejects(executeBeadsSync({ action: "push", directory: DIRECTORY, remote: "origin" }, dependencies, {
 		sessionId: "fixture-session", beforeLaunch() { if (revoked) throw new Error("session revoked"); },
 	}), /revoked/);
-	assert.equal(commands.some((command) => command.args.includes("push")), false);
+	assert.equal(commands.some((command) => isOperation(command, "push")), false);
 });
 
 test("removing trust during fetch prevents the following push", async () => {
@@ -257,7 +268,7 @@ test("removing trust during fetch prevents the following push", async () => {
 		if (isFetch(command)) await writeFile(join(agentDir, BEADS_SYNC_CONFIG_NAME), '{"version":1,"stores":[]}');
 	};
 	await assert.rejects(executeBeadsSync({ action: "push", directory: DIRECTORY, remote: "origin" }, dependencies, { sessionId: "fixture-session" }), /trust|revoked/);
-	assert.equal(commands.some((command) => command.args.includes("push")), false);
+	assert.equal(commands.some((command) => isOperation(command, "push")), false);
 });
 
 test("pre-cancelled sync launches no command", async () => {
@@ -279,7 +290,7 @@ test("schema and conflict preview use immutable local and remote hashes", async 
 test("CLI error output is not copied to model-visible errors", async () => {
 	const { dependencies } = await enrolled({ behind: 0, ahead: 1 });
 	const run = dependencies.run;
-	dependencies.run = async (command) => command.args.includes("push")
+	dependencies.run = async (command) => isOperation(command, "push")
 		? { code: 1, stdout: "sensitive fixture text", stderr: "https://user:fixture-secret@host/remote" }
 		: run(command);
 	await assert.rejects(executeBeadsSync({ action: "push", directory: DIRECTORY, remote: "origin" }, dependencies, { sessionId: "fixture-session" }), (error: Error) => {
@@ -314,7 +325,7 @@ test("malformed count evidence never proves a conflict-free preview", async () =
 	const original = dependencies.run;
 	dependencies.run = (command) => commandKey(command).includes("/*preview*/") ? Promise.resolve(json({})) : original(command);
 	await assert.rejects(executeBeadsSync({ action: "pull", directory: DIRECTORY, remote: "origin" }, dependencies, { sessionId: "fixture-session" }), /unsupported result/);
-	assert.equal(commands.some((command) => command.args.includes("merge")), false);
+	assert.equal(commands.some((command) => isOperation(command, "merge")), false);
 });
 
 test("post-merge ancestry must include both original commits", async () => {
@@ -322,7 +333,7 @@ test("post-merge ancestry must include both original commits", async () => {
 	const original = dependencies.run;
 	let merged = false;
 	dependencies.run = async (command) => {
-		if (command.args.includes("merge")) merged = true;
+		if (isOperation(command, "merge")) merged = true;
 		if (merged && commandKey(command).includes("/*ancestry*/")) return json({ rows: [{ base: "d".repeat(32) }] });
 		return original(command);
 	};
@@ -330,12 +341,14 @@ test("post-merge ancestry must include both original commits", async () => {
 });
 
 test("an offline Dolt update-check warning is not part of the executable version", async () => {
-	const { dependencies } = await fixture();
-	const original = dependencies.run;
-	dependencies.run = (command) => command.command === DOLT_PATH && command.args[0] === "version"
-		? Promise.resolve(result("dolt version 2.3.1\nWarning: unable to query latest released Dolt version\n")) : original(command);
-	const prepared = await inspectBeadsSyncTrust({ directory: DIRECTORY, remote: "origin" }, dependencies);
-	assert.equal(prepared.display.doltVersion, "dolt version 2.3.1");
+	for (const doltVersion of ["2.3.0", "2.3.1"]) {
+		const { dependencies } = await fixture({ doltVersion });
+		const original = dependencies.run;
+		dependencies.run = (command) => command.command === DOLT_PATH && command.args[0] === "version"
+			? Promise.resolve(result(`dolt version ${doltVersion}\nWarning: unable to query latest released Dolt version\n`)) : original(command);
+		const prepared = await inspectBeadsSyncTrust({ directory: DIRECTORY, remote: "origin" }, dependencies);
+		assert.equal(prepared.display.doltVersion, `dolt version ${doltVersion}`);
+	}
 });
 
 test("a mismatched on-disk remote is never silently repaired", async () => {
@@ -360,6 +373,107 @@ test("changed Git URL expansion invalidates trusted publication authority", asyn
 	options.transportUrl = "ssh://git@second.example/repo";
 	await assert.rejects(executeBeadsSync({ action: "fetch", directory: DIRECTORY, remote: "origin" }, dependencies, { sessionId: "fixture-session" }), /evidence changed/);
 	assert.equal(commands.some(isFetch), false);
+});
+
+test("both tested Dolt patches support enrollment and all operations in both storage modes", async (t) => {
+	for (const doltVersion of ["2.3.0", "2.3.1"]) for (const mode of ["embedded", "server"] as const) {
+		for (const action of ["fetch", "pull", "push"] as const) await t.test(`${doltVersion} ${mode} ${action}`, async () => {
+			const { dependencies, commands } = await enrolled({ doltVersion, mode, behind: action === "push" ? 0 : 1 });
+			const evidence = await executeBeadsSync({ action, directory: DIRECTORY, remote: "origin" }, dependencies, { sessionId: "fixture-session" });
+			assert.equal(evidence.verified, true);
+			const probes = commands.filter((command) => commandKey(command).includes("/*capabilities*/"));
+			assert.ok(probes.length > 0);
+			assert.ok(probes.every((command) => command.command === (mode === "server" ? BD_PATH : DOLT_PATH)));
+			assert.ok(probes.every((command) => mode === "server" ? command.args.includes("--readonly") : command.args.includes("--disable-auto-gc")));
+			const firstFetch = commands.findIndex(isFetch);
+			for (const name of ["fetch", "merge", "push"]) assert.ok(commands.slice(0, firstFetch).some((command) => command.args.includes(name) && command.args.includes("--help")));
+		});
+	}
+});
+
+test("unsupported, ambiguous and prerelease versions fail closed", async (t) => {
+	for (const doltVersion of ["2.2.9", "2.3.2", "2.3.5", "2.3.10", "2.4.0", "3.0.0", "2.3", "2.3.01", "2.3.1-dev", "2.3.1+build", "2.3.1\ndolt version 2.3.0"]) {
+		await t.test(doltVersion, async () => {
+			const { dependencies, commands } = await fixture({ doltVersion });
+			await assert.rejects(inspectBeadsSyncTrust({ directory: DIRECTORY, remote: "origin" }, dependencies), /unsupported dolt version/i);
+			assert.equal(commands.some(isFetch), false);
+		});
+	}
+	for (const bdVersion of ["1.2.3", "1.2.20", "1.2.2-dev"]) {
+		const { dependencies } = await fixture({ bdVersion });
+		await assert.rejects(inspectBeadsSyncTrust({ directory: DIRECTORY, remote: "origin" }, dependencies), /unsupported bd version/i);
+	}
+});
+
+test("supported patch changes still require exact re-enrollment", async () => {
+	const options = { doltVersion: "2.3.0" };
+	const { agentDir, dependencies, commands } = await enrolled(options);
+	assert.equal(JSON.parse(await readFile(join(agentDir, BEADS_SYNC_CONFIG_NAME), "utf8")).stores[0].doltVersion, "dolt version 2.3.0");
+	options.doltVersion = "2.3.1";
+	await assert.rejects(executeBeadsSync({ action: "fetch", directory: DIRECTORY, remote: "origin" }, dependencies, { sessionId: "fixture-session" }), /evidence changed/);
+	assert.equal(commands.some(isFetch), false);
+});
+
+test("failed live capabilities refuse enrollment and every action before transfer", async (t) => {
+	for (const failure of [
+		{ fail: /\/\*capabilities\*\// },
+		{ fail: /fetch --help/ },
+		{ help: { fetch: "dolt fetch" } },
+		{ help: { merge: "bd vc merge <branch> --json" } },
+		{ help: { push: "bd dolt push --sandbox --dolt-auto-commit" } },
+		{ capabilities: { version: "2.4.0" } },
+		{ capabilities: { base: REMOTE_HEAD } },
+		{ capabilities: { head: REMOTE_HEAD } },
+		{ capabilities: { schema_changes: 1 } },
+		{ capabilities: { migrations: "0" } },
+		{ capabilities: { conflicts: null } },
+	] satisfies FixtureOptions[]) await t.test(JSON.stringify(failure), async () => {
+		const { dependencies } = await fixture(failure);
+		await assert.rejects(inspectBeadsSyncTrust({ directory: DIRECTORY, remote: "origin" }, dependencies));
+		for (const action of ["fetch", "pull", "push"] as const) {
+			const options: FixtureOptions = {};
+			const value = await enrolled(options);
+			Object.assign(options, failure);
+			await assert.rejects(executeBeadsSync({ action, directory: DIRECTORY, remote: "origin" }, value.dependencies, { sessionId: "fixture-session" }));
+			assert.equal(value.commands.some((command) => ["fetch", "merge", "push"].some((name) => isOperation(command, name))), false);
+		}
+	});
+});
+
+test("capability probes require one well-formed evidence row", async () => {
+	for (const output of ["not JSON", "{}", '{"rows":[]}', '{"rows":[{},{}]}', '{"rows":[{}]}']) {
+		const { dependencies, commands } = await enrolled();
+		const original = dependencies.run;
+		dependencies.run = (command) => commandKey(command).includes("/*capabilities*/") ? Promise.resolve(result(output)) : original(command);
+		await assert.rejects(executeBeadsSync({ action: "fetch", directory: DIRECTORY, remote: "origin" }, dependencies, { sessionId: "fixture-session" }));
+		assert.equal(commands.some(isFetch), false);
+	}
+});
+
+test("admitted Dolt patches do not weaken the Beads schema contract", async () => {
+	for (const doltVersion of ["2.3.0", "2.3.1"]) for (const column of ["schema_version", "schema_count"]) {
+		const { dependencies, commands } = await enrolled({ doltVersion });
+		const original = dependencies.run;
+		dependencies.run = async (command) => {
+			const output = await original(command);
+			if (commandKey(command).includes("/*working*/")) {
+				const parsed = JSON.parse(output.stdout);
+				parsed.rows[0][column] = 54;
+				return json(parsed);
+			}
+			return output;
+		};
+		await assert.rejects(executeBeadsSync({ action: "fetch", directory: DIRECTORY, remote: "origin" }, dependencies, { sessionId: "fixture-session" }), /schema migration state/i);
+		assert.equal(commands.some(isFetch), false);
+	}
+});
+
+test("capabilities are rechecked after fetch before mutation", async () => {
+	const options: FixtureOptions = { behind: 0 };
+	const { dependencies, commands } = await enrolled(options);
+	options.onCommand = (command) => { if (isFetch(command)) options.help = { push: "unavailable" }; };
+	await assert.rejects(executeBeadsSync({ action: "push", directory: DIRECTORY, remote: "origin" }, dependencies, { sessionId: "fixture-session" }), /capabilit/i);
+	assert.equal(commands.some((command) => isOperation(command, "push")), false);
 });
 
 test("server mode uses the owner-qualified Beads SQL boundary for pull preview", async () => {

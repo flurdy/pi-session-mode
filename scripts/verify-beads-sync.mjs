@@ -182,7 +182,7 @@ try {
 	assert.equal(event?.isError, true, JSON.stringify(event));
 	assert.equal(client.events.some((item) => item.type === "ui_prompt_start" || item.method === "confirm"), false);
 	assert.doesNotMatch(client.stderr, /Failed to load extension|Network is forbidden/);
-	console.log(`Beads sync RPC PASS (${serverMode ? "server" : "embedded"}): current Pi plan mode from another repository, private trust, typed non-force push, exact-commit pull, conflict/unknown-store/changed-destination refusal, no-push respected, no source lease, no prompt, unchanged source worktrees. Disposable file remotes only.`);
+	console.log(`Beads sync RPC PASS (${serverMode ? "server" : "embedded"}; ${prepared.display.bdVersion}; ${prepared.display.doltVersion}): current Pi plan mode from another repository, private trust, typed non-force push, exact-commit pull, conflict/unknown-store/changed-destination refusal, no-push respected, no source lease, no prompt, unchanged source worktrees. Disposable file remotes only.`);
 } finally {
 	await client?.stop();
 	if (serverMode) { try { bd(store, "dolt", "stop"); } catch { /* Fixture setup may have failed before the server started. */ } }
