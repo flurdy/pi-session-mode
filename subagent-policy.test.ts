@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -102,6 +102,28 @@ test("surfaces discovery failures to the guarded controller", async () => {
 		verifiedReadOnlySubagents("/repo", { discoverAgents: async () => { throw new Error("unavailable"); } }),
 		/unavailable/,
 	);
+});
+
+test("loads the compiled JavaScript discovery module from packaged pi-subagents", async () => {
+	const agentDir = await mkdtemp(join(os.tmpdir(), "pi-subagent-policy-"));
+	const packageDir = join(agentDir, "npm", "node_modules", "pi-subagents");
+	const moduleDir = join(packageDir, "src", "agents");
+	try {
+		await mkdir(moduleDir, { recursive: true });
+		await writeFile(join(packageDir, "package.json"), '{"type":"module"}\n');
+		await writeFile(join(moduleDir, "agents.js"), `
+export function discoverAgents() {
+	return { scope: "both", agents: [{ name: "reviewer", tools: ["read", "grep", "find", "ls"] }] };
+}
+`);
+
+		assert.deepEqual(
+			[...(await verifiedReadOnlySubagents("/repo", { agentDir }))],
+			["reviewer"],
+		);
+	} finally {
+		await rm(agentDir, { recursive: true, force: true });
+	}
 });
 
 test("installed pi-subagents discovery contract remains loadable", async (t) => {

@@ -10,7 +10,7 @@ See [the guard contract](docs/guard.md) for policy, lease lifetime, compatibilit
 - Git and util-linux `flock` for writer exclusion; Linux `lslocks` for optional occupancy observation.
 - Node.js from `.nvmrc` for development.
 
-Pi supplies its core package at runtime; the peer range deliberately accepts the host version. The optional guarded-reviewer integration uses the installed `pi-subagents` discovery API and fails closed when unavailable; see the contract.
+Pi supplies its core package at runtime; the peer range deliberately accepts the host version. The optional guarded-reviewer integration requires the compiled package layout from `pi-subagents` 0.68.0 or newer and fails closed when its discovery API is unavailable; see the contract.
 
 ## Install
 

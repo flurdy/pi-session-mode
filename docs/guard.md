@@ -168,9 +168,11 @@ The statusline suppresses its own holder during plan release. Explicit `/leases`
 
 Development pins Pi 0.85.1. Its reload path awaits session shutdown before resource reload/rebinding; the package drains acquisition and release there. Confirmed activation also treats the public `getAgentDir`/`getPackageDir` exports and package CLI entry as a version-tested compatibility seam; it never imports private package-manager modules. Native tests, real temporary Git/flock fixtures and isolated RPC installation checks cover scope transitions, loss, reload and restoration. Interactive footer checks supplement—not replace—those contracts. The scripted local provider fixture runs actual Pi native tool preflight, sibling execution and wrapper dispatch, validates tool-call/result pairing through in-turn checkpoints, and checks cancellation and reload without external model requests. Recheck on upgrades; an open host peer range does not certify future Pi behavior.
 
-The optional reviewer discovery seam was initially checked with pi-subagents 0.65.1; that version's
-background launcher incorrectly depended on experimental packages absent from published Pi 0.85.1.
-The upstream 0.67.0 fix restored the inherited-cwd async external path. Discovery eligibility alone
-never proves launch compatibility or auth. It deep-imports `src/agents/agents.ts` under the active Pi agent directory and expects `discoverAgents(cwd, "both", provider)` to return `{ scope: "both", agents: [...] }`. This internal API is not a stability guarantee. Keep absence, malformed definitions and unsafe contracts fail-closed; do not vendor the resolver or turn discovery failures into approval.
+The optional reviewer discovery seam requires pi-subagents 0.68.0 or newer, which introduced the
+compiled JavaScript package layout. Discovery eligibility alone never proves launch compatibility or
+auth. It deep-imports `src/agents/agents.js` under the active Pi agent directory and expects
+`discoverAgents(cwd, "both", provider)` to return `{ scope: "both", agents: [...] }`. This internal API
+is not a stability guarantee. Keep absence, malformed definitions and unsafe contracts fail-closed;
+do not vendor the resolver or turn discovery failures into approval.
 
 Consumers use `@flurdy/pi-session-mode/lease-observer`; do not copy the implementation. Its new batch function supplements the existing single-root function. See the [README](../README.md) for installation, verification and downgrade boundaries.

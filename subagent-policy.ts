@@ -38,7 +38,7 @@ function agentDirFromEnvironment(): string {
 }
 
 async function discoverEffectiveAgents(cwd: string, agentDir: string, preferredProvider?: string): Promise<ResolvedSubagentDefinition[]> {
-	const modulePath = path.join(agentDir, "npm", "node_modules", "pi-subagents", "src", "agents", "agents.ts");
+	const modulePath = path.join(agentDir, "npm", "node_modules", "pi-subagents", "src", "agents", "agents.js");
 	const module = await import(pathToFileURL(modulePath).href) as { discoverAgents?: unknown };
 	if (typeof module.discoverAgents !== "function") throw new Error("pi-subagents discovery API is unavailable");
 	const result = module.discoverAgents(cwd, "both", preferredProvider) as { agents?: unknown; scope?: unknown } | undefined;
