@@ -3,13 +3,14 @@ import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 
 const source = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const target = process.argv[2] ? resolve(process.argv[2]) : source;
 const hostVersion = execFileSync("pi", ["--version"], { encoding: "utf8" }).trim();
-const expectedVersion = JSON.parse(await readFile(join(source, "package.json"), "utf8")).devDependencies["@earendil-works/pi-coding-agent"];
+const expectedVersion = process.env.PI_VERIFY_HOST_VERSION ?? JSON.parse(await readFile(join(source, "package.json"), "utf8")).devDependencies["@earendil-works/pi-coding-agent"];
 assert.equal(hostVersion, expectedVersion, "Verify against the repository-pinned Pi host");
 console.log(`Dynamic RPC host: Pi ${hostVersion}, Node ${process.version}`);
 await mkdir(join(source, ".artifacts"), { recursive: true });
@@ -44,7 +45,7 @@ class Client {
 	pending = new Map(); events = []; sequence = 0; buffer = ""; stderr = "";
 	constructor(agent, flags) {
 		this.child = spawn("pi", ["--mode", "rpc", "--offline", "--no-skills", "--no-context-files", "--no-approve", "--session", join(agent, "session.jsonl"), "--provider", "lease-fixture", "--model", "fixed", "-e", join(target, "index.ts"), "-e", join(source, "fixtures", "native-write-provider.ts"), ...flags], {
-			cwd: work, env: { HOME: agent, PATH: `${bin}:${process.env.PATH}`, TERM: "xterm-256color", PI_CODING_AGENT_DIR: agent, XDG_RUNTIME_DIR: runtime, TMPDIR: panelArtifacts, PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" }, stdio: ["pipe", "pipe", "pipe"],
+			cwd: work, env: { HOME: handoffHome ?? agent, PATH: `${bin}:${process.env.PATH}`, TERM: "xterm-256color", PI_CODING_AGENT_DIR: agent, XDG_RUNTIME_DIR: runtime, TMPDIR: panelArtifacts, PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" }, stdio: ["pipe", "pipe", "pipe"],
 		});
 		this.closed = new Promise((done) => this.child.once("close", done));
 		this.child.stdout.setEncoding("utf8");
@@ -100,6 +101,8 @@ class Client {
 	}
 }
 const clients = [];
+const handoffHelper = process.env.HANDOFF_SAVE_HELPER;
+const handoffHome = handoffHelper ? await mkdtemp(join(tmpdir(), "pi-handoff-rpc-")) : undefined;
 async function launch(name, flags = []) {
 	const agent = join(base, name); await mkdir(agent);
 	await writeFile(join(agent, "settings.json"), JSON.stringify({ defaultProjectTrust: "never", enableInstallTelemetry: false }));
@@ -110,11 +113,32 @@ async function launch(name, flags = []) {
 }
 const write = (path, content = "fixture") => ({ name: "write", arguments: { path, content } });
 const parallel = (calls) => ({ name: "multi_tool_use.parallel", arguments: { tool_uses: calls.map((call) => ({ recipient_name: `functions.${call.name}`, parameters: call.arguments })) } });
+const handoffRequest = (slug) => ({ name: "save_handoff", arguments: {
+	date: "2026-09-23", time: "09:42", slug,
+	content: `# Resume: ${slug} — 2026-09-23 09:42\n\n**Where to pick up:** /fixture\n**Jira:** —\n**Beads:** —\n**Deliverable:** —\n**PRs:** —\n**Context:**\n- Fixture.\n**Decisions so far:**\n- Save.\n**Working-copy risks:**\n- None.\n**Open threads:**\n- Resume.\n**Suggested next step:**\n- Verify.\n`,
+} });
+const receipt = (result) => { assert.equal(result.isError, false, JSON.stringify(result)); return JSON.parse(result.result.content[0].text); };
 try {
+	if (handoffHome) {
+		await mkdir(join(handoffHome, ".agents/skills/wrap-up/scripts"), { recursive: true });
+		await writeFile(join(handoffHome, ".agents/skills/wrap-up/scripts/save-handoff.py"), await readFile(handoffHelper));
+	}
 	const first = await launch("first"), peer = await launch("peer", ["--lease-roots", JSON.stringify([repos.web])]);
 	await first.roots([work]); await peer.roots([repos.web]);
 	const tools = (await first.snapshot()).tools;
 	assert.ok(tools.includes("activate_pi_package"));
+	assert.ok(tools.includes("save_handoff"));
+	if (handoffHome) {
+		const conflict = await launch("conflict");
+		await conflict.roots([]);
+		const [left, right] = await Promise.all([
+			first.turn("handoff-implement", [handoffRequest("implementation")]),
+			conflict.turn("handoff-conflict", [handoffRequest("conflict")]),
+		]);
+		assert.equal(receipt(left[0]).status, "saved"); assert.equal(receipt(right[0]).status, "saved");
+		await first.roots([work]); await conflict.roots([]);
+		await conflict.stop();
+	}
 	let results = await first.turn("activation-rpc-denied", [{ name: "activate_pi_package", arguments: { package: "session-mode", version: "v0.4.0", expectedCommit: "2".repeat(40) } }]);
 	assert.equal(results.length, 1); assert.equal(results[0].isError, true);
 	await first.turn("selection-only", []);
@@ -156,6 +180,20 @@ try {
 	const guarded = await first.turn("guarded", [write("repos/slow/guarded")]);
 	assert.equal(guarded.length, 1); assert.equal(guarded[0].isError, true);
 	await first.roots([]); await absent(join(repos.slow, "guarded"));
+	if (handoffHome) {
+		const input = handoffRequest("guarded-plan");
+		const saved = receipt((await first.turn("handoff-plan", [input]))[0]);
+		assert.equal(saved.status, "saved");
+		assert.equal(await readFile(saved.path, "utf8"), input.arguments.content);
+		assert.equal(receipt((await first.turn("handoff-collision", [input]))[0]).status, "collision");
+		const overwritten = await first.turn("handoff-rpc-overwrite", [{ ...input, arguments: { ...input.arguments, overwriteSha256: saved.sha256 } }]);
+		assert.equal(overwritten[0].isError, true); assert.match(JSON.stringify(overwritten[0].result), /interactive TUI confirmation/);
+		await first.roots([]);
+		await first.send("prompt", { message: "/fixture-reload" });
+		assert.equal(receipt((await first.turn("handoff-after-reload", [handoffRequest("after-reload")]))[0]).status, "saved");
+		await first.roots([]);
+		console.log("Handoff RPC PASS: concurrent implementation/conflict saves, guarded-plan save, collision preservation, RPC overwrite denial, reload, no scope expansion; real helper in isolated HOME.");
+	} else console.log("Handoff RPC SKIP: set HANDOFF_SAVE_HELPER for cross-repository coverage.");
 	const beforePanelArtifacts = await readdir(panelArtifacts);
 	for (const [index, command] of [
 		"review-panel.sh check --prompt-file repos/api/new",
@@ -195,4 +233,5 @@ try {
 } finally {
 	for (const client of clients) await client.stop();
 	await rm(base, { recursive: true, force: true });
+	if (handoffHome) await rm(handoffHome, { recursive: true, force: true });
 }

@@ -87,6 +87,7 @@ export const SAFE_PARALLEL_TOOL_NAMES: ReadonlySet<string> = new Set([
 	"figma_get_file_raw",
 	"figma_get_nodes_raw",
 	"ask_user_question",
+	"save_handoff",
 	"bash",
 	"subagent",
 	"subagent_supervisor",

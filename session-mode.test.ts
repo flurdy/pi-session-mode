@@ -88,10 +88,31 @@ function harness(results: WorktreeLeaseResult[] = [held()], options: Partial<Ses
 	return { pi, acquisitions, controller };
 }
 
-test("registers only scope controls and confirmed package activation", () => {
+test("registers scope controls, fixed handoff saving and confirmed package activation", () => {
 	const { pi } = harness();
 	assert.deepEqual([...pi.commands.keys()].sort(), ["grant-file", "grants", "implement", "leases", "plan"]);
-	assert.deepEqual([...pi.tools.keys()], ["activate_pi_package"]);
+	assert.deepEqual([...pi.tools.keys()], ["save_handoff", "activate_pi_package"]);
+});
+
+test("handoff operation stays allowed in plan, conflict, acquiring, lost, implement and unguarded states", async () => {
+	for (const scenario of ["plan", "conflict", "acquiring", "lost", "implement", "unguarded"]) {
+		let lose!: () => void;
+		const lease = held();
+		lease.lost = new Promise<void>((done) => { lose = done; });
+		const { pi } = harness(scenario === "conflict" ? [{ kind: "contended", root: "/repo" }] : [lease], { isDisabled: () => scenario === "unguarded" });
+		const ctx = context(); pi.planFlag = scenario === "plan";
+		if (scenario !== "acquiring") await pi.emit("session_start", ctx);
+		if (scenario === "lost") { lose(); await new Promise((done) => setImmediate(done)); }
+		for (const event of [
+			{ toolName: "save_handoff", input: {} },
+			{ toolName: "multi_tool_use.parallel", input: { tool_uses: [{ recipient_name: "functions.save_handoff", parameters: {} }] } },
+		]) assert.deepEqual(await pi.emit("tool_call", ctx, event), [undefined], scenario);
+		if (scenario !== "unguarded") {
+			const [prompt] = await pi.emit("before_agent_start", ctx, { systemPrompt: "base" });
+			assert.match((prompt as any).systemPrompt, /save_handoff.*every guard state/);
+		}
+		await pi.emit("session_shutdown", ctx);
+	}
 });
 
 test("defaults to implement and acquires before reporting write authority", async () => {
@@ -586,19 +607,22 @@ test("implement waits for an in-progress plan release before reacquiring", async
 });
 
 test("concurrent implement transitions share one lease acquisition", async () => {
+	let acquired!: () => void;
+	const entered = new Promise<void>((done) => { acquired = done; });
 	let resolveLease: ((result: WorktreeLeaseResult) => void) | undefined;
 	const pending = new Promise<WorktreeLeaseResult>((resolve) => (resolveLease = resolve));
 	let acquisitionCount = 0;
 	const { pi, controller } = harness([], {
 		acquireLease: async () => {
 			acquisitionCount += 1;
+			acquired();
 			return pending;
 		},
 	});
 	const ctx = context();
 
 	const startup = pi.emit("session_start", ctx);
-	await Promise.resolve();
+	await entered;
 	const command = pi.commands.get("implement")?.handler("", ctx);
 	await Promise.resolve();
 	assert.equal(acquisitionCount, 1);

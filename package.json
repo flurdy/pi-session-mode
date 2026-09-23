@@ -24,8 +24,10 @@
   "files": [
     "README.md",
     "docs/guard.md",
+    "docs/handoff-save.md",
     "docs/package-activation.md",
     "file-scope.ts",
+    "handoff-save.ts",
     "index.ts",
     "lease-observer.ts",
     "lease-set.ts",

@@ -138,6 +138,17 @@ V1 mode entries remain readable. V2 records distinguish plan, implicit cwd and e
 
 Changed originating cwd, missing roots, changed file identities, new Git ownership, changed link counts, or unavailable markers require guarded reselection. Restored identities are checked before acquisition, and each explicit acquisition checks its expected identity before taking a lock. Canonical saved paths are passed as file URLs rather than reinterpreted through user-input whitespace normalization. Restoration and reload reacquire; new sessions and forks never inherit locks. Explicit startup `--plan`, `--implement`, or `--lease-roots` selections do not implicitly restore file grants.
 
+## Fixed-destination handoff saves
+
+`save_handoff` is an explicit operation-specific exception in every guard state, independent of
+source leases and exact-file grants. It runs only the digest-verified installed wrap-up helper,
+with a fixed user-home destination and bounded content; no shell or caller-selected path is allowed.
+New files need no confirmation. Replacement requires fresh hash-bound native TUI confirmation;
+headless/RPC replacement is denied. Temporary per-target leases last only for the save, without
+changing session scope. The [handoff-save contract](handoff-save.md) owns helper trust, queueing,
+concurrency, cancellation, verification, rollout and residual risks. This exception grants no
+native edit/write, shell, arbitrary artifact or panel authority.
+
 ## Confirmed package activation
 
 `activate_pi_package` is an explicit exception to the ordinary native-path boundary, not a repository lease expansion. Its mutation authority exists only inside the controller closure while the session is in live `implement` state with at least one worktree lease, no guard bypass, no scope transition and an interactive timed confirmation. Plan, conflict, acquiring, lost, unguarded and file-only states block it; the bounded generic policy also rejects the tool before execution in guarded states. No persisted selection, status value, event-bus message, project file, prompt or model assertion can grant this authority.
@@ -156,7 +167,7 @@ The statusline suppresses its own holder during plan release. Explicit `/leases`
 
 ## Explicit limitations
 
-- Bash, PowerShell, scripts, arbitrary wrapper tools and subprocess side effects are not covered by native path enforcement. Exact-file grants authorize only native `edit`/`write`; they do not confine Bash. File-only mode keeps the guarded Bash checker, but it remains intentionally bounded and allows unknown commands. Once a worktree is leased, the ordinary implementation shell boundary applies.
+- Except for the dedicated `save_handoff` and `activate_pi_package` adapters, Bash, PowerShell, scripts, arbitrary wrapper tools and subprocess side effects are not covered by native path enforcement. Exact-file grants authorize only native `edit`/`write`; they do not confine Bash. File-only mode keeps the guarded Bash checker, but it remains intentionally bounded and allows unknown commands. Once a worktree is leased, the ordinary implementation shell boundary applies.
 - Typed `!` / `!!`, `--no-extensions`, trusted extensions, other editors and machines can bypass the guard. Pi-subagents extension ceilings/lists may also omit this extension.
 - Read-only guarded delegation retains its existing limits: no dynamic workflow fan-out, writer agents, alternative cwd, output authority or managed-worktree creation without implementation mode. Same-worktree writers contend rather than borrowing parent leases.
 - Worktree-root locks do not lock shared Git administration across separate worktrees.
