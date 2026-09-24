@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { access, link, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
-import { acquireFileLease } from "./lease.ts";
+import { acquireFileLease, acquireWorktreeLease } from "./lease.ts";
+import { resolveGrantFile } from "./file-scope.ts";
 import { createHandoffSaver, registerHandoffSave, type HandoffRequest } from "./handoff-save.ts";
 
 const helper = process.env.HANDOFF_SAVE_HELPER ?? join(homedir(), ".agents/skills/wrap-up/scripts/save-handoff.py");
@@ -14,7 +16,8 @@ function request(slug = "save-proof"): HandoffRequest {
 	return { date: "2026-09-23", time: "09:42", slug, content: `# Resume: ${slug} — 2026-09-23 09:42\n\n**Where to pick up:** /project\n**Jira:** —\n**Beads:** —\n**Deliverable:** —\n**PRs:** —\n**Context:**\n- Literal $(not-executed) and \`code\`.\n**Decisions so far:**\n- Keep grants narrow.\n**Working-copy risks:**\n- None.\n**Open threads:**\n- Resume.\n**Suggested next step:**\n- Verify.\n` };
 }
 async function fixture(run: (f: { home: string; runtime: string; save: ReturnType<typeof createHandoffSaver>; target: (slug?: string) => string }) => Promise<void>) {
-	const home = await mkdtemp(join(tmpdir(), "handoff-save-"));
+	const root = await mkdtemp(join(tmpdir(), "handoff-save-"));
+	const home = join(root, "home");
 	try {
 		const directory = join(home, ".agents/skills/wrap-up/scripts");
 		await mkdir(directory, { recursive: true });
@@ -22,7 +25,7 @@ async function fixture(run: (f: { home: string; runtime: string; save: ReturnTyp
 		const runtime = join(home, "runtime");
 		const save = createHandoffSaver({ home, acquire: (file, options) => acquireFileLease(file, { ...options, runtimeDir: runtime }) });
 		await run({ home, runtime, save, target: (slug = "save-proof") => join(home, ".claude/handoffs", `2026-09-23-${slug}.md`) });
-	} finally { await rm(home, { recursive: true, force: true }); }
+	} finally { await rm(root, { recursive: true, force: true }); }
 }
 const context = (confirm = async (_message: string) => true) => ({ sessionId: "fixture", confirm });
 
@@ -85,7 +88,24 @@ integration("rejects path/command overrides, malformed content and changed helpe
 	await assert.rejects(access(join(home, ".claude")));
 }));
 
-integration("symlinked directories, symlink targets and Git-owned destinations fail closed", () => fixture(async ({ home, save, target }) => {
+for (const root of [".", ".claude"]) {
+	integration(`fixed saves work inside a Git-owned ${root} without relaxing ordinary grants`, () => fixture(async ({ home, save, target }) => {
+		const repo = join(home, root);
+		await mkdir(repo, { recursive: true });
+		execFileSync("git", ["init", "-q", repo]);
+		const first = await save(request(), context());
+		assert.equal(first.status, "saved");
+		assert.equal(await readFile(target(), "utf8"), request().content);
+		await assert.rejects(resolveGrantFile(target(), home), /Git/);
+		assert.equal((await acquireFileLease(target())).kind, "unavailable");
+		assert.equal((await save(request(), context())).status, "collision");
+		const content = request().content.replace("- Verify.", "- Continue.");
+		assert.equal((await save({ ...request(), content, overwriteSha256: first.sha256! }, context())).status, "saved");
+		assert.equal(await readFile(target(), "utf8"), content);
+	}));
+}
+
+integration("symlinked directories, symlink targets and nested Git destinations fail closed", () => fixture(async ({ home, save, target }) => {
 	const outside = join(home, "outside"); await mkdir(outside);
 	await symlink(outside, join(home, ".claude"));
 	await assert.rejects(save(request(), context()), /directory/);
@@ -94,8 +114,89 @@ integration("symlinked directories, symlink targets and Git-owned destinations f
 	await writeFile(join(outside, "file"), "untouched"); await symlink(join(outside, "file"), target());
 	await assert.rejects(save(request(), context()), /target/);
 	assert.equal(await readFile(join(outside, "file"), "utf8"), "untouched");
-	await rm(target()); await mkdir(join(home, ".claude/.git"));
+	await rm(target()); await mkdir(join(home, ".claude/handoffs/.git"));
 	await assert.rejects(save(request(), context()), /Git/);
+}));
+
+integration("Git-owned handoffs retain exact-target leases and coexist with a dotfiles root lease", () => fixture(async ({ home, runtime, target }) => {
+	const repo = join(home, ".claude"); await mkdir(repo);
+	execFileSync("git", ["init", "-q", repo]);
+	const rootLease = await acquireWorktreeLease(repo, { runtimeDir: runtime });
+	assert.equal(rootLease.kind, "held");
+	let bound: Parameters<typeof acquireFileLease>[1];
+	const save = createHandoffSaver({ home, acquire: (file, options) => {
+		bound = { ...options, runtimeDir: runtime };
+		return acquireFileLease(file, bound);
+	} });
+	try {
+		const first = await save(request(), context());
+		assert.ok(bound?.resolveFile);
+		await assert.rejects(bound.resolveFile(join(home, "escape.md")), /identity/);
+		await assert.rejects(bound.resolveFile(target("other-valid-name")), /identity/);
+		const holder = await acquireFileLease(target(), bound);
+		assert.equal(holder.kind, "held");
+		const replacement = { ...request(), content: request().content.replace("- Verify.", "- Continue."), overwriteSha256: first.sha256! };
+		try {
+			await assert.rejects(save(replacement, context()), /held by another/);
+			assert.equal(await readFile(target(), "utf8"), request().content);
+		} finally { if (holder.kind === "held") await holder.release(); }
+		assert.equal((await save(replacement, context())).status, "saved");
+		const results = await Promise.all([save(request("one"), context()), save(request("two"), context())]);
+		assert.ok(results.every((result) => result.status === "saved"));
+	} finally { if (rootLease.kind === "held") await rootLease.release(); }
+}));
+
+integration("dotfiles Git indirection does not redirect the handoff path", () => fixture(async ({ home, save, target }) => {
+	const repo = join(home, ".claude"); await mkdir(repo);
+	execFileSync("git", ["init", "-q", "--separate-git-dir", join(home, "git-storage"), repo]);
+	assert.equal((await save(request(), context())).status, "saved");
+	assert.equal(await readFile(target(), "utf8"), request().content);
+}));
+
+for (const location of [".", ".claude", ".claude/handoffs"]) {
+	for (const marker of ["HEAD", "objects", "refs"]) {
+		integration(`rejects Git administration marker ${location}/${marker}`, () => fixture(async ({ home, save, target }) => {
+			await mkdir(join(home, location), { recursive: true });
+			await writeFile(join(home, location, marker), "fixture");
+			await assert.rejects(save(request(), context()), /Git administration/);
+			await assert.rejects(access(target()));
+		}));
+	}
+}
+
+integration("bare dotfiles repos, nested gitfiles and Git ancestors outside home stay rejected", () => fixture(async ({ home, save, target }) => {
+	const repo = join(home, ".claude");
+	execFileSync("git", ["init", "--bare", "-q", repo]);
+	await assert.rejects(save(request(), context()), /Git administration/);
+	await assert.rejects(access(target()));
+	await rm(repo, { recursive: true, force: true });
+	await mkdir(join(repo, "handoffs"), { recursive: true });
+	await writeFile(join(repo, "handoffs/.git"), "gitdir: /fixture/metadata\n");
+	await assert.rejects(save(request(), context()), /Git/);
+	await assert.rejects(access(target()));
+	await rm(join(repo, "handoffs/.git"));
+	await mkdir(join(dirname(home), ".git"));
+	await assert.rejects(save(request(), context()), /Git/);
+	await assert.rejects(access(target()));
+}));
+
+integration("Git-owned paths still reject symlinked handoff folders, hardlinks and special targets", () => fixture(async ({ home, save, target }) => {
+	const repo = join(home, ".claude"); await mkdir(repo);
+	execFileSync("git", ["init", "-q", repo]);
+	const outside = join(home, "outside"); await mkdir(outside);
+	await symlink(outside, join(repo, "handoffs"));
+	await assert.rejects(save(request(), context()), /directory/);
+	assert.deepEqual(await readdir(outside), []);
+	await rm(join(repo, "handoffs")); await mkdir(join(repo, "handoffs"));
+	await writeFile(join(outside, "original"), "untouched");
+	await link(join(outside, "original"), target());
+	await assert.rejects(save(request(), context()), /target/);
+	assert.equal(await readFile(join(outside, "original"), "utf8"), "untouched");
+	await rm(target()); await mkdir(target());
+	await assert.rejects(save(request(), context()), /target/);
+	await rm(target(), { recursive: true });
+	execFileSync("mkfifo", [target()]);
+	await assert.rejects(save(request(), context()), /target/);
 }));
 
 integration("cancellation before launch or during confirmation never writes", () => fixture(async ({ save, target }) => {

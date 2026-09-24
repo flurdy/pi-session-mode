@@ -122,6 +122,8 @@ try {
 	if (handoffHome) {
 		await mkdir(join(handoffHome, ".agents/skills/wrap-up/scripts"), { recursive: true });
 		await writeFile(join(handoffHome, ".agents/skills/wrap-up/scripts/save-handoff.py"), await readFile(handoffHelper));
+		await mkdir(join(handoffHome, ".claude"));
+		execFileSync("git", ["init", "-q", join(handoffHome, ".claude")]);
 	}
 	const first = await launch("first"), peer = await launch("peer", ["--lease-roots", JSON.stringify([repos.web])]);
 	await first.roots([work]); await peer.roots([repos.web]);
@@ -192,7 +194,7 @@ try {
 		await first.send("prompt", { message: "/fixture-reload" });
 		assert.equal(receipt((await first.turn("handoff-after-reload", [handoffRequest("after-reload")]))[0]).status, "saved");
 		await first.roots([]);
-		console.log("Handoff RPC PASS: concurrent implementation/conflict saves, guarded-plan save, collision preservation, RPC overwrite denial, reload, no scope expansion; real helper in isolated HOME.");
+		console.log("Handoff RPC PASS: concurrent implementation/conflict saves, guarded-plan save, collision preservation, RPC overwrite denial, reload, no scope expansion; real helper in isolated HOME with Git-owned .claude.");
 	} else console.log("Handoff RPC SKIP: set HANDOFF_SAVE_HELPER for cross-repository coverage.");
 	const beforePanelArtifacts = await readdir(panelArtifacts);
 	for (const [index, command] of [

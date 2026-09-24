@@ -4,10 +4,8 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { basename, dirname, join } from "node:path";
 import { Type } from "typebox";
-import { resolveGrantFile } from "./file-scope.ts";
 import { acquireFileLease } from "./lease.ts";
 import { safeDisplay } from "./scope.ts";
 
@@ -43,12 +41,28 @@ function validate(input: HandoffRequest): HandoffRequest {
 	return { ...input };
 }
 
+async function assertHandoffDirectory(directory: string, home: string, signal?: AbortSignal): Promise<void> {
+	while (true) {
+		signal?.throwIfAborted();
+		if (basename(directory) === ".git") throw new Error("Handoff directory overlaps Git administration");
+		for (const marker of [".git", "HEAD", "objects", "refs"]) {
+			if (marker === ".git" && (directory === home || directory === join(home, ".claude"))) continue;
+			try { await lstat(join(directory, marker)); }
+			catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+			throw new Error("Handoff directory overlaps Git administration or an unsupported repository");
+		}
+		const parent = dirname(directory);
+		if (parent === directory) return;
+		directory = parent;
+	}
+}
+
 async function directory(home: string, signal?: AbortSignal): Promise<string> {
 	let parent = await realpath(home);
+	if (parent !== home) throw new Error("Handoff home identity changed");
 	for (const name of [".claude", "handoffs"]) {
 		signal?.throwIfAborted();
-		// Reuse non-repository identity checks before creating either private directory.
-		await resolveGrantFile(pathToFileURL(join(parent, ".handoff-directory-check")).href, parent, signal);
+		await assertHandoffDirectory(parent, home, signal);
 		const next = join(parent, name);
 		try { await mkdir(next, { mode: 0o700 }); }
 		catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw new Error("Handoff directory unavailable"); }
@@ -56,6 +70,7 @@ async function directory(home: string, signal?: AbortSignal): Promise<string> {
 		if (!info.isDirectory() || info.isSymbolicLink() || await realpath(next) !== next) throw new Error("Handoff directory must be canonical and not symlinked");
 		parent = next;
 	}
+	await assertHandoffDirectory(parent, home, signal);
 	return parent;
 }
 
@@ -78,9 +93,14 @@ async function targetBytes(path: string): Promise<Buffer> {
 }
 
 async function assertTarget(path: string, home: string, signal?: AbortSignal): Promise<void> {
-	try { if ((await lstat(path)).isSymbolicLink()) throw new Error("Symlink handoff target refused"); }
-	catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-	if (await resolveGrantFile(pathToFileURL(path).href, home, signal) !== path) throw new Error("Handoff target identity changed");
+	if (dirname(path) !== await directory(home, signal)) throw new Error("Handoff target identity changed");
+	try {
+		const info = await lstat(path);
+		if (info.isSymbolicLink()) throw new Error("Symlink handoff target refused");
+		if (!info.isFile() || info.nlink !== 1 || info.size > MAX_BYTES) throw new Error("Invalid handoff target");
+		if (await realpath(path) !== path) throw new Error("Handoff target identity changed");
+	} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+	signal?.throwIfAborted();
 }
 
 async function runHelper(source: string, home: string, input: HandoffRequest): Promise<{ code: number | null; stdout: string }> {
@@ -121,7 +141,14 @@ export function createHandoffSaver(dependencies: Dependencies = { home: homedir(
 			ctx.signal?.throwIfAborted();
 			if (await directory(canonicalHome, ctx.signal) !== folder) throw new Error("Handoff directory changed");
 			await assertTarget(path, canonicalHome, ctx.signal);
-			const lease = await acquire(path, { sessionId: ctx.sessionId, expectedFile: path, signal: ctx.signal });
+			const lease = await acquire(path, {
+				sessionId: ctx.sessionId, expectedFile: path, signal: ctx.signal,
+				resolveFile: async (candidate, signal) => {
+					if (candidate !== path) throw new Error("Handoff target identity changed");
+					await assertTarget(candidate, canonicalHome, signal);
+					return candidate;
+				},
+			});
 			if (lease.kind !== "held") throw new Error(lease.kind === "contended" ? "Handoff target held by another writer; no file was saved" : "Handoff target lease unavailable; no file was saved");
 			let lost = false;
 			void lease.lost.then(() => { lost = true; });

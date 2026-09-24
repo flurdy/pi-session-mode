@@ -15,9 +15,12 @@ environment or directory argument is accepted, including through parallel wrappe
 
 The destination is the runtime user's canonical home plus
 `.claude/handoffs/{date}-{slug}.md`. Only the two missing handoff directories may be created,
-with mode `0700`; existing directory permissions are not changed. Symlinked directories,
-symlink/non-regular/hardlinked targets and filesystem-detectable Git ownership are rejected.
-The existing file-identity resolver remains authoritative for cooperative non-Git ownership.
+with mode `0700`; existing directory permissions are not changed. Git worktrees rooted at
+home or `~/.claude` are supported, including `.git` indirection files: dotfiles version control
+does not relocate the fixed destination. Symlinked directories, symlink/non-regular/hardlinked
+targets, Git administration markers, a repository rooted at `handoffs`, and Git ancestors above
+home are rejected. Only this operation's exact generated target uses the private resolver;
+ordinary `/grant-file` and native-write ownership rules are unchanged.
 
 The adapter reads the installed
 `~/.agents/skills/wrap-up/scripts/save-handoff.py`, compares it to an exact reviewed SHA-256
@@ -33,6 +36,10 @@ Each mutation participates in Pi's per-file queue and takes a temporary exact-fi
 Distinct target filenames do not contend. The lease is released after each call, including
 failure; it is never added to `/grants` or persisted as session authority. An existing writer
 lease on the same target blocks the operation; the adapter never steals or borrows that lease.
+A dotfiles repository's worktree lease is separate and does not block this exact-file operation.
+A cooperating handoff saver uses the same target-file lock; a repository writer or manual writer
+can still modify or publish handoffs outside that lock. Saving does not stage, commit, ignore,
+or publish the handoff: keep private handoffs out of dotfiles publication separately.
 A collision returns `status: "collision"`, `existingSha256` and `suggestedSlug`, without changing
 existing bytes. Select a new slug or explicitly request overwrite; no automatic renaming.
 
