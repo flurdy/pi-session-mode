@@ -26,6 +26,11 @@ const syncDispatched = join(base, "sync-dispatched");
 for (const helper of ["make", "project-workspace"]) {
 	await writeFile(join(bin, helper), `#!/bin/sh\nprintf dispatched > '${syncDispatched}'\nexit 99\n`, { mode: 0o700 });
 }
+const stdinHelper = process.env.PANEL_STDIN_HELPER;
+const reviewerDispatched = join(base, "reviewer-dispatched");
+if (stdinHelper) {
+	await writeFile(join(bin, "claude"), `#!/bin/sh\ncat >/dev/null\nprintf fixture > '${reviewerDispatched}'\nprintf 'offline panel fixture review'\n`, { mode: 0o700 });
+}
 const panelDispatched = join(base, "panel-dispatched");
 const panelArtifacts = join(base, "panel-artifacts");
 await mkdir(panelArtifacts);
@@ -105,6 +110,19 @@ const handoffHelper = process.env.HANDOFF_SAVE_HELPER;
 const handoffHome = handoffHelper ? await mkdtemp(join(tmpdir(), "pi-handoff-rpc-")) : undefined;
 async function launch(name, flags = []) {
 	const agent = join(base, name); await mkdir(agent);
+	if (stdinHelper) {
+		const home = handoffHome ?? agent;
+		const scripts = join(home, ".agents/skills/second-opinion/scripts");
+		await mkdir(scripts, { recursive: true });
+		for (const file of ["review-panel-stdin.py", "review-panel.sh", "openrouter-panel.sh"]) {
+			await writeFile(join(scripts, file), await readFile(join(dirname(stdinHelper), file)), { mode: 0o700 });
+		}
+		await mkdir(join(home, ".agents/second-opinion"), { recursive: true });
+		await writeFile(join(home, ".agents/second-opinion/config.json"), JSON.stringify({ version: 1, profiles: {
+			fixture: { quorum: 1, routes: [{ id: "claude", kind: "local", agent: "claude", role: "offline fixture" }],
+				limits: { maxParallel: 1, maxPromptBytes: 65536, maxOutputTokensPerModel: 2000, defaultTimeoutSeconds: 10 } },
+		} }));
+	}
 	await writeFile(join(agent, "settings.json"), JSON.stringify({ defaultProjectTrust: "never", enableInstallTelemetry: false }));
 	const client = new Client(agent, flags); clients.push(client);
 	const commands = (await client.send("get_commands")).commands;
@@ -205,9 +223,28 @@ try {
 	].entries()) {
 		const denied = await first.turn(`panel-denied-${index}`, [{ name: "bash", arguments: { command } }]);
 		assert.equal(denied.length, 1); assert.equal(denied[0].isError, true);
-		assert.match(JSON.stringify(denied[0].result), index < 3 ? /named second-opinion panels are unsupported/i : /command blocked/i);
+		assert.match(JSON.stringify(denied[0].result), index < 3 ? /caller-file second-opinion panels are unsupported/i : /command blocked/i);
 	}
 	await absent(panelDispatched);
+	if (stdinHelper) {
+		const request = { version: 1, panel: "fixture", prompt: "Sanitized offline fixture." };
+		const panelCall = (extra) => ({ name: "bash", arguments: { command:
+			`printf '%s' '${JSON.stringify({ ...request, ...extra }).replaceAll("'", "\\u0027")}' | python3 ~/.agents/skills/second-opinion/scripts/review-panel-stdin.py`,
+		} });
+		const check = receipt((await first.turn("panel-stdin-check", [panelCall({ action: "check" })]))[0]);
+		await absent(reviewerDispatched);
+		const { panelSha256, promptSha256 } = check;
+		const rows = receipt((await first.turn("panel-stdin-run", [panelCall({ action: "run-local", panelSha256, promptSha256 })]))[0]);
+		assert.equal(rows[0].response, "offline panel fixture review");
+		assert.equal(await readFile(reviewerDispatched, "utf8"), "fixture");
+		const evaluation = receipt((await first.turn("panel-stdin-evaluate", [panelCall({ action: "evaluate", policy: "quorum", check, results: [rows] })]))[0]);
+		assert.equal(evaluation.quorumMet, true);
+		const malformed = await first.turn("panel-stdin-bad-path", [panelCall({ action: "check", output: "/tmp/not-allowed" })]);
+		assert.equal(malformed[0].isError, true);
+		assert.deepEqual(await readdir(panelArtifacts), beforePanelArtifacts);
+		await first.roots([]);
+		console.log("Private panel RPC PASS: actual native Bash dispatch in plan mode, real stdin transport/coordinator with stub reviewer, check/run/evaluate, input rejection, scratch cleanup, no source leases or provider requests.");
+	} else console.log("Private panel RPC SKIP: set PANEL_STDIN_HELPER for cross-repository transport coverage.");
 	for (const [index, command] of ["make beads-sync", "project-workspace beads-sync --workspace ."].entries()) {
 		const denied = await first.turn(`sync-denied-${index}`, [{ name: "bash", arguments: { command } }]);
 		assert.equal(denied.length, 1); assert.equal(denied[0].isError, true);
@@ -231,7 +268,7 @@ try {
 	for (const call of calls) assert.equal(resultsInSession.filter((entry) => entry.message.toolCallId === call.id).length, 1, `Unpaired ${call.id}`);
 	const locks = JSON.parse(execFileSync("lslocks", ["--json", "--output", "PATH"], { encoding: "utf8" }));
 	assert.equal((locks.locks ?? []).some((row) => row.path?.startsWith(runtime)), false);
-	console.log("Dynamic RPC PASS: real Pi native write/edit, atomic wrapper, sibling preflights, contention, cancellation, v2 in-turn persistence and reload, paired tool results, unchanged active tools, selection-only no-op, guarded rejection, RPC package-activation denial, guarded panel and workspace-sync pre-dispatch refusal with no artifacts or helper execution, clean shutdown. Scripted fixture only; no external model requests or real CLI/auth/billing proof.");
+	console.log("Dynamic RPC PASS: real Pi native write/edit, atomic wrapper, sibling preflights, contention, cancellation, v2 in-turn persistence and reload, paired tool results, unchanged active tools, selection-only no-op, guarded rejection, RPC package-activation denial, caller-file panel and workspace-sync pre-dispatch refusal, optional private stdin panel coverage reported above, clean shutdown. Scripted fixture only; no external model requests or real CLI/auth/billing proof.");
 } finally {
 	for (const client of clients) await client.stop();
 	await rm(base, { recursive: true, force: true });

@@ -30,6 +30,7 @@ For a reviewed mutable checkout, run `make apply`. It owns the existing `~/.pi/a
 - `/grant-file ~/.agents/tool/config.json` resolves exact non-Git files, displays their canonical identities, and requires an interactive confirmation before acquiring them. It can establish file-only implementation mode without leasing cwd; the bounded guarded Bash/subagent policy remains active until a worktree is also leased.
 - `/leases` shows held/requested/failed worktree scopes. `/leases repos/api` inspects that root without acquiring.
 - `/grants` shows held/requested/failed exact-file scopes. `/grants path` resolves that file identity without acquiring it.
+- Named second-opinion panels can use the installed private stdin helper in plan mode, without source leases or general `/tmp` write permission. The helper requires a supporting guard and owns its scratch files; see [read-only second opinions](docs/guard.md#read-only-second-opinions).
 - `save_handoff` saves a rendered resume block to the fixed user handoff directory in every guard state, without repository or `/grant-file` authority. New files auto-save; overwrite requires fresh TUI confirmation. See [handoff saves](docs/handoff-save.md) for helper requirements, concurrency and failure boundaries.
 - `activate_pi_package` is an opt-in agent tool for one already-installed allowlisted Pi Git package. It requires live implement state and fresh TUI confirmation, but does not publish or reload. See [confirmed package activation](docs/package-activation.md).
 - `pi --implement --lease-roots '["repos/api","repos/web"]'` selects explicit startup roots. `--plan` wins; explicit startup flags override saved selection.
@@ -60,7 +61,11 @@ npm ci
 npm run check
 ```
 
-After committing, run `npm run verify:git-install`. It installs the exact local commit through a temporary loopback Git server into an isolated Pi agent directory, verifies commands and real lease lifecycle, and checks the exported observer from a scratch consumer. It also runs the `verify:dynamic` helper against the installed package using a local scripted provider fixture: actual Pi native tools, contention, cancellation, in-turn persistence and reload, with no external model requests. No user installation is modified.
+After committing, run `npm run verify:git-install`. It installs the exact local commit through a temporary loopback Git server into an isolated Pi agent directory, verifies commands and real lease lifecycle, and checks the exported observer from a scratch consumer. It also runs the `verify:dynamic` helper against the installed package using a local scripted provider fixture: actual Pi native tools, contention, cancellation, in-turn persistence and reload, with no external model requests. No user installation is modified. Set `PANEL_STDIN_HELPER` to the reviewed agent-skills
+`skills/second-opinion/scripts/review-panel-stdin.py` path to include the cross-repository plan-mode
+check/run/evaluate smoke with a stub reviewer and no external model requests. Without it, that
+coverage is explicitly skipped. For a separate current-host smoke, run `node scripts/verify-dynamic.mjs`
+with `PI_VERIFY_HOST_VERSION` matching `pi --version` (npm scripts prefer the development-pinned Pi).
 
 `make verify-apply` verifies a checkout link; `make check` runs tests, typechecking, and the exact package allowlist. History provenance is recorded in [the extraction record](https://github.com/flurdy/pi-session-mode/blob/main/docs/extraction-history.md).
 

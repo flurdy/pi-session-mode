@@ -65,18 +65,25 @@ of executable availability, authentication, billing consent or successful launch
 children retain the inherited-cwd async-only contract; never pass native child options to expand
 an external runner's tools. Current discovery and runner preflight must both succeed.
 
-Named panels are unsupported in guarded states, including file-only implementation sessions.
-Their multi-stage coordinator requires caller-owned prompt and result files; no private-artifact
-capability is provided. Stop before context artifacts or panel consent, and never emulate a panel
-with direct calls or silently substitute a peer. The bounded Bash checker rejects recognizable
-`review-panel.sh` and `openrouter-panel.sh` invocations (literal paths, shell/`env` wrappers and
-constant shell payloads) with a panel-specific reason. `mktemp` is also an obvious file mutation.
-Existing input files do not authorize panel execution. This is not shell isolation: renamed
-scripts, arbitrary indirection and hidden subprocess effects remain outside detection and must
-not be used as workarounds.
+Named panels are eligible in guarded states, including file-only sessions, through the installed
+`~/.agents/skills/second-opinion/scripts/review-panel-stdin.py` helper only. The fixed Bash shape is
+`printf '%s' '<literal JSON>' | python3 ~/.agents/skills/second-opinion/scripts/review-panel-stdin.py`.
+Encode apostrophes in JSON values as `\u0027`; no shell expansion, alternate helper path, arguments,
+redirects or command chains are accepted. The helper owns fresh private scratch files and reuses
+the coordinator's check/run/evaluate protocol; no source lease or native adapter is introduced.
+It accepts bounded data rather than artifact paths, commands, cwd or environment overrides.
+
+Caller-file `review-panel.sh` and `openrouter-panel.sh` commands remain blocked, including recognized
+shell/`env` wrappers. `mktemp`, native writes, arbitrary redirects and cleanup remain guarded.
+An older guard or missing helper is unavailable support, never permission to bypass or emulate the
+panel. This is trusted installed-helper execution, not digest-verified code or shell isolation:
+user-controlled runtimes, scripts, CLI hooks/caches, indirection and subprocess effects remain
+outside comprehensive enforcement. The helper cleans ordinary exits and supported cancellation;
+SIGKILL, power loss or uncooperative children may leave private artifacts/processes.
 
 There is no broad temporary-directory or home grant, no new native-write exception, and no change
-to panel selection, digests, limits, billing or quorum/consensus interpretation. The owning skill's
+to panel selection, prompt/panel/subset digests, limits, billing or quorum/consensus interpretation.
+The guard's command eligibility does not attest model consent or task authorization. The owning skill's
 [support matrix](https://github.com/flurdy/agent-skills/blob/main/skills/second-opinion/references/guarded-plan.md)
 separates policy from actual runtime evidence and explains unsupported options, plan-policy denial,
 unavailable executable/auth, version incompatibility and billing consent. It never recommends

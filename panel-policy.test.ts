@@ -23,7 +23,7 @@ test("guarded panels fail before dispatch, even with pre-existing prompt files",
 	for (const command of panelCommands) {
 		for (const allowNativeWrites of [false, true]) {
 			const reason = guardedToolBlockReason("bash", { command }, { allowNativeWrites }) ?? "";
-			assert.match(reason, /named second-opinion panels are unsupported/i, command);
+			assert.match(reason, /caller-file second-opinion panels are unsupported/i, command);
 			assert.doesNotMatch(reason, /switch to \/implement|use \/implement/i);
 		}
 	}
@@ -55,10 +55,32 @@ test("guarded panel denial preserves direct peer commands and literal discussion
 	}
 });
 
+test("only the installed stdin helper with a literal JSON pipe is eligible", () => {
+	const helper = "~/.agents/skills/second-opinion/scripts/review-panel-stdin.py";
+	const command = `printf '%s' '{"version":1,"action":"check","prompt":"Review rm and git push as text"}' | python3 ${helper}`;
+	assert.equal(guardedToolBlockReason("bash", { command }), undefined);
+	assert.equal(guardedToolBlockReason("multi_tool_use.parallel", {
+		tool_uses: [{ recipient_name: "functions.bash", parameters: { command } }],
+	}), undefined);
+	for (const bad of [
+		command.replace(helper, "/tmp/review-panel-stdin.py"),
+		command.replace("python3", "python3 -c"),
+		`${command} --output /tmp/result`,
+		`${command} > /tmp/result`,
+		`${command}; touch source.ts`,
+		`${command} | tee /tmp/result`,
+		command.replace("printf '%s'", "echo"),
+		`printf '%s' "{}" | python3 ${helper}`,
+		`python3 ${helper}`,
+		`env python3 ${helper}`,
+		`bash -lc 'python3 ${helper}'`,
+	]) assert.ok(guardedToolBlockReason("bash", { command: bad }), bad);
+});
+
 test("parallel wrappers cannot hide a panel invocation", () => {
 	const reason = guardedToolBlockReason("multi_tool_use.parallel", {
 		tool_uses: [{ recipient_name: "functions.bash", parameters: { command: panelCommands[0] } }],
 	}) ?? "";
 	assert.match(reason, /nested call 1/);
-	assert.match(reason, /named second-opinion panels are unsupported/i);
+	assert.match(reason, /caller-file second-opinion panels are unsupported/i);
 });

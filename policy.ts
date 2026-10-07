@@ -42,8 +42,10 @@ export interface GuardedToolPolicyOptions {
 }
 
 const FILE_MUTATION = /\b(?:rm|rmdir|mv|cp|mkdir|mktemp|touch|chmod|chown|chgrp|ln|tee|truncate|dd|shred|patch|rsync)\b/i;
-const PANEL_SCRIPTS = new Set(["review-panel.sh", "openrouter-panel.sh"]);
-const PANEL_BLOCK_REASON = "Guarded session: named second-opinion panels are unsupported, including quorum, premium and consensus profiles. No private-artifact capability is available. Stop before artifacts or billing consent; a direct read-only peer requires separate route selection, not source-write authority.";
+const PANEL_SCRIPTS = new Set(["review-panel.sh", "openrouter-panel.sh", "review-panel-stdin.py"]);
+const PANEL_BLOCK_REASON = "Guarded session: caller-file second-opinion panels are unsupported. Use the installed review-panel-stdin.py helper through its documented literal JSON pipe; it owns private scratch files without source leases. Panel selection and billing consent remain separate.";
+// One fixed shell shape, not a general shell-path or /tmp-write exception.
+const PRIVATE_PANEL_PIPE = /^printf '%s' '[^'\x00]*' \| python3 ~\/\.agents\/skills\/second-opinion\/scripts\/review-panel-stdin\.py$/;
 const IN_PLACE_MUTATION = /\b(?:sed\s+(?:-[A-Za-z]*i[A-Za-z]*\b|--in-place\b)|perl\s+-[A-Za-z]*p?i[A-Za-z]*\b|tar\s+[^\n;&|]*-[A-Za-z]*x|unzip\b|vim?\b|nano\b|emacs\b|subl\b|code\s+[^\n;&|]*--wait\b)/i;
 const PACKAGE_MUTATION =
 	/\b(?:npm\s+(?:install|uninstall|update|ci|link|publish)|yarn\s+(?:add|remove|install|publish)|pnpm\s+(?:add|remove|install|update|publish)|pipx?\s+(?:install|uninstall)|cargo\s+(?:add|remove|install|uninstall|update|publish)|go\s+(?:get|install)|go\s+mod\s+(?:download|edit|init|tidy|vendor)|bundle\s+(?:install|update)|gem\s+(?:install|uninstall|update)|composer\s+(?:install|update|require|remove)|apt(?:-get)?\s+(?:install|remove|purge|update|upgrade)|brew\s+(?:install|uninstall|upgrade))\b/i;
@@ -156,6 +158,7 @@ export function guardedToolBlockReason(
 	if (toolName === "bash") {
 		const command = isRecord(input) ? input.command : undefined;
 		if (typeof command !== "string") return undefined;
+		if (PRIVATE_PANEL_PIPE.test(command)) return undefined;
 		if (hasCommand(command, isPanelCommand)) return PANEL_BLOCK_REASON;
 		return isObviousMutation(command) ? GUARDED_MUTATION_REASON : undefined;
 	}
@@ -329,6 +332,9 @@ function isPanelCommand(words: string[]): boolean {
 				index += shellOptionValueCount(executable, option);
 			}
 			return PANEL_SCRIPTS.has(words[index]?.split("/").at(-1) ?? "");
+		}
+		if (/^python(?:3(?:\.\d+)?)?$/.test(executable)) {
+			return words.slice(index).some((word) => PANEL_SCRIPTS.has(word.split("/").at(-1) ?? ""));
 		}
 		return PANEL_SCRIPTS.has(executable);
 	}
