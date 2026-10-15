@@ -35,6 +35,8 @@ export interface PublicationIdentity {
 }
 export interface PreparedPublication {
 	revision: string;
+	/** Digest of effective configuration, push URL and SSH environment, rechecked after the push. */
+	transport: string;
 	identity: PublicationIdentity;
 	display: {
 		commitCount: number;
@@ -99,6 +101,10 @@ function baseEnvironment(): NodeJS.ProcessEnv {
 	return { ...env, GIT_TERMINAL_PROMPT: "0", SSH_ASKPASS_REQUIRE: "never", GIT_ALLOW_PROTOCOL: "file:git:http:https:ssh" };
 }
 
+function sshEnvironment(): Record<string, string | undefined> {
+	return { GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND, GIT_SSH: process.env.GIT_SSH, GIT_SSH_VARIANT: process.env.GIT_SSH_VARIANT };
+}
+
 function sshConfigured(config: Map<string, string[]>): boolean {
 	return Boolean(process.env.GIT_SSH_COMMAND || process.env.GIT_SSH || config.has("core.sshcommand"));
 }
@@ -114,7 +120,7 @@ async function checked(args: string[], root: string, env: NodeJS.ProcessEnv, sig
 	signal?.throwIfAborted();
 	if (result.spawnFailed) throw new Error("Git is unavailable");
 	if (result.timedOut) throw new Error(`Git ${args[0]} timed out during publication preflight`);
-	if (result.code === null || !allowed.includes(result.code)) throw new Error(`Git ${args.join(" ")} failed during publication preflight (exit ${result.code}): ${redactText(result.stderr).slice(0, 300)}`);
+	if (result.code === null || !allowed.includes(result.code)) throw new Error(`Git ${args.join(" ")} failed during publication preflight (exit ${result.code}): ${redactDiagnostics(result.stderr).slice(0, 300)}`);
 	return result;
 }
 
@@ -139,21 +145,19 @@ function truthy(value: string): boolean {
 	return !/^(?:false|no|off|0|)$/i.test(value.trim());
 }
 
+// Userinfo may hold a token in either position, so redact it whole; queries and fragments too.
 export function redactUrl(url: string): string {
 	const match = /^([a-z][a-z0-9+.-]*:\/\/)([^/?#]*@)?([^?#]*)([?#].*)?$/i.exec(url);
 	if (!match) return safeDisplay(url);
 	const [, scheme, userinfo, rest, query] = match;
-	let auth = "";
-	if (userinfo) {
-		const info = userinfo.slice(0, -1);
-		const colon = info.indexOf(":");
-		auth = colon >= 0 ? `${info.slice(0, colon)}:***@` : "***@";
-	}
-	return safeDisplay(`${scheme}${auth}${rest}${query ? `${query[0]}…` : ""}`);
+	return safeDisplay(`${scheme}${userinfo ? "***@" : ""}${rest}${query ? `${query[0]}…` : ""}`);
 }
 
-function redactText(text: string): string {
-	const redacted = text.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi, "$1***@").trim();
+export function redactDiagnostics(text: string): string {
+	const redacted = text
+		.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi, "$1***@")
+		.replace(/([a-z][a-z0-9+.-]*:\/\/[^\s?#]*)([?#])\S*/gi, "$1$2…")
+		.trim();
 	return safeDisplay(redacted.length > 2000 ? `…${redacted.slice(-2000)}` : redacted);
 }
 
@@ -163,6 +167,18 @@ function validated(input: PublicationRequest): Required<Pick<PublicationRequest,
 	if (typeof input.commit !== "string" || !COMMIT.test(input.commit)) throw new Error("Expected a lowercase hex commit of 7-64 characters");
 	if (input.context !== undefined && (typeof input.context !== "string" || input.context.length > MAX_CONTEXT)) throw new Error(`Context must be at most ${MAX_CONTEXT} characters`);
 	return { root: input.root, commit: input.commit, ...(input.context !== undefined ? { context: input.context } : {}) };
+}
+
+function transportDigest(configText: string, urls: string[]): string {
+	return createHash("sha256").update(JSON.stringify({ configText, urls, ssh: sshEnvironment() })).digest("hex");
+}
+
+async function currentTransport(identity: PublicationIdentity): Promise<string | undefined> {
+	try {
+		const configText = (await checked(["config", "--list", "-z"], identity.root, baseEnvironment())).stdout;
+		const urls = (await checked(["remote", "get-url", "--push", "--all", identity.remote], identity.root, gitEnvironment(parseConfig(configText)))).stdout.split("\n").filter(Boolean);
+		return transportDigest(configText, urls);
+	} catch { return undefined; }
 }
 
 export async function preparePublication(input: PublicationRequest, _dependencies: PublicationDependencies = {}, signal?: AbortSignal): Promise<PreparedPublication> {
@@ -214,9 +230,11 @@ export async function preparePublication(input: PublicationRequest, _dependencie
 	const prePushHook = await access(join(hooks, "pre-push"), constants.X_OK).then(() => true, () => false);
 
 	const identity: PublicationIdentity = { root, branch, commit: tip, remote, destination: redactUrl(urls[0]!), ref: headRef, trackingCommit };
-	const revision = createHash("sha256").update(JSON.stringify({ identity, url: urls[0], configText, prePushHook })).digest("hex");
+	const transport = transportDigest(configText, urls);
+	const revision = createHash("sha256").update(JSON.stringify({ identity, transport, prePushHook })).digest("hex");
 	return {
 		revision,
+		transport,
 		identity,
 		display: {
 			commitCount,
@@ -253,32 +271,40 @@ export async function executePublication(
 	input: PublicationRequest,
 	prepared: PreparedPublication,
 	dependencies: PublicationDependencies = {},
-	options: { beforeLaunch?: () => boolean } = {},
+	options: { beforeLaunch?: () => boolean; signal?: AbortSignal } = {},
 ): Promise<PublicationReceipt> {
 	let fresh: PreparedPublication;
-	try { fresh = await preparePublication(input, dependencies); }
+	try { fresh = await preparePublication(input, dependencies, options.signal); }
 	catch (error) { return receipt(prepared.identity, "stale", { diagnostics: safeDisplay(String(error)).slice(0, 2000) }); }
 	if (fresh.revision !== prepared.revision) {
 		return receipt(prepared.identity, "stale", { diagnostics: "Publication identity, tip or configuration changed after confirmation; nothing was pushed" });
 	}
-	if (options.beforeLaunch && !options.beforeLaunch()) {
-		return receipt(prepared.identity, "stale", { diagnostics: "Publication session ended before launch; nothing was pushed" });
+	if (options.signal?.aborted || (options.beforeLaunch && !options.beforeLaunch())) {
+		return receipt(prepared.identity, "stale", { diagnostics: "Publication was cancelled or its session ended before launch; nothing was pushed" });
 	}
 	const { identity } = fresh;
 	const env = fresh.display.ssh === "configured" ? baseEnvironment() : { ...baseEnvironment(), GIT_SSH_COMMAND: BATCH_SSH };
 	// Once launched, a push drains to completion or its deadline; cancellation would hide a partial outcome.
+	// ^{commit} forces object lookup: a bare hex source would prefer a ref with that name.
 	const result = await runGit(
-		["push", "--porcelain", "--no-follow-tags", "--recurse-submodules=no", "--no-signed", identity.remote, `${identity.commit}:${identity.ref}`],
+		["push", "--porcelain", "--no-follow-tags", "--recurse-submodules=no", "--no-signed", identity.remote, `${identity.commit}^{commit}:${identity.ref}`],
 		identity.root, env, dependencies.pushTimeoutMs ?? DEFAULT_PUSH_TIMEOUT_MS,
 	);
-	const diagnostics = redactText(result.stderr);
+	const diagnostics = redactDiagnostics(result.stderr);
 	if (result.spawnFailed) return receipt(identity, "failed", { diagnostics: "Git could not be started; nothing was pushed" });
 	if (result.timedOut) {
 		return receipt(identity, "unknown", { diagnostics: `Push exceeded its deadline and was terminated; remote outcome unknown${diagnostics ? `\n${diagnostics}` : ""}` });
 	}
 	const parsed = parsePushPorcelain(result.stdout, identity.ref, result.code);
+	// Git rereads configuration at launch; a change during the push leaves the real destination unverified.
+	if (await currentTransport(identity) !== fresh.transport) {
+		return receipt(identity, "unknown", {
+			summary: redactDiagnostics(parsed.summary).slice(0, 500),
+			diagnostics: `Git configuration or transport changed while the push ran; actual destination unverified (reported ${parsed.status})${diagnostics ? `\n${diagnostics}` : ""}`,
+		});
+	}
 	return receipt(identity, parsed.status, {
-		summary: safeDisplay(parsed.summary).slice(0, 500),
+		summary: redactDiagnostics(parsed.summary).slice(0, 500),
 		...(parsed.warning ? { warning: parsed.warning } : {}),
 		...(diagnostics ? { diagnostics } : {}),
 	});
@@ -310,6 +336,23 @@ function confirmation(prepared: PreparedPublication, occupancy: string): string 
 		"Publishing makes this exact commit visible remotely and may trigger CI or deployment. Non-force, no tags, no retry. Execution rechecks every value above and refuses on drift.",
 	];
 	return lines.join("\n").slice(0, 10_000);
+}
+
+const PARALLEL_REASON = "publish_commit cannot run inside parallel tool wrappers; call it directly so each confirmation and push stays attended and serialized.";
+
+/** Guard-independent: blocks publish_commit nested in parallel wrappers, including when the guard is disabled. */
+export function publicationWrapperBlockReason(toolName: string, input: unknown, depth = 0): string | undefined {
+	if (toolName !== "multi_tool_use.parallel") return undefined;
+	const uses = typeof input === "object" && input !== null ? (input as { tool_uses?: unknown }).tool_uses : undefined;
+	if (!Array.isArray(uses)) return undefined;
+	for (const use of uses) {
+		const name = typeof use?.recipient_name === "string" ? use.recipient_name.replace(/^functions\./, "") : "";
+		if (name === "publish_commit") return PARALLEL_REASON;
+		if (depth >= 8) return PARALLEL_REASON;
+		const nested = publicationWrapperBlockReason(name, use?.parameters, depth + 1);
+		if (nested) return nested;
+	}
+	return undefined;
 }
 
 const result = (details: object) => ({ content: [{ type: "text" as const, text: JSON.stringify(details) }], details });
@@ -382,7 +425,8 @@ export function registerCommitPublication(pi: ExtensionAPI, dependencies: Public
 					}
 					combined.throwIfAborted();
 					return result(await executePublication(entry.request, entry.prepared, dependencies, {
-						beforeLaunch: () => session === active && !active.abort.signal.aborted,
+						signal: combined,
+						beforeLaunch: () => session === active && !combined.aborted,
 					}));
 				}
 				if (params.token !== undefined) throw new Error("Confirm does not accept a token");

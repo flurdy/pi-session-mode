@@ -11,7 +11,7 @@ import { guardedToolBlockReason } from "./policy.ts";
 import { scopedWriteBlockReason } from "./scoped-policy.ts";
 import { resolveExplicitFiles } from "./file-scope.ts";
 import { registerHandoffSave } from "./handoff-save.ts";
-import { registerCommitPublication } from "./commit-publication.ts";
+import { publicationWrapperBlockReason, registerCommitPublication } from "./commit-publication.ts";
 import { ADDITION_TIMEOUT_MS, parseRootArguments, parseRootFlag, resolveExplicitRoots, safeDisplay, scopeStatus } from "./scope.ts";
 import { restoreSelection, selectionEntries, selectionFiles, type Selection, type WorktreeSelection } from "./selection.ts";
 import { verifiedReadOnlySubagents } from "./subagent-policy.ts";
@@ -546,6 +546,8 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	}
 
 	pi.on("tool_call", async (event, ctx) => {
+		const publicationReason = publicationWrapperBlockReason(event.toolName, event.input);
+		if (publicationReason) return { block: true, reason: publicationReason };
 		if (state === "unguarded") return;
 		if (state === "implement" && leases.live) {
 			const acquisitionReason = await acquireWriteTargets(event.toolName, event.input, ctx);

@@ -8,6 +8,8 @@ import {
 	executePublication,
 	parsePushPorcelain,
 	preparePublication,
+	publicationWrapperBlockReason,
+	redactDiagnostics,
 	redactUrl,
 	registerCommitPublication,
 	type PublicationDependencies,
@@ -186,8 +188,12 @@ test("inherited Git location overrides cannot redirect the publication", () => f
 	assert.equal(git(remote, "rev-parse", "refs/heads/main"), tip);
 }));
 
-test("credentials are redacted from destinations", () => {
-	assert.equal(redactUrl("https://user:secret@example.com/org/repo.git"), "https://user:***@example.com/org/repo.git");
+test("credentials are redacted from destinations and diagnostics", () => {
+	assert.equal(redactUrl("https://user:secret@example.com/org/repo.git"), "https://***@example.com/org/repo.git");
+	assert.equal(redactUrl("https://TOKEN:x-oauth-basic@example.com/org/repo.git"), "https://***@example.com/org/repo.git");
+	const text = redactDiagnostics("fatal: https://TOKEN:x@host/repo and https://host/repo?access_token=SECRET#frag failed");
+	assert.doesNotMatch(text, /TOKEN|SECRET|frag/);
+	assert.match(text, /https:\/\/\*\*\*@host\/repo and https:\/\/host\/repo\?…/);
 	assert.equal(redactUrl("https://token@example.com/org/repo.git?x=secret"), "https://***@example.com/org/repo.git?…");
 	assert.equal(redactUrl("git@github.com:org/repo.git"), "git@github.com:org/repo.git");
 });
@@ -293,3 +299,47 @@ test("publish_commit allows one operation at a time and drains an in-flight push
 	assert.equal((await running).details.status, "ok");
 	assert.equal(git(remote, "rev-parse", "refs/heads/main"), tip);
 }));
+
+test("a branch named like the confirmed SHA cannot supply a different object", () => fixture(async ({ work, remote, commit }) => {
+	const tip = commit("real");
+	git(work, "checkout", "-q", "-b", "decoy-base");
+	const decoy = commit("decoy");
+	git(work, "checkout", "-q", "main");
+	git(work, "branch", tip, decoy);
+	const prepared = await preparePublication({ root: work, commit: tip }, deps());
+	assert.equal((await executePublication({ root: work, commit: tip }, prepared, deps())).status, "ok");
+	assert.equal(git(remote, "rev-parse", "refs/heads/main"), tip);
+}));
+
+test("configuration that changes while the push runs makes the outcome unknown", () => fixture(async ({ work, remote, commit }) => {
+	const hooks = join(work, ".git", "hooks");
+	await mkdir(hooks, { recursive: true });
+	await writeFile(join(hooks, "pre-push"), `#!/bin/sh\ngit config remote.origin.pushurl ${JSON.stringify(remote)}\n`);
+	await chmod(join(hooks, "pre-push"), 0o755);
+	const tip = commit("drift");
+	const prepared = await preparePublication({ root: work, commit: tip }, deps());
+	const receipt = await executePublication({ root: work, commit: tip }, prepared, deps());
+	assert.equal(receipt.status, "unknown");
+	assert.match(receipt.diagnostics ?? "", /changed while the push ran/);
+}));
+
+test("transport environment changes after confirmation are stale; cancellation before launch pushes nothing", () => fixture(async ({ work, remote, commit }) => {
+	const before = git(remote, "rev-parse", "refs/heads/main");
+	const tip = commit("transport");
+	const prepared = await preparePublication({ root: work, commit: tip }, deps());
+	const saved = process.env.GIT_SSH_COMMAND;
+	process.env.GIT_SSH_COMMAND = "ssh -o HostName=elsewhere.invalid";
+	try { assert.equal((await executePublication({ root: work, commit: tip }, prepared, deps())).status, "stale"); }
+	finally { if (saved === undefined) delete process.env.GIT_SSH_COMMAND; else process.env.GIT_SSH_COMMAND = saved; }
+	const aborted = new AbortController(); aborted.abort();
+	assert.equal((await executePublication({ root: work, commit: tip }, prepared, deps(), { signal: aborted.signal })).status, "stale");
+	assert.equal(git(remote, "rev-parse", "refs/heads/main"), before);
+}));
+
+test("publication is refused inside parallel wrappers at any depth", () => {
+	const call = { recipient_name: "functions.publish_commit", parameters: { action: "execute", token: "0".repeat(32) } };
+	assert.match(publicationWrapperBlockReason("multi_tool_use.parallel", { tool_uses: [call] }) ?? "", /parallel/);
+	assert.match(publicationWrapperBlockReason("multi_tool_use.parallel", { tool_uses: [{ recipient_name: "multi_tool_use.parallel", parameters: { tool_uses: [call] } }] }) ?? "", /parallel/);
+	assert.equal(publicationWrapperBlockReason("multi_tool_use.parallel", { tool_uses: [{ recipient_name: "functions.read", parameters: {} }] }), undefined);
+	assert.equal(publicationWrapperBlockReason("publish_commit", {}), undefined);
+});

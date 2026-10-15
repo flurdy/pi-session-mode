@@ -120,10 +120,10 @@ test("handoff operation stays allowed in plan, conflict, acquiring, lost, implem
 			{ toolName: "multi_tool_use.parallel", input: { tool_uses: [{ recipient_name: "functions.save_handoff", parameters: {} }] } },
 			{ toolName: "publish_commit", input: { action: "confirm", root: "/repo", commit: "abcdef1" } },
 		]) assert.deepEqual(await pi.emit("tool_call", ctx, event), [undefined], scenario);
+		const nested = { tool_uses: [{ recipient_name: "functions.publish_commit", parameters: { action: "execute", token: "0".repeat(32) } }] };
+		const [blocked] = await pi.emit("tool_call", ctx, { toolName: "multi_tool_use.parallel", input: nested });
+		assert.equal((blocked as any)?.block, true, `${scenario}: confirmed publication never runs inside parallel wrappers`);
 		if (scenario !== "unguarded") {
-			const nested = { tool_uses: [{ recipient_name: "functions.publish_commit", parameters: { action: "execute", token: "0".repeat(32) } }] };
-			const [blocked] = await pi.emit("tool_call", ctx, { toolName: "multi_tool_use.parallel", input: nested });
-			assert.equal((blocked as any)?.block, true, `${scenario}: confirmed publication never runs inside parallel wrappers`);
 			const [prompt] = await pi.emit("before_agent_start", ctx, { systemPrompt: "base" });
 			assert.match((prompt as any).systemPrompt, /save_handoff.*every guard state/);
 			assert.match((prompt as any).systemPrompt, /publish_commit.*every guard state.*never ask for \/implement/);
