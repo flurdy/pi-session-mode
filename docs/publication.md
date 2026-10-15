@@ -29,7 +29,7 @@ git push --porcelain --no-follow-tags --recurse-submodules=no --no-signed <remot
 
 `^{commit}` forces object lookup; a bare hexadecimal source would prefer a branch or tag with that name.
 
-Git rereads configuration when the push starts, and that read cannot be frozen. After the push the tool reads configuration, push URL and SSH environment again; any change since the final preflight turns the receipt into `unknown`, because the actual destination is then unverified.
+Git rereads configuration when the push starts, and that read cannot be frozen. An acknowledgement only counts when Git's reported `To` destination equals the approved push URL (ignoring the userinfo Git anonymizes). After the push the tool also reads configuration, push URL and SSH environment again. A different destination or any change since the final preflight turns the receipt into `unknown`, because the actual destination is then unverified.
 
 ## Receipts
 

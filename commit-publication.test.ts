@@ -8,6 +8,7 @@ import {
 	executePublication,
 	parsePushPorcelain,
 	preparePublication,
+	destinationMatches,
 	publicationWrapperBlockReason,
 	redactDiagnostics,
 	redactUrl,
@@ -198,12 +199,17 @@ test("credentials are redacted from destinations and diagnostics", () => {
 	assert.equal(redactUrl("git@github.com:org/repo.git"), "git@github.com:org/repo.git");
 });
 
-test("porcelain parsing requires the expected ref acknowledgement", () => {
+test("porcelain parsing requires the expected ref acknowledgement from the approved destination", () => {
 	const ref = "refs/heads/main";
 	const line = (flag: string, summary: string) => `To remote\n${flag}\tabc:${ref}\t${summary}\nDone\n`;
-	assert.deepEqual(parsePushPorcelain(line(" ", "a..b"), ref, 0), { status: "ok", summary: "a..b" });
-	assert.deepEqual(parsePushPorcelain(line("*", "[new branch]"), ref, 0), { status: "ok", summary: "[new branch]" });
-	assert.deepEqual(parsePushPorcelain(line(" ", "a..b"), ref, 1), { status: "ok", summary: "a..b", warning: "Git exited 1 after the remote acknowledged the update; local tracking state may be stale" });
+	assert.deepEqual(parsePushPorcelain(line(" ", "a..b"), ref, 0), { status: "ok", summary: "a..b", destination: "remote" });
+	assert.deepEqual(parsePushPorcelain(line("*", "[new branch]"), ref, 0), { status: "ok", summary: "[new branch]", destination: "remote" });
+	assert.deepEqual(parsePushPorcelain(line(" ", "a..b"), ref, 1), { status: "ok", summary: "a..b", destination: "remote", warning: "Git exited 1 after the remote acknowledged the update; local tracking state may be stale" });
+	assert.ok(destinationMatches("file://localhost/srv/repo.git", "file://user@localhost/srv/repo.git"));
+	assert.ok(destinationMatches("https://host/org/repo.git", "https://TOKEN:x@host/org/repo.git"));
+	assert.ok(destinationMatches("../remote.git", "../remote.git"));
+	assert.ok(!destinationMatches("https://evil.example/org/repo.git", "https://host/org/repo.git"));
+	assert.ok(!destinationMatches(undefined, "https://host/org/repo.git"));
 	assert.equal(parsePushPorcelain(line("=", "[up to date]"), ref, 0).status, "uptodate");
 	assert.equal(parsePushPorcelain(line("!", "[rejected] (fetch first)"), ref, 1).status, "rejected");
 	assert.equal(parsePushPorcelain(line("+", "a...b (forced update)"), ref, 0).status, "unknown");

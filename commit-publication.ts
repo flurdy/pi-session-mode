@@ -37,6 +37,8 @@ export interface PreparedPublication {
 	revision: string;
 	/** Digest of effective configuration, push URL and SSH environment, rechecked after the push. */
 	transport: string;
+	/** Unredacted push URL; session memory only, never returned to callers. */
+	pushUrl: string;
 	identity: PublicationIdentity;
 	display: {
 		commitCount: number;
@@ -235,6 +237,7 @@ export async function preparePublication(input: PublicationRequest, _dependencie
 	return {
 		revision,
 		transport,
+		pushUrl: urls[0]!,
 		identity,
 		display: {
 			commitCount,
@@ -246,18 +249,28 @@ export async function preparePublication(input: PublicationRequest, _dependencie
 	};
 }
 
-export function parsePushPorcelain(stdout: string, ref: string, code: number | null): { status: PublicationStatus; summary: string; warning?: string } {
+const withoutUserinfo = (url: string) => url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/@]*@/i, "$1").replace(/^[^/@:]+@(?=[^/:]+:)/, "");
+
+/** Git anonymizes userinfo in its "To" line, so compare both sides without it. */
+export function destinationMatches(reported: string | undefined, approved: string): boolean {
+	return reported !== undefined && withoutUserinfo(reported) === withoutUserinfo(approved);
+}
+
+export function parsePushPorcelain(stdout: string, ref: string, code: number | null): { status: PublicationStatus; summary: string; destination?: string; warning?: string } {
+	let destination: string | undefined;
 	for (const line of stdout.split("\n")) {
+		if (line.startsWith("To ")) { destination = line.slice(3); continue; }
 		const fields = line.split("\t");
 		if (fields.length !== 3 || fields[1]!.slice(fields[1]!.indexOf(":") + 1) !== ref) continue;
 		const [flag, , summary = ""] = fields;
+		const at = destination === undefined ? {} : { destination };
 		if (flag === " " || flag === "*") {
-			return code === 0 ? { status: "ok", summary }
-				: { status: "ok", summary, warning: `Git exited ${code} after the remote acknowledged the update; local tracking state may be stale` };
+			return code === 0 ? { status: "ok", summary, ...at }
+				: { status: "ok", summary, ...at, warning: `Git exited ${code} after the remote acknowledged the update; local tracking state may be stale` };
 		}
-		if (flag === "=") return { status: "uptodate", summary };
-		if (flag === "!") return { status: "rejected", summary };
-		return { status: "unknown", summary: `Unexpected acknowledgement '${flag}': ${summary}` };
+		if (flag === "=") return { status: "uptodate", summary, ...at };
+		if (flag === "!") return { status: "rejected", summary, ...at };
+		return { status: "unknown", summary: `Unexpected acknowledgement '${flag}': ${summary}`, ...at };
 	}
 	return { status: "unknown", summary: `No remote acknowledgement for ${ref}` };
 }
@@ -296,7 +309,14 @@ export async function executePublication(
 		return receipt(identity, "unknown", { diagnostics: `Push exceeded its deadline and was terminated; remote outcome unknown${diagnostics ? `\n${diagnostics}` : ""}` });
 	}
 	const parsed = parsePushPorcelain(result.stdout, identity.ref, result.code);
-	// Git rereads configuration at launch; a change during the push leaves the real destination unverified.
+	// Git rereads configuration at launch: require the reported destination and an unchanged transport.
+	const acknowledged = parsed.status === "ok" || parsed.status === "uptodate" || parsed.status === "rejected";
+	if (acknowledged && !destinationMatches(parsed.destination, fresh.pushUrl)) {
+		return receipt(identity, "unknown", {
+			summary: redactDiagnostics(parsed.summary).slice(0, 500),
+			diagnostics: `Git reported a destination other than the approved push URL (reported ${parsed.status})${parsed.destination ? `: ${redactUrl(parsed.destination)}` : ""}`,
+		});
+	}
 	if (await currentTransport(identity) !== fresh.transport) {
 		return receipt(identity, "unknown", {
 			summary: redactDiagnostics(parsed.summary).slice(0, 500),
