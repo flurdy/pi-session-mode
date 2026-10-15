@@ -34,6 +34,7 @@ const READ_ONLY_SUBAGENT_ACTIONS = new Set([
 
 const READ_ONLY_SUPERVISOR_ACTIONS = new Set(["list", "pending", "status"]);
 const GUARDED_MUTATION_REASON = "Guarded session: obvious source, Git, package, system, or raw destructive/remote Beads command blocked. Source/Git/package/system changes need /implement scopes; /implement alone does not authorize destructive or remote actions. Local Beads triage needs no source lease; pass prose as literal quoted arguments. Workspace synchronization uses make beads-sync after fresh explicit confirmation.";
+const MAKE_PUSH_REASON = "Guarded session: make push recipes are remote Git mutations that publish whatever tip exists at run time. Publish one exact, freshly confirmed commit with publish_commit instead; do not request /implement for publication or use Bash/make push fallbacks.";
 const SUBAGENT_BLOCK_REASON = "Guarded session: this subagent operation may launch or control a writer in the current worktree. Use a verified read-only agent or switch to /implement.";
 
 export interface GuardedToolPolicyOptions {
@@ -160,6 +161,7 @@ export function guardedToolBlockReason(
 		if (typeof command !== "string") return undefined;
 		if (PRIVATE_PANEL_PIPE.test(command)) return undefined;
 		if (hasCommand(command, isPanelCommand)) return PANEL_BLOCK_REASON;
+		if (hasCommand(command, isMakePushCommand)) return MAKE_PUSH_REASON;
 		return isObviousMutation(command) ? GUARDED_MUTATION_REASON : undefined;
 	}
 	if (toolName === "subagent") return subagentBlockReason(input, options);
@@ -341,7 +343,7 @@ function isPanelCommand(words: string[]): boolean {
 	return false;
 }
 
-function isWorkspaceSyncCommand(words: string[]): boolean {
+function invokedCommand(words: string[]): { executable: string; args: string[] } | undefined {
 	let index = 0;
 	while (index < words.length) {
 		if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index]!)) { index++; continue; }
@@ -353,10 +355,25 @@ function isWorkspaceSyncCommand(words: string[]): boolean {
 			}
 			continue;
 		}
-		if (executable === "make" || executable === "gmake") return words.slice(index).includes("beads-sync");
-		return executable === "project-workspace" && words[index] === "beads-sync" && !words.slice(index + 1).includes("--dry-run");
+		return { executable, args: words.slice(index) };
 	}
-	return false;
+	return undefined;
+}
+
+const isMake = (executable: string) => executable === "make" || executable === "gmake";
+
+function isWorkspaceSyncCommand(words: string[]): boolean {
+	const invoked = invokedCommand(words);
+	if (!invoked) return false;
+	if (isMake(invoked.executable)) return invoked.args.includes("beads-sync");
+	return invoked.executable === "project-workspace" && invoked.args[0] === "beads-sync" && !invoked.args.slice(1).includes("--dry-run");
+}
+
+// Bounded recognition of conventional push targets, not recipe confinement.
+function isMakePushCommand(words: string[]): boolean {
+	const invoked = invokedCommand(words);
+	return Boolean(invoked && isMake(invoked.executable)
+		&& invoked.args.some((arg) => !arg.startsWith("-") && !arg.includes("=") && /(?:^|[-_:.])push(?:$|[-_:.])/i.test(arg)));
 }
 
 function hasCommand(command: string, matches: (words: string[]) => boolean, depth = 0): boolean {

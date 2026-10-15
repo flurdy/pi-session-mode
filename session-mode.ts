@@ -11,6 +11,7 @@ import { guardedToolBlockReason } from "./policy.ts";
 import { scopedWriteBlockReason } from "./scoped-policy.ts";
 import { resolveExplicitFiles } from "./file-scope.ts";
 import { registerHandoffSave } from "./handoff-save.ts";
+import { registerCommitPublication } from "./commit-publication.ts";
 import { ADDITION_TIMEOUT_MS, parseRootArguments, parseRootFlag, resolveExplicitRoots, safeDisplay, scopeStatus } from "./scope.ts";
 import { restoreSelection, selectionEntries, selectionFiles, type Selection, type WorktreeSelection } from "./selection.ts";
 import { verifiedReadOnlySubagents } from "./subagent-policy.ts";
@@ -72,6 +73,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	readOnlySubagents: (cwd, provider) => verifiedReadOnlySubagents(cwd, { preferredProvider: provider }),
 }): SessionModeController {
 	registerHandoffSave(pi);
+	const publication = registerCommitPublication(pi, {}, { ownLifecycle: false });
 	let mode: SessionMode = "implement";
 	let state: SessionGuardState = "acquiring";
 	let selection: Selection = { mode: "implement", scope: { kind: "cwd" } };
@@ -569,9 +571,10 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		const guidance = state === "implement" && leases.live
 			? `Leased worktrees: ${boundedScopeList(leases.roots)}. Exact-file grants: ${boundedScopeList(leases.files)}. ${leases.roots.length ? "Native edit/write calls can acquire and persist their canonical target worktree leases automatically; do not ask for a redundant /implement command for that supported path. Contention or unavailable identity blocks the write." : "File-only sessions cannot auto-acquire worktrees and retain the bounded guarded shell/subagent policy; ask for /implement while idle before repository work."} Exact non-repository files still require explicit /grant-file confirmation. Shell/script effects are not automatically scoped: never use them as a scope-expansion workaround. Reads, Beads claims, prose and subagent requests do not acquire leases.`
 			: "[GUARDED SESSION]\nDo not modify source files, Git, package or system state; ask the user to select /implement scopes first. Read-only analysis, safe subagent management and verified direct read-only reviewers are allowed.\nOrdinary local Beads triage means a local mutation in any resolver-proven owning store, not only cwd. Use bd -C <proven directory> for comments, create, update and close without /implement or a worktree lease. If ownership resolution is ambiguous, unavailable or not-found, write nothing; repository-specific tracker rules still win. Beads writes do not acquire source leases.\nVerify effective export, backup and synchronization side effects, not just command syntax or commented config examples. A configured Dolt remote alone does not make a local comment a sync request. Follow the applicable remote/destructive policy separately; /implement alone does not authorize remote or destructive actions. Workspace synchronization uses make beads-sync after fresh explicit confirmation; never synchronize during list, resolver or triage workflows.";
-		return { systemPrompt: `${event.systemPrompt}\n\n${guidance}\nException: save_handoff is a dedicated, fixed-destination handoff save operation available in every guard state without repository leases or /grant-file. Use it for wrap-up; it grants no native write or shell authority. Never substitute a Bash helper when this tool is missing or fails.` };
+		return { systemPrompt: `${event.systemPrompt}\n\n${guidance}\nException: save_handoff is a dedicated, fixed-destination handoff save operation available in every guard state without repository leases or /grant-file. Use it for wrap-up; it grants no native write or shell authority. Never substitute a Bash helper when this tool is missing or fails.\nException: publish_commit is the attended exact-commit publication tool, available in every guard state without a source lease. Each push needs its own fresh native confirmation; never ask for /implement to publish, and never fall back to Bash or make pushes when it is missing or refuses.` };
 	});
 	pi.on("session_start", async (_event, ctx) => {
+		publication.sessionStart(ctx);
 		generation++; currentContext = ctx; shuttingDown = false;
 		const restored = restoreSelection(ctx.sessionManager.getBranch());
 		selection = restored.selection;
@@ -593,7 +596,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	});
 	pi.on("session_shutdown", async (_event, ctx) => {
 		shuttingDown = true; generation++; guardTools();
-		await packageActivationDrain;
+		await Promise.all([packageActivationDrain, publication.sessionShutdown()]);
 		await leases.releaseAll();
 		resetDiscovery(); restoreTools();
 		try { ctx.ui.setStatus("session-mode-leases", undefined); ctx.ui.setStatus("session-mode-grants", undefined); ctx.ui.setStatus("session-mode", undefined); ctx.ui.setWidget("session-mode-grants", undefined); } catch { /* Teardown is already complete. */ }

@@ -187,6 +187,16 @@ test("guarded workspace synchronization blocks mutations but permits previews an
 	]) assert.equal(guardedToolBlockReason("bash", { command }), undefined, command);
 });
 
+test("guarded sessions treat make push recipes as remote Git mutations", () => {
+	for (const command of [
+		"make git-push account", "gmake -C /letterbox git-push web", "make push", "make release_push",
+		"env -C /letterbox make git-push", "bash -lc 'cd /letterbox && make git-push apikey'", "make test && make push:prod",
+	]) assert.match(guardedToolBlockReason("bash", { command }) ?? "", /publish_commit/, command);
+	for (const command of ["make test", "make pushover", "echo 'make git-push'", "bd -C /store comments add fixture-1 'make git-push'"]) {
+		assert.equal(guardedToolBlockReason("bash", { command }), undefined, command);
+	}
+});
+
 test("raw Beads remote and destructive commands remain guarded", () => {
 	for (const command of [
 		"bash -c 'bd -C /abs/other-store dolt fetch'",

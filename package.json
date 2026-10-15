@@ -23,9 +23,11 @@
   },
   "files": [
     "README.md",
+    "commit-publication.ts",
     "docs/guard.md",
     "docs/handoff-save.md",
     "docs/package-activation.md",
+    "docs/publication.md",
     "file-scope.ts",
     "handoff-save.ts",
     "index.ts",

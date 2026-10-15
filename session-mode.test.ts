@@ -88,10 +88,22 @@ function harness(results: WorktreeLeaseResult[] = [held()], options: Partial<Ses
 	return { pi, acquisitions, controller };
 }
 
-test("registers scope controls, fixed handoff saving and confirmed package activation", () => {
+test("registers scope controls, fixed handoff saving, commit publication and confirmed package activation", () => {
 	const { pi } = harness();
 	assert.deepEqual([...pi.commands.keys()].sort(), ["grant-file", "grants", "implement", "leases", "plan"]);
-	assert.deepEqual([...pi.tools.keys()], ["save_handoff", "activate_pi_package"]);
+	assert.deepEqual([...pi.tools.keys()], ["save_handoff", "publish_commit", "activate_pi_package"]);
+});
+
+test("commit publication follows the session-mode lifecycle", async () => {
+	const { pi } = harness();
+	const ctx = context();
+	pi.planFlag = true;
+	const execute = () => pi.tools.get("publish_commit")!.execute("call", { action: "execute", token: "0".repeat(32) }, undefined, undefined, ctx);
+	await assert.rejects(execute(), /no longer active/);
+	await pi.emit("session_start", ctx);
+	await assert.rejects(execute(), /unknown, used or expired/);
+	await pi.emit("session_shutdown", ctx);
+	await assert.rejects(execute(), /no longer active/);
 });
 
 test("handoff operation stays allowed in plan, conflict, acquiring, lost, implement and unguarded states", async () => {
@@ -106,10 +118,15 @@ test("handoff operation stays allowed in plan, conflict, acquiring, lost, implem
 		for (const event of [
 			{ toolName: "save_handoff", input: {} },
 			{ toolName: "multi_tool_use.parallel", input: { tool_uses: [{ recipient_name: "functions.save_handoff", parameters: {} }] } },
+			{ toolName: "publish_commit", input: { action: "confirm", root: "/repo", commit: "abcdef1" } },
 		]) assert.deepEqual(await pi.emit("tool_call", ctx, event), [undefined], scenario);
 		if (scenario !== "unguarded") {
+			const nested = { tool_uses: [{ recipient_name: "functions.publish_commit", parameters: { action: "execute", token: "0".repeat(32) } }] };
+			const [blocked] = await pi.emit("tool_call", ctx, { toolName: "multi_tool_use.parallel", input: nested });
+			assert.equal((blocked as any)?.block, true, `${scenario}: confirmed publication never runs inside parallel wrappers`);
 			const [prompt] = await pi.emit("before_agent_start", ctx, { systemPrompt: "base" });
 			assert.match((prompt as any).systemPrompt, /save_handoff.*every guard state/);
+			assert.match((prompt as any).systemPrompt, /publish_commit.*every guard state.*never ask for \/implement/);
 		}
 		await pi.emit("session_shutdown", ctx);
 	}

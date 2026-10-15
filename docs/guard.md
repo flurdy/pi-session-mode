@@ -58,6 +58,16 @@ shell-wrapper payloads; a triage command does not exempt a following source or d
 mutation. Quoting is not shell isolation: substitutions and arbitrary script side effects remain
 outside this accidental-change guard's guarantee.
 
+## Attended publication
+
+Publishing a commit is a remote action, not a source edit, so it does not use writer leases.
+`publish_commit` is available in every guard state: each exact commit needs its own native
+TUI confirmation and single-use session token, then execution rechecks identity and
+configuration before a non-force single-ref push. Guarded Bash still blocks raw `git push`
+and recognizable `make`/`gmake` push targets, whose recipes publish whatever tip exists
+when they run. Do not request `/implement` scopes to publish. See
+[attended commit publication](publication.md).
+
 ## Read-only second opinions
 
 Direct read-only second-opinion routes do not require a source lease. Eligibility is not proof
