@@ -31,6 +31,7 @@
     "file-scope.ts",
     "handoff-save.ts",
     "index.ts",
+    "lease-inventory.ts",
     "lease-observer.ts",
     "lease-set.ts",
     "lease.ts",

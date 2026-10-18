@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 import { acquireFileLease, acquireWorktreeLease, type FileLeaseResult, type WorktreeLeaseResult } from "./lease.ts";
 import { LeaseSet, type HeldScopes, type LeaseSetResult, type ScopeSetRequest } from "./lease-set.ts";
 import { probeWorktreeLeaseOccupancies } from "./lease-observer.ts";
+import { inventoryHeldLeases, type LeaseInventory, type LeaseInventoryOptions } from "./lease-inventory.ts";
 import { defaultPackageActivationDependencies, activatePreparedPackage, preparePackageActivation, type PackageActivationEvidence, type PackageActivationLaunchOptions, type PackageActivationRequest, type PreparedPackageActivation } from "./package-activation.ts";
 import { guardedToolBlockReason } from "./policy.ts";
 import { scopedWriteBlockReason } from "./scoped-policy.ts";
@@ -30,6 +31,7 @@ export interface SessionModeDependencies {
 	isDisabled(): boolean;
 	readOnlySubagents(cwd: string, preferredProvider?: string): Promise<ReadonlySet<string>>;
 	packageActivation?: PackageActivationAdapter;
+	inventory?(options: LeaseInventoryOptions): Promise<LeaseInventory>;
 }
 export interface SessionModeController {
 	readonly mode: SessionMode;
@@ -406,6 +408,19 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 				const observations = paths.length ? await probeWorktreeLeaseOccupancies(requested!, { selfPid: -1 }) : undefined;
 				notify(ctx, JSON.stringify({ state: STATE_META[state].label, held: leases.roots, requested, lastFailure, observations }));
 			} catch (error) { notify(ctx, `Lease inspection unavailable: ${String(error)}`, "error"); }
+		},
+	});
+	pi.registerCommand("lease-holders", {
+		description: "Show every live local Pi session's held leases without acquiring",
+		handler: async (_args, ctx) => {
+			try {
+				const inventory = await (dependencies.inventory ?? inventoryHeldLeases)({ signal: ctx.signal });
+				const payload = { state: STATE_META[state].label, held: { worktrees: leases.roots, files: leases.files }, inventory, omittedSessions: 0 };
+				while (inventory.kind === "inventory" && JSON.stringify(payload).length > 10_000 && inventory.sessions.length > 1) {
+					inventory.sessions.pop(); payload.omittedSessions++;
+				}
+				notify(ctx, JSON.stringify(payload));
+			} catch (error) { notify(ctx, `Lease inventory unavailable: ${String(error)}`, "error"); }
 		},
 	});
 

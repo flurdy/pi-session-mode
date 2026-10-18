@@ -29,6 +29,7 @@ For a reviewed mutable checkout, run `make apply`. It owns the existing `~/.pi/a
 - `/implement repos/api repos/web` adds those worktree roots without implicitly leasing the workspace root. Quote literal paths containing spaces.
 - `/grant-file ~/.agents/tool/config.json` resolves exact non-Git files, displays their canonical identities, and requires an interactive confirmation before acquiring them. It can establish file-only implementation mode without leasing cwd; the bounded guarded Bash/subagent policy remains active until a worktree is also leased.
 - `/leases` shows held/requested/failed worktree scopes. `/leases repos/api` inspects that root without acquiring.
+- `/lease-holders` lists every lease held by live local Pi sessions, grouped by session, validated against kernel locks; holder metadata is reported only when it matches.
 - `/grants` shows held/requested/failed exact-file scopes. `/grants path` resolves that file identity without acquiring it.
 - Named second-opinion panels can use the installed private stdin helper in plan mode, without source leases or general `/tmp` write permission. The helper requires a supporting guard and owns its scratch files; see [read-only second opinions](docs/guard.md#read-only-second-opinions).
 - `save_handoff` saves a rendered resume block to the fixed user handoff directory in every guard state, without repository or `/grant-file` authority. New files auto-save; overwrite requires fresh TUI confirmation. See [handoff saves](docs/handoff-save.md) for helper requirements, concurrency and failure boundaries.

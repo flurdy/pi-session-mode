@@ -190,10 +190,16 @@ function validHolder(value: Record<string, unknown>): boolean {
 		&& typeof value.sessionId === "string" && typeof value.startedAt === "string";
 }
 
+/** Shape check only: diagnostic metadata never establishes ownership. */
+export function holderMetadata(value: unknown, identity: "root" | "file"): LeaseHolderMetadata | FileLeaseHolderMetadata | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const record = value as Record<string, unknown>;
+	return typeof record[identity] === "string" && validHolder(record) ? record as unknown as LeaseHolderMetadata | FileLeaseHolderMetadata : undefined;
+}
+
 async function readHolder<Metadata>(path: string, identity: "root" | "file"): Promise<Metadata | undefined> {
 	try {
-		const value = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
-		if (typeof value[identity] === "string" && validHolder(value)) return value as Metadata;
+		return holderMetadata(JSON.parse(await readFile(path, "utf8")), identity) as Metadata | undefined;
 	} catch {
 		// Diagnostic metadata is best effort and never establishes ownership.
 	}

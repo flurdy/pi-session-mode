@@ -120,7 +120,7 @@ try {
 	const first = launch();
 	const commands = (await first.send("get_commands")).commands;
 	assert.deepEqual(commands.filter((command) => command.source === "extension" && command.sourceInfo?.path === join(installed, "index.ts")).map((command) => command.name).sort(),
-		["grant-file", "grants", "implement", "leases", "plan"]);
+		["grant-file", "grants", "implement", "lease-holders", "leases", "plan"]);
 	await first.state("implement", true);
 	const second = launch();
 	await second.send("get_commands");

@@ -1,5 +1,5 @@
-import { execFile } from "node:child_process";
 import { readFile, realpath } from "node:fs/promises";
+import { runCommand } from "./lease-inventory.ts";
 import { resolveGitRoot, worktreeLeaseLockPath } from "./lease.ts";
 import { MAX_LEASE_ROOTS } from "./scope.ts";
 
@@ -16,26 +16,6 @@ export interface ProbeWorktreeLeaseOccupancyOptions {
 	timeoutMs?: number;
 	signal?: AbortSignal;
 	selfPid?: number;
-}
-
-interface CommandOutput {
-	stdout: string;
-}
-
-function runCommand(command: string, args: string[], options: ProbeWorktreeLeaseOccupancyOptions): Promise<CommandOutput> {
-	const timeoutMs = options.timeoutMs ?? DEFAULT_LEASE_OCCUPANCY_TIMEOUT_MS;
-	return new Promise((resolve, reject) => {
-		execFile(command, args, {
-			encoding: "utf8",
-			timeout: timeoutMs,
-			windowsHide: true,
-			signal: options.signal,
-		}, (error, stdout) => {
-			if (error?.killed && error.signal === "SIGTERM") reject(new Error(`${command} timed out after ${timeoutMs}ms`));
-			else if (error) reject(error);
-			else resolve({ stdout });
-		});
-	});
 }
 
 interface LockObservation {

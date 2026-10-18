@@ -90,8 +90,39 @@ function harness(results: WorktreeLeaseResult[] = [held()], options: Partial<Ses
 
 test("registers scope controls, fixed handoff saving, commit publication and confirmed package activation", () => {
 	const { pi } = harness();
-	assert.deepEqual([...pi.commands.keys()].sort(), ["grant-file", "grants", "implement", "leases", "plan"]);
+	assert.deepEqual([...pi.commands.keys()].sort(), ["grant-file", "grants", "implement", "lease-holders", "leases", "plan"]);
 	assert.deepEqual([...pi.tools.keys()], ["save_handoff", "publish_commit", "activate_pi_package"]);
+});
+
+test("lease-holders reports the kernel inventory without acquiring and trims oversized payloads", async () => {
+	const session = (parentPid: number, self: boolean, roots: string[]) => ({
+		parentPid, self, sessionIds: self ? ["session-1"] : [], files: [],
+		worktrees: roots.map((root) => ({ kind: "worktree" as const, identity: "a".repeat(64), holderPid: parentPid + 1, parent: "live" as const, parentPid, self, binding: "bound" as const, path: root })),
+	});
+	const inventories = [
+		{ kind: "inventory" as const, runtimeDir: "/run/pi", truncated: false, sessions: [session(500, true, ["/repo"]), session(600, false, ["/other\u001b[31m"])] },
+		{ kind: "inventory" as const, runtimeDir: "/run/pi", truncated: false, sessions: Array.from({ length: 40 }, (_, index) => session(1000 + index, false, [`/repo-${index}/${"x".repeat(500)}`])) },
+		{ kind: "unavailable" as const, runtimeDir: "/run/pi", reason: "lslocks timed out after 2000ms" },
+	];
+	const requested: unknown[] = [];
+	const { pi, acquisitions } = harness([], { inventory: async (options) => { requested.push(options); return structuredClone(inventories.shift()!); } });
+	const ctx = context();
+	await pi.commands.get("lease-holders")?.handler("", ctx);
+	let payload = JSON.parse(ctx.notifications.at(-1)!.message);
+	assert.deepEqual(payload.held, { worktrees: [], files: [] });
+	assert.equal(payload.inventory.sessions.length, 2);
+	assert.equal(payload.inventory.sessions[0].self, true);
+	assert.doesNotMatch(ctx.notifications.at(-1)!.message, /[\u0000-\u001f\u007f-\u009f]/);
+	assert.equal(payload.omittedSessions, 0);
+	await pi.commands.get("lease-holders")?.handler("", ctx);
+	assert.ok(ctx.notifications.at(-1)!.message.length <= 10_000);
+	payload = JSON.parse(ctx.notifications.at(-1)!.message);
+	assert.ok(payload.omittedSessions > 0 && payload.inventory.sessions.length + payload.omittedSessions === 40);
+	await pi.commands.get("lease-holders")?.handler("", ctx);
+	assert.equal(JSON.parse(ctx.notifications.at(-1)!.message).inventory.kind, "unavailable");
+	assert.deepEqual(acquisitions, []);
+	assert.deepEqual(pi.appended, []);
+	assert.equal(requested.length, 3);
 });
 
 test("commit publication follows the session-mode lifecycle", async () => {
