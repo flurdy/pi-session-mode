@@ -24,7 +24,9 @@ For a reviewed mutable checkout, run `make apply`. It owns the existing `~/.pi/a
 
 ## Use
 
+- A fresh session or `/new` starts `lazy`: implementation intent with no worktree lease. The first native `edit`/`write` acquires only its target's canonical worktree; contention blocks that write and the session stays lazy. Until a worktree is held, obvious Bash, package, Git, system and writer-subagent mutations stay guarded, so use `/implement <root>` for shell-first work.
 - `/plan` guards writes, drains pending additions, releases every worktree and file lease, and saves plan mode.
+- `/lazy` releases held worktree leases, keeps exact-file grants, and saves lazy mode. The `release_scopes` agent tool does the same after a task's work is committed and verified; it refuses dirty worktrees unless explicitly allowed with a reason, and refuses while writes or scope transitions are active.
 - `/implement` acquires the cwd worktree when none is held; otherwise it retains the current worktree set.
 - `/implement repos/api repos/web` adds those worktree roots without implicitly leasing the workspace root. Quote literal paths containing spaces.
 - `/grant-file ~/.agents/tool/config.json` resolves exact non-Git files, displays their canonical identities, and requires an interactive confirmation before acquiring them. It can establish file-only implementation mode without leasing cwd; the bounded guarded Bash/subagent policy remains active until a worktree is also leased.
@@ -35,16 +37,18 @@ For a reviewed mutable checkout, run `make apply`. It owns the existing `~/.pi/a
 - `save_handoff` saves a rendered resume block to the fixed user handoff directory in every guard state, without repository or `/grant-file` authority. New files auto-save; overwrite requires fresh TUI confirmation. See [handoff saves](docs/handoff-save.md) for helper requirements, concurrency and failure boundaries.
 - `publish_commit` publishes one exact, freshly confirmed commit to its same-name upstream in every guard state, without a source-writer lease. Each push needs its own native TUI confirmation and single-use token; no force, tags or retry. See [attended commit publication](docs/publication.md).
 - `activate_pi_package` is an opt-in agent tool for one already-installed allowlisted Pi Git package. It requires live implement state and fresh TUI confirmation, but does not publish or reload. See [confirmed package activation](docs/package-activation.md).
-- `pi --implement --lease-roots '["repos/api","repos/web"]'` selects explicit startup roots. `--plan` wins; explicit startup flags override saved selection.
+- `pi --implement --lease-roots '["repos/api","repos/web"]'` selects explicit startup roots. `pi --lazy` saves lazy mode. `--plan` wins; explicit startup flags override saved selection, and `--lazy` combined with `--implement` or `--lease-roots` starts guarded plan mode instead.
 - `PI_SESSION_GUARD=0` is the explicit, visibly unguarded emergency bypass.
 
 **Compatibility change in 0.3:** once an implement session holds at least one live worktree lease, native `edit`/`write` preflight can acquire and persist additional canonical target worktrees without another prompt. Linked, nested and sibling repositories still require their own locks; a supported parallel wrapper acquires all missing roots atomically. This replaces the explicit-only expansion policy in released 0.2.1: leases now prevent writer collisions, not accidental targeting of a different repository. Plan, conflict, lost, unguarded and file-only sessions never auto-expand.
 
-Bash/script effects remain outside path enforcement and cannot trigger expansion. Legacy non-Git or unavailable implicit-cwd sessions remain visibly `unguarded`; start in plan mode or explicitly select valid roots to obtain protection.
+**Compatibility change after 0.5.0:** sessions without a saved selection, including `/new` and `--continue` with no history, start `lazy` instead of leasing cwd. Concurrent sessions launched at a workspace root no longer contend for that root; each takes the member worktree its first write targets. Saved selections still restore, bare `/implement` still leases cwd, and a lazy session that acquires a worktree saves it as explicit roots so a reload reacquires in-progress work. Lazy selections use a v4 checkpoint after a v1 plan checkpoint; older readers resume guarded.
+
+Bash/script effects remain outside path enforcement and cannot trigger expansion. Legacy non-Git or unavailable implicit-cwd sessions (bare `/implement`, `--implement` or a saved cwd selection) remain visibly `unguarded`; start lazy or in plan mode, or explicitly select valid roots, to obtain protection.
 
 A failed addition preserves previously held worktree and file scopes. Any lost lease guards the whole session and releases the combined set. File grants are limited to exact regular files with one filesystem link, or one missing leaf beneath an existing canonical parent; directories, missing parents, filesystem-marker-detectable Git ownership or administration, reserved Git marker names, hardlinks, dangling links, and special files fail closed. Marker-less or externally redirected worktrees are not detectable from an ordinary file path and remain outside this cooperative guarantee. Revalidation before every native edit/write catches identity and scope-revision changes.
 
-Beads claims, prose, reads, environment variables, project configuration, and arbitrary model tools cannot trigger expansion. Only concrete native-write targets in an eligible session do so; `/grant-file` remains interactive-only. There is also no automatic release on completion/idle, individual release, or special cross-repository owner. Narrow a set with `/plan`, then select the desired scopes again. Separate `leases:N` and `grants:N` extension statuses plus `/leases` and `/grants` expose the active identities. A bounded grant widget remains visible even when a custom footer ignores extension statuses.
+Beads claims, prose, reads, environment variables, project configuration, and arbitrary model tools cannot trigger expansion. Only concrete native-write targets in an eligible session do so; `/grant-file` remains interactive-only. Release is always explicit: there is no automatic release on tracker close, completion or idle, no per-root release, and no special cross-repository owner. `/lazy` and `release_scopes` release the whole worktree set; `/plan` also releases file grants. Separate `leases:N` and `grants:N` extension statuses plus `/leases` and `/grants` expose the active identities. A bounded grant widget remains visible even when a custom footer ignores extension statuses.
 
 ## Observer integration
 
@@ -73,7 +77,7 @@ with `PI_VERIFY_HOST_VERSION` matching `pi --version` (npm scripts prefer the de
 
 ## Rollback
 
-Enter `/plan`, remove only the selected package or checkout link, then restart Pi. Do not delete runtime lock files to force takeover. Worktree-only selections keep the safe v1-plan-plus-v2 checkpoint format. Selections containing file grants write a safe v1 plan checkpoint before their v3 combined record, so v2 readers resume guarded rather than retaining only part of the authority. Removing the extension makes its custom entries inert. Downgrading also removes exact-file and scoped native-write enforcement; do not assume mixed-version sessions provide the same protection.
+Enter `/plan`, remove only the selected package or checkout link, then restart Pi. Do not delete runtime lock files to force takeover. Roll back launcher `--lazy` emission before downgrading this extension. Worktree-only selections keep the safe v1-plan-plus-v2 checkpoint format; lazy selections write v1 plan then v4, which older versions restore as guarded plan. Selections containing file grants write a safe v1 plan checkpoint before their v3 combined record, so v2 readers resume guarded rather than retaining only part of the authority. Removing the extension makes its custom entries inert. Downgrading also removes exact-file and scoped native-write enforcement; do not assume mixed-version sessions provide the same protection.
 
 ## License
 

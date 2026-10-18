@@ -143,13 +143,16 @@ try {
 		await mkdir(join(handoffHome, ".claude"));
 		execFileSync("git", ["init", "-q", join(handoffHome, ".claude")]);
 	}
+	// No startup flag: flags are reapplied on reload, which would replace the saved dynamic selection.
 	const first = await launch("first"), peer = await launch("peer", ["--lease-roots", JSON.stringify([repos.web])]);
+	await first.roots([]);
+	await first.send("prompt", { message: "/implement" });
 	await first.roots([work]); await peer.roots([repos.web]);
 	const tools = (await first.snapshot()).tools;
 	assert.ok(tools.includes("activate_pi_package"));
 	assert.ok(tools.includes("save_handoff"));
 	if (handoffHome) {
-		const conflict = await launch("conflict");
+		const conflict = await launch("conflict", ["--implement"]);
 		await conflict.roots([]);
 		const [left, right] = await Promise.all([
 			first.turn("handoff-implement", [handoffRequest("implementation")]),
@@ -200,6 +203,25 @@ try {
 	const guarded = await first.turn("guarded", [write("repos/slow/guarded")]);
 	assert.equal(guarded.length, 1); assert.equal(guarded[0].isError, true);
 	await first.roots([]); await absent(join(repos.slow, "guarded"));
+	const lazy = await launch("lazy");
+	await lazy.roots([]);
+	results = await lazy.turn("lazy-write", [write("repos/api/lazy")]);
+	assert.equal(results[0].isError, false);
+	await lazy.roots([repos.api]);
+	assert.equal((await lazy.snapshot()).saved.data.scope.kind, "roots");
+	const dirtyRelease = await lazy.turn("lazy-dirty-release", [{ name: "release_scopes", arguments: {} }]);
+	assert.equal(dirtyRelease[0].isError, true); assert.match(JSON.stringify(dirtyRelease[0].result), /dirty worktrees/);
+	await lazy.roots([repos.api]);
+	const released = receipt((await lazy.turn("lazy-release", [{ name: "release_scopes", arguments: { allowDirty: true, reason: "disposable fixture file" } }]))[0]);
+	assert.deepEqual(released.released, [repos.api]);
+	await lazy.roots([]);
+	assert.deepEqual((await lazy.snapshot()).saved.data, { version: 4, mode: "implement", scope: { kind: "lazy", originCwd: work } });
+	await lazy.send("prompt", { message: "/fixture-reload" });
+	await lazy.roots([]);
+	const shellFirst = await lazy.turn("lazy-shell", [{ name: "bash", arguments: { command: "touch repos/api/shell" } }]);
+	assert.equal(shellFirst[0].isError, true); await absent(join(repos.api, "shell"));
+	await lazy.stop();
+	console.log("Lazy RPC PASS: fresh start holds no lease, first native write takes only its member, dirty release refusal, explicit release to v4 lazy, reload stays lazy, shell-first refusal.");
 	if (handoffHome) {
 		const input = handoffRequest("guarded-plan");
 		const saved = receipt((await first.turn("handoff-plan", [input]))[0]);

@@ -120,9 +120,12 @@ try {
 	const first = launch();
 	const commands = (await first.send("get_commands")).commands;
 	assert.deepEqual(commands.filter((command) => command.source === "extension" && command.sourceInfo?.path === join(installed, "index.ts")).map((command) => command.name).sort(),
-		["grant-file", "grants", "implement", "lease-holders", "leases", "plan"]);
+		["grant-file", "grants", "implement", "lazy", "lease-holders", "leases", "plan"]);
+	await first.state("lazy", true);
+	await proveFree();
+	await first.send("prompt", { message: "/implement" });
 	await first.state("implement", true);
-	const second = launch();
+	const second = launch(["--implement"]);
 	await second.send("get_commands");
 	await second.state("conflict", false);
 	await first.send("prompt", { message: "/plan" });
@@ -216,7 +219,7 @@ assert.equal(result.kind,"held");
 		assert.equal(client.events.some((event) => event.type === "agent_start" || event.type === "extension_error"), false, "unexpected model turn or extension error");
 		assert.doesNotMatch(client.stderr, /Failed to load extension/);
 	}
-	console.log("RPC: single load, plan/implement, exact-file command registration and kernel contention, holder loss, reload, shutdown, flag precedence, missing resolver, bypass and exported observer: PASS; no model turns");
+	console.log("RPC: single load, fresh lazy start, plan/implement, exact-file command registration and kernel contention, holder loss, reload, shutdown, flag precedence, missing resolver, bypass and exported observer: PASS; no model turns");
 } finally {
 	for (const client of clients) await client.stop();
 	await rm(fileFixture, { recursive: true, force: true });

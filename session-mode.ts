@@ -18,7 +18,7 @@ import { restoreSelection, selectionEntries, selectionFiles, type Selection, typ
 import { verifiedReadOnlySubagents } from "./subagent-policy.ts";
 
 export type SessionMode = "implement" | "plan";
-export type SessionGuardState = "acquiring" | "implement" | "plan" | "implement-blocked" | "lost" | "unguarded";
+export type SessionGuardState = "acquiring" | "implement" | "lazy" | "plan" | "implement-blocked" | "lost" | "unguarded";
 export interface PackageActivationAdapter {
 	prepare(request: PackageActivationRequest, signal?: AbortSignal): Promise<PreparedPackageActivation>;
 	activate(request: PackageActivationRequest, prepared: PreparedPackageActivation, options?: PackageActivationLaunchOptions): Promise<PackageActivationEvidence>;
@@ -45,11 +45,15 @@ interface Implementation {
 	requestedRoots: readonly string[];
 	requestedFiles: readonly string[];
 	persist: boolean;
+	/** A failed addition started from healthy lazy mode keeps lazy intent. */
+	retainLazy: boolean;
 	promise: Promise<void>;
 }
+const NATIVE_WRITE_TOOLS = new Set(["edit", "write", "multi_tool_use.parallel"]);
 const STATE_META: Record<SessionGuardState, { label: string; tone: "success" | "warning" | "error" }> = {
 	acquiring: { label: "acquiring", tone: "warning" },
 	implement: { label: "implement", tone: "success" },
+	lazy: { label: "lazy", tone: "success" },
 	plan: { label: "plan", tone: "warning" },
 	"implement-blocked": { label: "conflict", tone: "error" },
 	lost: { label: "lost", tone: "error" },
@@ -88,6 +92,8 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	let dynamicAcquisition: symbol | undefined;
 	let packageActivationOperation: symbol | undefined;
 	let packageActivationDrain: Promise<void> | undefined;
+	let releaseOperation: symbol | undefined;
+	const activeWrites = new Set<string>();
 	let lastFailure: { requested: readonly string[]; result: LeaseSetResult | string } | undefined;
 	let activationDependencies: ReturnType<typeof defaultPackageActivationDependencies> | undefined;
 	const defaultActivationDependencies = () => activationDependencies ??= defaultPackageActivationDependencies();
@@ -111,6 +117,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 
 	pi.registerFlag("plan", { description: "Start in guarded plan mode without leases", type: "boolean", default: false });
 	pi.registerFlag("implement", { description: "Acquire the cwd worktree lease", type: "boolean", default: false });
+	pi.registerFlag("lazy", { description: "Hold no worktree lease until the first native edit/write; overrides restored scopes", type: "boolean", default: false });
 	pi.registerFlag("lease-roots", { description: "Explicit worktree roots as a JSON array; overrides restored scopes", type: "string" });
 
 	function notify(ctx: ExtensionContext, text: string, level: "info" | "warning" | "error" = "info"): void {
@@ -119,7 +126,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		try { ctx.ui.notify(bounded, level); } catch { /* UI is not an authority boundary. */ }
 	}
 	function warnDiscovery(ctx: ExtensionContext): void {
-		if (shuttingDown || !discoveryFailed || warningShown || !["plan", "implement-blocked", "lost"].includes(state)) return;
+		if (shuttingDown || !discoveryFailed || warningShown || !["plan", "lazy", "implement-blocked", "lost"].includes(state)) return;
 		warningShown = true;
 		notify(ctx, "Read-only subagent verification failed; direct agent launches remain blocked.", "warning");
 	}
@@ -166,20 +173,37 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		for (const entry of selectionEntries(value)) pi.appendEntry("session-mode", entry);
 	}
 	function current(ticket: number): boolean { return ticket === generation && !shuttingDown; }
+	/** Lazy means implementation intent while no worktree lease is held. */
+	function activeState(): "implement" | "lazy" {
+		return selection.mode === "implement" && selection.scope.kind === "lazy" && leases.roots.length === 0 ? "lazy" : "implement";
+	}
+	function writable(): boolean {
+		return (state === "implement" && leases.live) || (state === "lazy" && leases.roots.length === 0 && (leases.files.length === 0 || leases.live));
+	}
+	function acquisitionEligible(): boolean {
+		return !dependencies.isDisabled() && writable() && (state === "lazy" || leases.roots.length > 0);
+	}
+	function scopeBusy(): boolean {
+		return shuttingDown || Boolean((implementation && current(implementation.generation)) || dynamicAcquisition || packageActivationOperation || releaseOperation) || activeWrites.size > 0;
+	}
 	function rejectBusy(ctx: ExtensionContext): boolean {
 		if (ctx.isIdle() && !ctx.hasPendingMessages()) return false;
 		notify(ctx, "Cannot change session mode while Pi is busy.", "warning");
 		return true;
 	}
-	async function failScope(ctx: ExtensionContext, result: LeaseSetResult | string, requested: readonly string[], ticket: number, persist: boolean, legacyContention = false): Promise<void> {
+	async function failScope(
+		ctx: ExtensionContext, result: LeaseSetResult | string, requested: readonly string[], ticket: number, persist: boolean,
+		options: { legacyContention?: boolean; retainLazy?: boolean } = {},
+	): Promise<void> {
 		if (!current(ticket) || state === "lost") return;
 		lastFailure = { requested, result };
-		if (leases.live) {
+		const retained = leases.live || (options.retainLazy === true && selection.mode === "implement" && selection.scope.kind === "lazy");
+		if (retained) {
 			mode = "implement";
 			restoreTools();
-			setState(ctx, "implement");
+			setState(ctx, activeState());
 		} else {
-			selection = legacyContention ? { mode: "implement", scope: { kind: "cwd" } } : { mode: "plan" };
+			selection = options.legacyContention ? { mode: "implement", scope: { kind: "cwd" } } : { mode: "plan" };
 			mode = selection.mode;
 			guardTools();
 			await refreshReadOnlySubagents(ctx);
@@ -190,7 +214,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 			}
 			setState(ctx, typeof result !== "string" && result.kind === "contended" ? "implement-blocked" : "plan");
 		}
-		const authority = leases.live ? "Existing valid leases are retained." : "No scope leases are held; writes remain guarded.";
+		const authority = leases.live ? "Existing valid leases are retained." : retained ? "The session remains lazy; no worktree lease is held." : "No scope leases are held; writes remain guarded.";
 		if (typeof result !== "string" && result.kind === "contended") {
 			const value = "root" in result ? result.root : result.file;
 			const escaped = safeDisplay(value);
@@ -221,7 +245,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 			return implementation.promise;
 		}
 		const requestedRoots = request.worktrees.kind === "paths" ? request.worktrees.paths : request.worktrees.kind === "cwd" ? [ctx.cwd] : [];
-		const operation: Implementation = { generation: ++generation, key, requestedRoots, requestedFiles: request.files, persist, promise: undefined! };
+		const operation: Implementation = { generation: ++generation, key, requestedRoots, requestedFiles: request.files, persist, retainLazy: state === "lazy", promise: undefined! };
 		implementation = operation;
 		operation.promise = doAcquire(ctx, request, scopeFor, operation, expected, legacyImplicit).finally(() => {
 			if (implementation === operation) implementation = undefined;
@@ -262,16 +286,17 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 			if (!current(ticket)) return;
 			if (result.kind === "held" && leases.live) {
 				selection = candidate; lastFailure = undefined; mode = "implement";
-				resetDiscovery(); restoreTools(); setState(ctx, "implement");
+				resetDiscovery(); restoreTools(); setState(ctx, activeState());
+				if (state === "lazy") await refreshReadOnlySubagents(ctx);
 			} else if (result.kind === "unguarded" && legacyImplicit && leases.files.length === 0) {
 				selection = { mode: "implement", scope: { kind: "cwd" } };
 				if (operation.persist) persistSelection(selection);
 				unguarded(ctx); notify(ctx, `Session guard unavailable (${result.reason}). This session is unguarded.`, "error");
 			} else {
-				await failScope(ctx, result, requested, ticket, operation.persist, legacyImplicit && result.kind === "contended");
+				await failScope(ctx, result, requested, ticket, operation.persist, { legacyContention: legacyImplicit && result.kind === "contended", retainLazy: operation.retainLazy });
 			}
 		} catch (error) {
-			if (current(ticket)) await failScope(ctx, error instanceof Error ? error.message : String(error), [...operation.requestedRoots, ...operation.requestedFiles], ticket, operation.persist);
+			if (current(ticket)) await failScope(ctx, error instanceof Error ? error.message : String(error), [...operation.requestedRoots, ...operation.requestedFiles], ticket, operation.persist, { retainLazy: operation.retainLazy });
 		}
 	}
 	async function enterImplement(ctx: ExtensionContext, paths?: string[], persist = false): Promise<void> {
@@ -280,8 +305,50 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		return enterScopes(ctx, { worktrees: { kind: "paths", paths }, files: [] }, (scopes, originCwd) => ({ kind: "roots", roots: scopes.roots, originCwd: originCwd! }), persist);
 	}
 	function enterFiles(ctx: ExtensionContext, paths: string[], expectedFiles: readonly string[], persist = false): Promise<void> {
-		const preserved = selection.mode === "implement" && leases.roots.length ? selection.scope : { kind: "none" } as const;
+		const preserved = selection.mode === "implement" && (leases.roots.length > 0 || selection.scope.kind === "lazy") ? selection.scope : { kind: "none" } as const;
 		return enterScopes(ctx, { worktrees: { kind: "none" }, files: paths }, () => preserved, persist, { files: expectedFiles });
+	}
+	/**
+	 * Select lazy intent: release held worktree leases while keeping live exact-file grants, or
+	 * reacquire restored grants. Returns the released roots when it completed without reacquisition.
+	 */
+	async function enterLazy(ctx: ExtensionContext, persist: boolean, restored?: { originCwd: string; files: readonly string[] }): Promise<readonly string[] | undefined> {
+		currentContext = ctx;
+		const ticket = ++generation;
+		let originCwd: string;
+		try { originCwd = await realpath(ctx.cwd); }
+		catch (error) { await failScope(ctx, `Cannot resolve the lazy origin cwd: ${String(error)}`, [], ticket, persist); return; }
+		if (!current(ticket)) return;
+		if (restored && restored.originCwd !== originCwd) {
+			await failScope(ctx, "Restored lazy origin cwd changed; reselect with /lazy, /implement or /grant-file", [], ticket, true);
+			return;
+		}
+		const scope = { kind: "lazy", originCwd } as const;
+		if (restored?.files.length) {
+			await enterScopes(ctx, { worktrees: { kind: "none" }, files: restored.files.map((file) => pathToFileURL(file).href) }, () => scope, true, { files: restored.files });
+			return;
+		}
+		const released = leases.roots, files = leases.live ? leases.files : [];
+		selection = files.length ? { mode: "implement", scope, files } : { mode: "implement", scope };
+		mode = "implement"; lastFailure = undefined;
+		let checkpointFailed = false;
+		if (persist) { try { persistSelection(selection); } catch { checkpointFailed = true; } }
+		if (released.length) await leases.releaseWorktrees();
+		if (!current(ticket)) return;
+		restoreTools(); setState(ctx, activeState());
+		if (checkpointFailed) notify(ctx, `Lazy mode could not be saved; use --lazy when restarting.${released.length ? " Worktree leases have been released." : ""}`, "error");
+		await refreshReadOnlySubagents(ctx);
+		return current(ticket) ? released : undefined;
+	}
+	async function reportDirty(ctx: ExtensionContext, roots: readonly string[], ticket: number, action: string): Promise<boolean> {
+		for (const root of roots) {
+			try {
+				const result = await pi.exec("git", ["-C", root, "status", "--porcelain"], { timeout: 2000 });
+				if (result.code === 0 && result.stdout.trim()) notify(ctx, `${action} with a dirty worktree: ${JSON.stringify(root)}; changes remain on disk.`, "warning");
+			} catch { /* Dirty-state reporting is advisory. */ }
+			if (!current(ticket)) return false;
+		}
+		return true;
 	}
 	function enterRestored(ctx: ExtensionContext, restored: Exclude<Selection, { mode: "plan" }>): Promise<void> {
 		const files = [...selectionFiles(restored)];
@@ -322,14 +389,18 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 			}
 			await refreshReadOnlySubagents(ctx);
 			if (!current(ticket)) return;
-			for (const root of roots.length ? roots : [ctx.cwd]) {
-				try {
-					const result = await pi.exec("git", ["-C", root, "status", "--porcelain"], { timeout: 2000 });
-					if (result.code === 0 && result.stdout.trim()) notify(ctx, `Entering plan mode with a dirty worktree: ${JSON.stringify(root)}; changes remain on disk.`, "warning");
-				} catch { /* Dirty-state reporting is advisory. */ }
-				if (!current(ticket)) return;
-			}
+			if (!(await reportDirty(ctx, roots.length ? roots : [ctx.cwd], ticket, "Entering plan mode"))) return;
 			setState(ctx, dependencies.isDisabled() ? "unguarded" : "plan");
+		},
+	});
+	pi.registerCommand("lazy", {
+		description: "Release worktree leases, keep exact-file grants, and acquire a worktree only on the next native write",
+		handler: async (_args, ctx) => {
+			if (rejectBusy(ctx)) return;
+			if (dependencies.isDisabled()) { notify(ctx, "Lazy mode is unavailable while the guard is disabled.", "warning"); return; }
+			if (scopeBusy()) { notify(ctx, "Another scope transition is active; try again when it finishes.", "warning"); return; }
+			const released = await enterLazy(ctx, true);
+			if (released?.length) await reportDirty(ctx, released, generation, "Returning to lazy mode");
 		},
 	});
 	pi.registerCommand("implement", {
@@ -345,7 +416,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 					notify(ctx, `Scope error: ${String(error)}`, "error");
 					return;
 				}
-				await failScope(ctx, String(error), [], ++generation, true);
+				await failScope(ctx, String(error), [], ++generation, true, { retainLazy: state === "lazy" });
 			}
 		},
 	});
@@ -384,7 +455,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 					lastFailure = { requested: [], result: String(error) };
 					notify(ctx, `Grant error: ${String(error)}`, "error"); return;
 				}
-				await failScope(ctx, String(error), [], ++generation, true);
+				await failScope(ctx, String(error), [], ++generation, true, { retainLazy: state === "lazy" });
 			}
 		},
 	});
@@ -447,7 +518,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 						&& ctx.sessionManager.getSessionId() === sessionId
 						&& ctx.mode === "tui" && ctx.hasUI
 						&& state === "implement" && leases.live && leases.roots.length > 0
-						&& !dependencies.isDisabled() && !implementation && !dynamicAcquisition && !signal?.aborted;
+						&& !dependencies.isDisabled() && !implementation && !dynamicAcquisition && !releaseOperation && !signal?.aborted;
 				} catch { return false; }
 			};
 			if (!eligible()) throw new Error("Pi package activation requires live implement mode with a held worktree lease and no scope transition");
@@ -502,17 +573,84 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		},
 	});
 
+	pi.registerTool({
+		name: "release_scopes",
+		label: "Release Scopes",
+		description: "Release every held worktree lease and return to lazy implementation intent after the current task's work is committed and verified. Exact-file grants stay held. Refuses dirty worktrees unless allowDirty is true with a reason, refuses while writes, scope transitions or shutdown are active, and changes nothing in plan, conflict, lost, file-only or unguarded sessions.",
+		promptSnippet: "Release completed task worktree leases back to lazy mode",
+		promptGuidelines: [
+			"Use release_scopes only after the task's changes are committed or otherwise verified complete; a tracker close alone is not a reason to release.",
+			"Never set allowDirty on your own: it needs the user's explicit decision and a short reason for leaving uncommitted changes unprotected.",
+			"A release_scopes refusal keeps every lease held; report it instead of retrying or working around it.",
+		],
+		executionMode: "sequential",
+		parameters: Type.Object({
+			allowDirty: Type.Optional(Type.Boolean({ description: "Release worktrees with uncommitted changes; requires reason" })),
+			reason: Type.Optional(Type.String({ maxLength: 500, description: "Why dirty worktrees may be released; required with allowDirty" })),
+		}, { additionalProperties: false }),
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const refuse = (text: string): never => { throw new Error(`${safeDisplay(text).slice(0, 4000)} Nothing was released.`); };
+			if (scopeBusy()) refuse("Cannot release scopes while a write, scope transition, package activation, release or shutdown is active.");
+			if (dependencies.isDisabled() || state === "unguarded") refuse("The session guard is disabled; there are no guarded scopes to release.");
+			if (state === "lazy" && leases.roots.length === 0) {
+				const details = { status: "lazy", released: [], files: leases.files };
+				return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details };
+			}
+			if (state !== "implement" || !leases.live || leases.roots.length === 0) refuse(`release_scopes requires implement mode with held worktree leases, or lazy mode (current: ${STATE_META[state].label}).`);
+			const allowDirty = params.allowDirty === true;
+			const reason = typeof params.reason === "string" ? safeDisplay(params.reason.trim()).slice(0, 500) : "";
+			if (allowDirty && !reason) refuse("allowDirty requires a nonempty reason.");
+			const operation = Symbol("release-scopes");
+			releaseOperation = operation;
+			const ticket = generation, revision = leases.revision, roots = leases.roots;
+			const unchanged = () => current(ticket) && state === "implement" && leases.live && leases.revision === revision && !signal?.aborted;
+			try {
+				const dirty: string[] = [];
+				for (const root of roots) {
+					let status: { code: number; stdout: string } | undefined;
+					try { status = await pi.exec("git", ["-C", root, "status", "--porcelain"], { timeout: 2000, ...(signal ? { signal } : {}) }); }
+					catch (error) { refuse(`Cannot check ${JSON.stringify(root)} for uncommitted changes: ${String(error)}.`); }
+					if (!unchanged()) refuse("Scopes changed or the release was cancelled during checks.");
+					if (status?.code !== 0) refuse(`Cannot check ${JSON.stringify(root)} for uncommitted changes (git exited ${String(status?.code)}).`);
+					if (status?.stdout.trim()) dirty.push(root);
+				}
+				if (dirty.length && !allowDirty) refuse(`Refusing to release dirty worktrees ${boundedScopeList(dirty)}. Commit or stash first, or ask the user whether to release them anyway.`);
+				const originCwd = await realpath(ctx.cwd);
+				if (!unchanged()) refuse("Scopes changed or the release was cancelled during checks.");
+				const releaseTicket = ++generation;
+				selection = leases.files.length ? { mode: "implement", scope: { kind: "lazy", originCwd }, files: leases.files } : { mode: "implement", scope: { kind: "lazy", originCwd } };
+				mode = "implement"; lastFailure = undefined;
+				await leases.releaseWorktrees();
+				if (!current(releaseTicket)) {
+					const outcome = shuttingDown ? "shut down" : `is now ${STATE_META[state].label}`;
+					throw new Error(safeDisplay(`Worktree leases ${boundedScopeList(roots)} were released, but the session ${outcome} before lazy mode was selected.`));
+				}
+				let checkpoint: "saved" | "failed" = "saved";
+				try { persistSelection(selection); } catch { checkpoint = "failed"; }
+				setState(ctx, activeState());
+				void refreshReadOnlySubagents(ctx).catch(() => {});
+				if (dirty.length) notify(ctx, `Released dirty worktrees ${boundedScopeList(dirty)} on request: ${reason}`, "warning");
+				if (checkpoint === "failed") notify(ctx, "Worktree leases were released, but lazy mode could not be saved; use --lazy when restarting.", "error");
+				const details = { status: "released", released: roots, dirty, ...(dirty.length ? { reason } : {}), files: leases.files, checkpoint };
+				return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details };
+			} finally {
+				if (releaseOperation === operation) releaseOperation = undefined;
+			}
+		},
+	});
+
 	async function acquireWriteTargets(tool: string, input: unknown, ctx: ExtensionContext): Promise<string | undefined> {
-		if (!["edit", "write", "multi_tool_use.parallel"].includes(tool) || leases.roots.length === 0 || dependencies.isDisabled()) return;
-		if (dynamicAcquisition || (implementation && current(implementation.generation))) return "Another scope acquisition is busy; write blocked.";
+		if (!NATIVE_WRITE_TOOLS.has(tool) || !acquisitionEligible()) return;
+		if (dynamicAcquisition || releaseOperation || (implementation && current(implementation.generation))) return "Another scope acquisition or release is busy; write blocked.";
 		const operation = Symbol("native-write");
 		dynamicAcquisition = operation;
+		const lazy = state === "lazy";
 		const ticket = generation, revision = leases.revision;
 		const missing = new Set<string>();
 		const abort = ctx.signal;
 		const deadline = AbortSignal.timeout(ADDITION_TIMEOUT_MS);
 		const signal = abort ? AbortSignal.any([abort, deadline]) : deadline;
-		const eligible = () => current(ticket) && state === "implement" && leases.live && leases.roots.length > 0 && !dependencies.isDisabled() && !signal.aborted;
+		const eligible = () => current(ticket) && acquisitionEligible() && !signal.aborted;
 		const unchanged = () => eligible() && leases.revision === revision;
 		try {
 			const reason = await scopedWriteBlockReason(tool, input, ctx.cwd, leases.roots, { files: leases.files, collectMissingRoots: missing, signal, isCurrent: unchanged });
@@ -528,7 +666,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 			const originCwd = await realpath(ctx.cwd);
 			if (!unchanged()) return "Scope changed or tool cancelled before acquisition; write blocked.";
 			if (selection.mode !== "implement") return "Implementation selection changed; write blocked.";
-			if (selection.scope.kind === "roots" && selection.scope.originCwd !== originCwd) return "Origin cwd changed; reselect scopes explicitly.";
+			if ((selection.scope.kind === "roots" || selection.scope.kind === "lazy") && selection.scope.originCwd !== originCwd) return "Origin cwd changed; reselect scopes explicitly.";
 			const roots = [...missing].sort();
 			let candidate: Selection = selection;
 			const result = await leases.addScopes(
@@ -541,9 +679,9 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 				},
 				{ roots }, signal,
 			);
-			if (result.kind === "held" && current(ticket) && state === "implement" && leases.live) {
+			if (result.kind === "held" && current(ticket) && (state === "implement" || state === "lazy") && leases.live) {
 				selection = candidate; lastFailure = undefined;
-				setState(ctx, "implement");
+				setState(ctx, activeState());
 			}
 			if (!eligible()) return "Scope changed or tool cancelled during acquisition; write blocked.";
 			if (result.kind !== "held") {
@@ -551,7 +689,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 				const detail = result.kind === "contended" && "root" in result
 					? `Worktree ${JSON.stringify(result.root)} is held by another live session`
 					: `${result.kind}${"detail" in result ? `: ${result.detail}` : ""}`;
-				return safeDisplay(`Dynamic lease acquisition blocked for ${boundedScopeList(roots)}: ${detail.slice(0, 2000)}. Existing valid scopes are retained.`);
+				return safeDisplay(`Dynamic lease acquisition blocked for ${boundedScopeList(roots)}: ${detail.slice(0, 2000)}. ${lazy ? "The session remains lazy with no new worktree lease." : "Existing valid scopes are retained."}`);
 			}
 		} catch (error) {
 			return safeDisplay(`Native-write scope acquisition failed for ${boundedScopeList([...missing])}: ${String(error).slice(0, 2000)}. Write blocked.`);
@@ -564,11 +702,11 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		const publicationReason = publicationWrapperBlockReason(event.toolName, event.input);
 		if (publicationReason) return { block: true, reason: publicationReason };
 		if (state === "unguarded") return;
-		if (state === "implement" && leases.live) {
+		if (writable()) {
 			const acquisitionReason = await acquireWriteTargets(event.toolName, event.input, ctx);
 			if (acquisitionReason) return { block: true, reason: acquisitionReason };
 			const ticket = generation, revision = leases.revision;
-			const reason = await scopedWriteBlockReason(event.toolName, event.input, ctx.cwd, leases.roots, { files: leases.files, signal: ctx.signal, isCurrent: () => current(ticket) && state === "implement" && leases.live && revision === leases.revision });
+			const reason = await scopedWriteBlockReason(event.toolName, event.input, ctx.cwd, leases.roots, { files: leases.files, signal: ctx.signal, isCurrent: () => current(ticket) && writable() && revision === leases.revision });
 			if (reason) return { block: true, reason };
 			if (leases.roots.length === 0) {
 				const guardedReason = guardedToolBlockReason(event.toolName, event.input, { readOnlySubagents, allowNativeWrites: true });
@@ -579,37 +717,51 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		const reason = guardedToolBlockReason(event.toolName, event.input, { readOnlySubagents });
 		if (reason) return { block: true, reason };
 	});
+	pi.on("tool_execution_start", (event) => { if (NATIVE_WRITE_TOOLS.has(event.toolName)) activeWrites.add(event.toolCallId); });
+	pi.on("tool_execution_end", (event) => { activeWrites.delete(event.toolCallId); });
+	pi.on("agent_settled", () => { activeWrites.clear(); });
 	pi.on("model_select", (event, ctx) => {
 		readOnlySubagents = new Set(); discoveryFailed = false;
 		void refreshReadOnlySubagents(ctx, event.model.provider);
 	});
 	pi.on("before_agent_start", (event) => {
 		if (state === "unguarded") return;
-		const guidance = state === "implement" && leases.live
-			? `Leased worktrees: ${boundedScopeList(leases.roots)}. Exact-file grants: ${boundedScopeList(leases.files)}. ${leases.roots.length ? "Native edit/write calls can acquire and persist their canonical target worktree leases automatically; do not ask for a redundant /implement command for that supported path. Contention or unavailable identity blocks the write." : "File-only sessions cannot auto-acquire worktrees and retain the bounded guarded shell/subagent policy; ask for /implement while idle before repository work."} Exact non-repository files still require explicit /grant-file confirmation. Shell/script effects are not automatically scoped: never use them as a scope-expansion workaround. Reads, Beads claims, prose and subagent requests do not acquire leases.`
+		const common = "Exact non-repository files still require explicit /grant-file confirmation. Shell/script effects are not automatically scoped: never use them as a scope-expansion workaround. Reads, Beads claims, prose and subagent requests do not acquire leases.";
+		const guidance = state === "lazy" && writable()
+			? `Lazy implementation: no worktree lease is held yet. Exact-file grants: ${boundedScopeList(leases.files)}. The first native edit/write acquires only its target's canonical Git worktree; do not ask for /implement for that path. Contention or unavailable identity blocks that write and the session stays lazy. Until a worktree is held, obvious Bash, package, Git, system and writer-subagent mutations stay guarded; for shell-first work ask the user for /implement <root> while idle. ${common}`
+			: state === "implement" && leases.live
+			? `Leased worktrees: ${boundedScopeList(leases.roots)}. Exact-file grants: ${boundedScopeList(leases.files)}. ${leases.roots.length ? "Native edit/write calls can acquire and persist their canonical target worktree leases automatically; do not ask for a redundant /implement command for that supported path. Contention or unavailable identity blocks the write. After the task's work is committed and verified, release_scopes returns held worktrees to lazy mode; it refuses dirty worktrees unless the user explicitly allows them." : "File-only sessions cannot auto-acquire worktrees and retain the bounded guarded shell/subagent policy; ask for /implement while idle before repository work."} ${common}`
 			: "[GUARDED SESSION]\nDo not modify source files, Git, package or system state; ask the user to select /implement scopes first. Read-only analysis, safe subagent management and verified direct read-only reviewers are allowed.\nOrdinary local Beads triage means a local mutation in any resolver-proven owning store, not only cwd. Use bd -C <proven directory> for comments, create, update and close without /implement or a worktree lease. If ownership resolution is ambiguous, unavailable or not-found, write nothing; repository-specific tracker rules still win. Beads writes do not acquire source leases.\nVerify effective export, backup and synchronization side effects, not just command syntax or commented config examples. A configured Dolt remote alone does not make a local comment a sync request. Follow the applicable remote/destructive policy separately; /implement alone does not authorize remote or destructive actions. Workspace synchronization uses make beads-sync after fresh explicit confirmation; never synchronize during list, resolver or triage workflows.";
 		return { systemPrompt: `${event.systemPrompt}\n\n${guidance}\nException: save_handoff is a dedicated, fixed-destination handoff save operation available in every guard state without repository leases or /grant-file. Use it for wrap-up; it grants no native write or shell authority. Never substitute a Bash helper when this tool is missing or fails.\nException: publish_commit is the attended exact-commit publication tool, available in every guard state without a source lease. Each push needs its own fresh native confirmation; never ask for /implement to publish, and never fall back to Bash or make pushes when it is missing or refuses.` };
 	});
 	pi.on("session_start", async (_event, ctx) => {
 		publication.sessionStart(ctx);
-		generation++; currentContext = ctx; shuttingDown = false;
+		generation++; currentContext = ctx; shuttingDown = false; state = "acquiring"; activeWrites.clear();
 		const restored = restoreSelection(ctx.sessionManager.getBranch());
-		selection = restored.selection;
-		mode = pi.getFlag("plan") === true ? "plan" : selection.mode;
+		selection = restored?.selection ?? { mode: "plan" };
+		const planFlag = pi.getFlag("plan") === true, lazyFlag = pi.getFlag("lazy") === true, implementFlag = pi.getFlag("implement") === true;
+		const rootsFlag = pi.getFlag("lease-roots");
+		const conflictingLazy = !planFlag && lazyFlag && (implementFlag || typeof rootsFlag === "string");
+		mode = planFlag || conflictingLazy ? "plan" : restored ? selection.mode : "implement";
 		if (dependencies.isDisabled()) { unguarded(ctx); notify(ctx, "Session guard disabled by PI_SESSION_GUARD=0.", "warning"); return; }
-		if (pi.getFlag("plan") === true) selection = { mode: "plan" };
-		else if (typeof pi.getFlag("lease-roots") === "string") {
-			try { await enterImplement(ctx, parseRootFlag(pi.getFlag("lease-roots") as string), true); }
+		if (planFlag || conflictingLazy) selection = { mode: "plan" };
+		else if (typeof rootsFlag === "string") {
+			try { await enterImplement(ctx, parseRootFlag(rootsFlag), true); }
 			catch (error) { await failScope(ctx, String(error), [], ++generation, true); }
 			return;
-		} else if (pi.getFlag("implement") === true) {
+		} else if (implementFlag) {
 			await enterImplement(ctx, undefined, true);
+			return;
+		} else if (lazyFlag || !restored) {
+			await enterLazy(ctx, lazyFlag);
 			return;
 		}
 		if (selection.mode === "plan") {
 			mode = "plan"; guardTools(); await refreshReadOnlySubagents(ctx); setState(ctx, "plan");
-			if (restored.invalid) notify(ctx, "Invalid restored scope; reselect worktrees with /implement or exact files with /grant-file.", "error");
-		} else await enterRestored(ctx, selection);
+			if (conflictingLazy) notify(ctx, "--lazy cannot be combined with --implement or --lease-roots; started in guarded plan mode. Restart with one mode flag.", "error");
+			else if (restored?.invalid) notify(ctx, "Invalid restored scope; reselect worktrees with /implement or exact files with /grant-file.", "error");
+		} else if (selection.scope.kind === "lazy") await enterLazy(ctx, false, { originCwd: selection.scope.originCwd, files: selectionFiles(selection) });
+		else await enterRestored(ctx, selection);
 	});
 	pi.on("session_shutdown", async (_event, ctx) => {
 		shuttingDown = true; generation++; guardTools();

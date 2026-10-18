@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { realpath } from "node:fs/promises";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import type { FileLeaseResult, HeldWorktreeLease, WorktreeLeaseResult } from "./lease.ts";
 import type { PackageActivationEvidence, PackageActivationRequest, PreparedPackageActivation } from "./package-activation.ts";
 import { registerSessionMode, type SessionModeDependencies } from "./session-mode.ts";
@@ -16,10 +18,13 @@ class FakePi {
 	activeTools = ["read", "bash", "edit", "write", "questionnaire", "subagent"];
 	planFlag = false;
 	implementFlag = false;
+	lazyFlag = false;
 	leaseRootsFlag: string | undefined;
 
 	registerFlag(): void {}
-	getFlag(name: string): boolean | string | undefined { return name === "plan" ? this.planFlag : name === "implement" ? this.implementFlag : this.leaseRootsFlag; }
+	getFlag(name: string): boolean | string | undefined {
+		return name === "plan" ? this.planFlag : name === "implement" ? this.implementFlag : name === "lazy" ? this.lazyFlag : this.leaseRootsFlag;
+	}
 	on(name: string, handler: Handler): void { this.handlers.set(name, [...(this.handlers.get(name) ?? []), handler]); }
 	registerCommand(name: string, command: { handler: Handler }): void { this.commands.set(name, command); }
 	registerTool(tool: { name: string; execute: (...args: any[]) => Promise<any> }): void { this.tools.set(tool.name, tool); }
@@ -37,7 +42,9 @@ class FakePi {
 	}
 }
 
-function context(branch: any[] = [], provider = "provider-a") {
+// Most tests exercise a restored implicit-cwd selection, the pre-lazy fresh default. Fresh lazy sessions use context([]).
+const implicitCwd = () => [{ type: "custom", customType: "session-mode", data: { version: 2, mode: "implement", scope: { kind: "cwd" } } }];
+function context(branch: any[] = implicitCwd(), provider = "provider-a") {
 	const statuses: Array<string | undefined> = [];
 	const notifications: Array<{ message: string; level?: string }> = [];
 	const ctx = {
@@ -90,8 +97,8 @@ function harness(results: WorktreeLeaseResult[] = [held()], options: Partial<Ses
 
 test("registers scope controls, fixed handoff saving, commit publication and confirmed package activation", () => {
 	const { pi } = harness();
-	assert.deepEqual([...pi.commands.keys()].sort(), ["grant-file", "grants", "implement", "lease-holders", "leases", "plan"]);
-	assert.deepEqual([...pi.tools.keys()], ["save_handoff", "publish_commit", "activate_pi_package"]);
+	assert.deepEqual([...pi.commands.keys()].sort(), ["grant-file", "grants", "implement", "lazy", "lease-holders", "leases", "plan"]);
+	assert.deepEqual([...pi.tools.keys()], ["save_handoff", "publish_commit", "activate_pi_package", "release_scopes"]);
 });
 
 test("lease-holders reports the kernel inventory without acquiring and trims oversized payloads", async () => {
@@ -163,7 +170,7 @@ test("handoff operation stays allowed in plan, conflict, acquiring, lost, implem
 	}
 });
 
-test("defaults to implement and acquires before reporting write authority", async () => {
+test("a restored implicit-cwd selection acquires before reporting write authority", async () => {
 	const { pi, acquisitions, controller } = harness();
 	const ctx = context();
 	await pi.emit("session_start", ctx);
@@ -173,7 +180,7 @@ test("defaults to implement and acquires before reporting write authority", asyn
 	assert.deepEqual(pi.activeTools, ["read", "bash", "edit", "write", "questionnaire", "subagent"]);
 });
 
-test("fresh initial contention explains the held root without exposing holder metadata", async (t) => {
+test("implicit-cwd contention explains the held root without exposing holder metadata", async (t) => {
 	for (const holder of [undefined, { root: "/canonical/repo", pid: 987654, parentPid: 987653, sessionId: "private-holder-session", startedAt: "private-start-time" }]) {
 		await t.test(holder ? "with holder metadata" : "without holder metadata", async () => {
 			const { pi, controller } = harness([{ kind: "contended", root: "/canonical/repo", holder }]);
@@ -265,13 +272,13 @@ test("fresh replacement does not inherit outgoing interactive plan selection", a
 	assert.equal(outgoing.controller.state, "plan");
 	await outgoing.pi.emit("session_shutdown", oldContext);
 	assert.deepEqual(outgoing.acquisitions, []);
-	const replacement = harness([{ kind: "contended", root: "/repo" }]);
-	const newContext = context();
+	const replacement = harness([]);
+	const newContext = context([]);
+	newContext.cwd = process.cwd();
 	await replacement.pi.emit("session_start", newContext);
-	assert.deepEqual(replacement.acquisitions, ["acquire"]);
-	assert.equal(replacement.controller.state, "implement-blocked");
-	assert.match(newContext.notifications.at(-1)!.message, /another live session/);
-	assert.doesNotMatch(newContext.notifications.at(-1)!.message, /retained/);
+	assert.deepEqual(replacement.acquisitions, []);
+	assert.equal(replacement.controller.state, "lazy");
+	assert.deepEqual(replacement.pi.appended, []);
 });
 
 test("implicit cwd contention retains implementation intent for a later restore", async () => {
@@ -1033,4 +1040,326 @@ test("concurrent activation calls are rejected before duplicate confirmation", a
 	confirmFirst(false);
 	await first;
 	assert.deepEqual(activation.calls, ["prepare"]);
+});
+
+const lazyEntry = (originCwd: string, files?: string[]) => ({ type: "custom", customType: "session-mode", data: { version: 4, mode: "implement", scope: { kind: "lazy", originCwd }, ...(files ? { files } : {}) } });
+function fileLease(file: string, releases: string[] = []): FileLeaseResult {
+	return { kind: "held", file, holderPid: 321, lost: new Promise(() => undefined), async release() { releases.push(file); } };
+}
+function fileOptions(acquire: (file: string) => FileLeaseResult): Partial<SessionModeDependencies> {
+	return {
+		acquireFile: async (file) => acquire(file),
+		resolveFiles: async (paths) => paths.map((path) => path.startsWith("file://") ? fileURLToPath(path) : path).sort(),
+	};
+}
+function realContext(branch?: any[]) {
+	const ctx = context(branch);
+	ctx.cwd = process.cwd();
+	return ctx;
+}
+const releaseTool = (pi: FakePi, ctx: ReturnType<typeof context>, params: Record<string, unknown> = {}) =>
+	pi.tools.get("release_scopes")!.execute("call", params, undefined, undefined, ctx);
+const dirtyExec = (pi: FakePi) => async (command: string, args: string[]) => {
+	pi.execCalls.push([command, ...args]);
+	return { code: 0, stdout: " M file.ts\n", stderr: "" };
+};
+
+test("fresh sessions start lazy without a lease or checkpoint; --lazy persists and overrides restored scopes", async () => {
+	const here = await realpath(process.cwd());
+	const fresh = harness([]);
+	const ctx = realContext([]);
+	await fresh.pi.emit("session_start", ctx);
+	assert.equal(fresh.controller.state, "lazy");
+	assert.equal(fresh.controller.mode, "implement");
+	assert.deepEqual(fresh.acquisitions, []);
+	assert.deepEqual(fresh.pi.appended, []);
+	assert.equal(fresh.pi.activeTools.includes("write"), true);
+	assert.equal(ctx.statuses.at(-1), "lazy");
+	for (const branch of [implicitCwd(), [{ type: "custom", customType: "session-mode", data: { version: 2, mode: "plan" } }]]) {
+		const flagged = harness([]);
+		flagged.pi.lazyFlag = true;
+		await flagged.pi.emit("session_start", realContext(branch));
+		assert.equal(flagged.controller.state, "lazy");
+		assert.deepEqual(flagged.acquisitions, []);
+		assert.deepEqual(flagged.pi.appended.map((entry) => entry.data), [{ version: 1, mode: "plan" }, { version: 4, mode: "implement", scope: { kind: "lazy", originCwd: here } }]);
+	}
+});
+
+test("--plan wins over --lazy, and --lazy with another scope flag starts guarded without a checkpoint", async () => {
+	const planned = harness([]);
+	planned.pi.planFlag = true; planned.pi.lazyFlag = true;
+	const ctx = realContext([]);
+	await planned.pi.emit("session_start", ctx);
+	assert.equal(planned.controller.state, "plan");
+	assert.doesNotMatch(ctx.notifications.map((notice) => notice.message).join("\n"), /cannot be combined/);
+	for (const configure of [(pi: FakePi) => { pi.implementFlag = true; }, (pi: FakePi) => { pi.leaseRootsFlag = JSON.stringify([process.cwd()]); }]) {
+		const conflicting = harness([]);
+		conflicting.pi.lazyFlag = true; configure(conflicting.pi);
+		const conflictContext = realContext();
+		await conflicting.pi.emit("session_start", conflictContext);
+		assert.equal(conflicting.controller.state, "plan");
+		assert.deepEqual(conflicting.acquisitions, []);
+		assert.deepEqual(conflicting.pi.appended, []);
+		assert.equal(conflicting.pi.activeTools.includes("write"), false);
+		assert.match(conflictContext.notifications.at(-1)!.message, /--lazy cannot be combined with --implement or --lease-roots/);
+	}
+});
+
+test("restored lazy selections hold no worktree, and a changed origin guards to plan", async () => {
+	const here = await realpath(process.cwd());
+	const restored = harness([]);
+	await restored.pi.emit("session_start", realContext([lazyEntry(here)]));
+	assert.equal(restored.controller.state, "lazy");
+	assert.deepEqual(restored.acquisitions, []);
+	assert.deepEqual(restored.pi.appended, []);
+	const drifted = harness([]);
+	const ctx = realContext([lazyEntry("/elsewhere")]);
+	await drifted.pi.emit("session_start", ctx);
+	assert.equal(drifted.controller.state, "plan");
+	assert.equal(drifted.pi.activeTools.includes("write"), false);
+	assert.match(ctx.notifications.at(-1)!.message, /origin cwd changed/);
+	assert.deepEqual(drifted.pi.appended.at(-1), { type: "session-mode", data: { version: 2, mode: "plan" } });
+});
+
+test("restored lazy grants are reacquired without a prompt, and failed reacquisition stays guarded", async () => {
+	const here = await realpath(process.cwd()), file = "/home/user/config.json";
+	const restored = harness([], fileOptions((path) => fileLease(path)));
+	await restored.pi.emit("session_start", realContext([lazyEntry(here, [file])]));
+	assert.equal(restored.controller.state, "lazy");
+	assert.deepEqual(restored.controller.files, [file]);
+	assert.deepEqual(restored.acquisitions, []);
+	const contended = harness([], fileOptions(() => ({ kind: "contended", file })));
+	await contended.pi.emit("session_start", realContext([lazyEntry(here, [file])]));
+	assert.notEqual(contended.controller.state, "lazy");
+	assert.equal(contended.pi.activeTools.includes("write"), false);
+	assert.deepEqual(contended.controller.files, []);
+});
+
+test("/lazy releases worktrees, keeps exact-file grants, persists, and warns about dirty roots", async () => {
+	const here = await realpath(process.cwd()), file = "/home/user/config.json";
+	const releases: string[] = [];
+	const { pi, controller } = harness([held(releases)], fileOptions((path) => fileLease(path, releases)));
+	const ctx = realContext();
+	await pi.emit("session_start", ctx);
+	await pi.commands.get("grant-file")?.handler(JSON.stringify(file), ctx);
+	assert.deepEqual(controller.files, [file]);
+	pi.exec = dirtyExec(pi);
+	await pi.commands.get("lazy")?.handler("", ctx);
+	assert.equal(controller.state, "lazy");
+	assert.deepEqual(controller.roots, []);
+	assert.deepEqual(controller.files, [file]);
+	assert.deepEqual(releases, ["release"], "only the worktree lease is released");
+	assert.deepEqual(pi.appended.at(-1)?.data, { version: 4, mode: "implement", scope: { kind: "lazy", originCwd: here }, files: [file] });
+	assert.match(ctx.notifications.map((notice) => notice.message).join("\n"), /Returning to lazy mode with a dirty worktree: "\/repo"/);
+	assert.equal(pi.activeTools.includes("write"), true);
+});
+
+test("/lazy from plan acquires nothing; busy, disabled and failed additions keep the prior state", async () => {
+	const { pi, controller, acquisitions } = harness([{ kind: "contended", root: "/repo" }]);
+	pi.planFlag = true;
+	const ctx = realContext([]);
+	await pi.emit("session_start", ctx);
+	ctx.idle = false;
+	await pi.commands.get("lazy")?.handler("", ctx);
+	assert.equal(controller.state, "plan");
+	ctx.idle = true;
+	await pi.commands.get("lazy")?.handler("", ctx);
+	assert.equal(controller.state, "lazy");
+	assert.deepEqual(acquisitions, []);
+	await pi.commands.get("implement")?.handler("", ctx);
+	assert.equal(controller.state, "lazy");
+	assert.match(ctx.notifications.at(-1)!.message, /held by another live session\. The session remains lazy/);
+	await pi.commands.get("implement")?.handler('"unterminated', ctx);
+	assert.equal(controller.state, "lazy");
+	assert.equal(pi.activeTools.includes("write"), true);
+	const disabled = harness([], { isDisabled: () => true });
+	const disabledContext = realContext([]);
+	await disabled.pi.emit("session_start", disabledContext);
+	await disabled.pi.commands.get("lazy")?.handler("", disabledContext);
+	assert.equal(disabled.controller.state, "unguarded");
+	assert.match(disabledContext.notifications.at(-1)!.message, /unavailable while the guard is disabled/);
+});
+
+test("lazy sessions keep the guarded shell boundary and fixed-destination exceptions", async () => {
+	const { pi } = harness([]);
+	const ctx = realContext([]);
+	await pi.emit("session_start", ctx);
+	for (const [toolName, input] of [
+		["bash", { command: "git commit -m nope" }],
+		["subagent", { agent: "worker" }],
+		["activate_pi_package", { package: "x", version: "v1.0.0", expectedCommit: "0".repeat(40) }],
+		["multi_tool_use.parallel", { tool_uses: [{ recipient_name: "functions.publish_commit", parameters: { action: "execute", token: "0".repeat(32) } }] }],
+	] as const) {
+		const [result] = await pi.emit("tool_call", ctx, { toolName, input });
+		assert.equal((result as { block?: boolean })?.block, true, toolName);
+	}
+	for (const event of [
+		{ toolName: "bash", input: { command: "git status" } },
+		{ toolName: "save_handoff", input: {} },
+		{ toolName: "publish_commit", input: { action: "confirm", root: "/repo", commit: "abcdef1" } },
+	]) assert.deepEqual(await pi.emit("tool_call", ctx, event), [undefined], event.toolName);
+	const [prompt] = await pi.emit("before_agent_start", ctx, { systemPrompt: "base" });
+	const text = (prompt as { systemPrompt: string }).systemPrompt;
+	assert.match(text, /Lazy implementation: no worktree lease is held yet/);
+	assert.match(text, /first native edit\/write acquires only its target's canonical Git worktree/);
+	assert.match(text, /session stays lazy/);
+	assert.match(text, /\/implement <root>/);
+	assert.match(text, /save_handoff.*every guard state/);
+	assert.doesNotMatch(text, /GUARDED SESSION/);
+});
+
+test("release_scopes is sequential, idempotent in lazy and changes nothing outside implement with worktrees", async () => {
+	const lazy = harness([]);
+	assert.equal((lazy.pi.tools.get("release_scopes") as { executionMode?: string }).executionMode, "sequential");
+	const lazyContext = realContext([]);
+	await lazy.pi.emit("session_start", lazyContext);
+	assert.deepEqual((await releaseTool(lazy.pi, lazyContext)).details, { status: "lazy", released: [], files: [] });
+	assert.deepEqual(lazy.pi.appended, []);
+
+	const plan = harness([]); plan.pi.planFlag = true;
+	const planContext = realContext([]);
+	await plan.pi.emit("session_start", planContext);
+	await assert.rejects(releaseTool(plan.pi, planContext), /current: plan\)\. Nothing was released/);
+	assert.equal(plan.controller.state, "plan");
+
+	const conflict = harness([{ kind: "contended", root: "/repo" }]);
+	const conflictContext = realContext();
+	await conflict.pi.emit("session_start", conflictContext);
+	await assert.rejects(releaseTool(conflict.pi, conflictContext), /current: conflict\)/);
+	assert.equal(conflict.controller.state, "implement-blocked");
+
+	const fileOnly = harness([], fileOptions((path) => fileLease(path))); fileOnly.pi.planFlag = true;
+	const fileContext = realContext([]);
+	await fileOnly.pi.emit("session_start", fileContext);
+	await fileOnly.pi.commands.get("grant-file")?.handler('"/home/user/config.json"', fileContext);
+	assert.equal(fileOnly.controller.state, "implement");
+	await assert.rejects(releaseTool(fileOnly.pi, fileContext), /current: implement\)\. Nothing was released/);
+	assert.equal(fileOnly.controller.state, "implement", "file-only sessions never gain lazy worktree intent");
+
+	const disabled = harness([], { isDisabled: () => true });
+	const disabledContext = realContext([]);
+	await disabled.pi.emit("session_start", disabledContext);
+	await assert.rejects(releaseTool(disabled.pi, disabledContext), /guard is disabled/);
+});
+
+test("release_scopes releases clean worktrees to lazy, keeps grants, and blocks nested wrapper use", async () => {
+	const here = await realpath(process.cwd()), file = "/home/user/config.json";
+	const releases: string[] = [];
+	const { pi, controller } = harness([held(releases)], fileOptions((path) => fileLease(path, releases)));
+	const ctx = realContext();
+	await pi.emit("session_start", ctx);
+	const [prompt] = await pi.emit("before_agent_start", ctx, { systemPrompt: "base" });
+	assert.match((prompt as { systemPrompt: string }).systemPrompt, /release_scopes returns held worktrees to lazy mode; it refuses dirty worktrees/);
+	const [nested] = await pi.emit("tool_call", ctx, { toolName: "multi_tool_use.parallel", input: { tool_uses: [{ recipient_name: "functions.release_scopes", parameters: {} }] } });
+	assert.equal((nested as { block?: boolean })?.block, true);
+	await pi.commands.get("grant-file")?.handler(JSON.stringify(file), ctx);
+	const result = await releaseTool(pi, ctx);
+	assert.deepEqual(result.details, { status: "released", released: ["/repo"], dirty: [], files: [file], checkpoint: "saved" });
+	assert.deepEqual(pi.execCalls.at(-1), ["git", "-C", "/repo", "status", "--porcelain"]);
+	assert.equal(controller.state, "lazy");
+	assert.deepEqual(controller.files, [file]);
+	assert.deepEqual(releases, ["release"], "only the worktree lease is released");
+	assert.deepEqual(pi.appended.at(-1)?.data, { version: 4, mode: "implement", scope: { kind: "lazy", originCwd: here }, files: [file] });
+	assert.equal(ctx.statuses.at(-1), "lazy");
+});
+
+test("release_scopes refuses dirty or unverifiable worktrees unless explicitly allowed with a reason", async () => {
+	const releases: string[] = [];
+	const { pi, controller } = harness([held(releases)]);
+	const ctx = realContext();
+	await pi.emit("session_start", ctx);
+	pi.exec = dirtyExec(pi);
+	await assert.rejects(releaseTool(pi, ctx), /Refusing to release dirty worktrees \["\/repo"\].*ask the user.*Nothing was released/);
+	assert.equal(controller.state, "implement");
+	assert.deepEqual(controller.roots, ["/repo"]);
+	const probes = pi.execCalls.length;
+	for (const reason of [undefined, "   "]) await assert.rejects(releaseTool(pi, ctx, { allowDirty: true, reason }), /nonempty reason/);
+	assert.equal(pi.execCalls.length, probes, "a missing reason refuses before probing");
+	pi.exec = async () => ({ code: 128, stdout: "", stderr: "fatal" });
+	await assert.rejects(releaseTool(pi, ctx), /git exited 128/);
+	pi.exec = async () => { throw new Error("timed out"); };
+	await assert.rejects(releaseTool(pi, ctx), /Cannot check "\/repo" for uncommitted changes: Error: timed out/);
+	assert.deepEqual(releases, []);
+	pi.exec = dirtyExec(pi);
+	const result = await releaseTool(pi, ctx, { allowDirty: true, reason: "user parked WIP" });
+	assert.deepEqual(result.details.dirty, ["/repo"]);
+	assert.equal(result.details.reason, "user parked WIP");
+	assert.equal(controller.state, "lazy");
+	assert.match(ctx.notifications.map((notice) => notice.message).join("\n"), /Released dirty worktrees \["\/repo"\] on request: user parked WIP/);
+});
+
+test("release_scopes refuses during in-flight writes and its own checks, and blocks writes while releasing", async () => {
+	const { pi, controller } = harness([held()]);
+	const ctx = realContext();
+	await pi.emit("session_start", ctx);
+	await pi.emit("tool_execution_start", ctx, { toolCallId: "w1", toolName: "edit" });
+	await assert.rejects(releaseTool(pi, ctx), /while a write.*Nothing was released/);
+	await pi.emit("tool_execution_start", ctx, { toolCallId: "r1", toolName: "read" });
+	await pi.emit("tool_execution_end", ctx, { toolCallId: "w1", toolName: "edit" });
+	let started!: () => void, finish!: () => void;
+	const checking = new Promise<void>((done) => { started = done; });
+	const gate = new Promise<void>((done) => { finish = done; });
+	pi.exec = async () => { started(); await gate; return { code: 0, stdout: "", stderr: "" }; };
+	const first = releaseTool(pi, ctx);
+	await checking;
+	await assert.rejects(releaseTool(pi, ctx), /while a write, scope transition, package activation, release or shutdown/);
+	const [write] = await pi.emit("tool_call", ctx, { toolName: "write", input: { path: "/repo/file", content: "x" } });
+	assert.match((write as { reason: string }).reason, /release is busy/);
+	finish();
+	assert.equal((await first).details.status, "released");
+	assert.equal(controller.state, "lazy");
+	await pi.emit("tool_execution_start", ctx, { toolCallId: "leaked", toolName: "write" });
+	await assert.rejects(releaseTool(pi, ctx), /while a write/);
+	await pi.emit("agent_settled", ctx);
+	assert.equal((await releaseTool(pi, ctx)).details.status, "lazy", "settlement clears unpaired write tracking");
+});
+
+test("release_scopes reports a failed checkpoint after releasing, and shutdown during checks releases nothing early", async () => {
+	const releases: string[] = [];
+	const failed = harness([held(releases)]);
+	const ctx = realContext();
+	await failed.pi.emit("session_start", ctx);
+	failed.pi.appendEntry = () => { throw new Error("checkpoint unavailable"); };
+	const result = await releaseTool(failed.pi, ctx);
+	assert.equal(result.details.checkpoint, "failed");
+	assert.deepEqual(releases, ["release"], "only the worktree lease is released");
+	assert.equal(failed.controller.state, "lazy");
+	assert.match(ctx.notifications.at(-1)!.message, /released, but lazy mode could not be saved; use --lazy/);
+
+	const shutdown = harness([held()]);
+	const shutdownContext = realContext();
+	await shutdown.pi.emit("session_start", shutdownContext);
+	let started!: () => void, finish!: () => void;
+	const checking = new Promise<void>((done) => { started = done; });
+	const gate = new Promise<void>((done) => { finish = done; });
+	shutdown.pi.exec = async () => { started(); await gate; return { code: 0, stdout: "", stderr: "" }; };
+	const releasing = releaseTool(shutdown.pi, shutdownContext);
+	await checking;
+	await shutdown.pi.emit("session_shutdown", shutdownContext);
+	finish();
+	await assert.rejects(releasing, /cancelled during checks\. Nothing was released/);
+	assert.equal(shutdown.pi.appended.some((entry) => (entry.data as { version?: number }).version === 4), false);
+});
+
+test("release_scopes reports a lease loss during its release drain instead of selecting lazy", async () => {
+	let releasing!: () => void, finishRelease!: () => void, loseFile!: () => void;
+	const releaseStarted = new Promise<void>((done) => { releasing = done; });
+	const gate = new Promise<void>((done) => { finishRelease = done; });
+	const root: HeldWorktreeLease = { kind: "held", root: "/repo", holderPid: 123, lost: new Promise(() => undefined), async release() { releasing(); await gate; } };
+	const file: FileLeaseResult = { kind: "held", file: "/home/user/config.json", holderPid: 321, lost: new Promise<void>((done) => { loseFile = done; }), async release() {} };
+	const { pi, controller } = harness([root], fileOptions(() => file));
+	const ctx = realContext();
+	await pi.emit("session_start", ctx);
+	await pi.commands.get("grant-file")?.handler('"/home/user/config.json"', ctx);
+	const result = releaseTool(pi, ctx);
+	await releaseStarted;
+	loseFile();
+	await new Promise((done) => setImmediate(done));
+	finishRelease();
+	await assert.rejects(result, /\["\/repo"\] were released, but the session is now lost before lazy mode was selected/);
+	assert.equal(controller.state, "lost");
+	assert.deepEqual(controller.files, []);
+	assert.equal(pi.activeTools.includes("write"), false);
+	assert.equal(pi.appended.some((entry) => (entry.data as { version?: number }).version === 4), false);
+	assert.deepEqual(pi.appended.at(-1)?.data, { version: 2, mode: "plan" });
 });

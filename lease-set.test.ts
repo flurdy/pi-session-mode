@@ -335,3 +335,42 @@ test("rejects the whole oversized set and already-dead handles", async () => {
 	assert.deepEqual(other.roots, []);
 	await other.releaseAll();
 });
+
+test("worktree-only release keeps file leases, bumps the revision and drains a pending addition", async () => {
+	const released: string[] = [];
+	let lostCalls = 0;
+	let finishLate!: (result: WorktreeLeaseResult) => void;
+	const set = new LeaseSet(
+		async (root) => root === "late" ? new Promise<WorktreeLeaseResult>((resolve) => { finishLate = resolve; }) : handle(root, released).lease,
+		resolveRoots,
+		() => { lostCalls++; },
+		{ acquireFile: async (file) => fileHandle(file, released).lease, resolveFiles },
+	);
+	assert.equal((await set.addScopes({ worktrees: { kind: "paths", paths: ["api", "web"] }, files: ["/config"] }, "/cwd", "session")).kind, "held");
+	const revision = set.revision;
+	const pending = set.add(["late"], "/cwd", "session");
+	await new Promise((resolve) => setImmediate(resolve));
+	const draining = set.releaseWorktrees();
+	assert.deepEqual(set.roots, []);
+	assert.deepEqual(set.files, ["/config"]);
+	assert.ok(set.revision > revision);
+	finishLate(handle("late", released).lease);
+	assert.equal((await pending).kind, "cancelled");
+	await draining;
+	assert.deepEqual(released.sort(), ["api", "late", "web"]);
+	assert.equal(set.live, true, "the remaining file lease keeps the set live");
+	assert.equal(lostCalls, 0, "intentional release is not loss");
+	assert.equal((await set.add(["api"], "/cwd", "session")).kind, "held", "released roots can be reacquired");
+	await set.releaseAll();
+	assert.deepEqual(released.filter((value) => value === "/config"), ["/config"]);
+});
+
+test("worktree-only release of a root-only set leaves no live authority", async () => {
+	const released: string[] = [];
+	const set = new LeaseSet(async (root) => handle(root, released).lease, resolveRoots);
+	assert.equal((await set.add(["api"], "/cwd", "session")).kind, "held");
+	await set.releaseWorktrees();
+	assert.equal(set.live, false);
+	assert.equal(set.lost, false);
+	assert.deepEqual(released, ["api"]);
+});

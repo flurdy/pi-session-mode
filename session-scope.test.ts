@@ -10,6 +10,7 @@ import { acquireFileLease, acquireWorktreeLease, lockIdentity } from "./lease.ts
 import { registerSessionMode } from "./session-mode.ts";
 
 type Handler = (event: any, ctx: any) => any;
+const IMPLICIT_CWD = { implicitCwd: true };
 class Pi {
 	tools = ["read", "bash", "edit", "write"];
 	toolChanges = 0;
@@ -20,12 +21,14 @@ class Pi {
 	registerFlag() {}
 	getFlag(name: string) { return this.flags.get(name); }
 	registerCommand(name: string, value: { handler: Handler }) { this.commands.set(name, value); }
-	registerTool() {}
+	registered = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
+	gitStatus = { code: 0, stdout: "", stderr: "" };
+	registerTool(tool: { name: string; execute: (...args: any[]) => Promise<any> }) { this.registered.set(tool.name, tool); }
 	on(name: string, value: Handler) { this.handlers.set(name, value); }
 	getActiveTools() { return [...this.tools]; }
 	setActiveTools(tools: string[]) { this.toolChanges++; this.tools = tools; }
 	appendEntry(customType: string, data: unknown) { this.entries.push({ type: "custom", customType, data }); }
-	async exec() { return { code: 0, stdout: "", stderr: "" }; }
+	async exec() { return this.gitStatus; }
 }
 async function fixture(run: (root: string, start: (flags?: Record<string, unknown>, entries?: any[]) => Promise<any>) => Promise<void>) {
 	const root = await mkdtemp(join(tmpdir(), "session-scope-"));
@@ -36,7 +39,10 @@ async function fixture(run: (root: string, start: (flags?: Record<string, unknow
 			execFileSync("git", ["-C", path, "init", "-q", "-b", "main"]);
 		}
 		await run(root, async (flags = { plan: true }, entries = []) => {
-			const pi = new Pi(); pi.flags = new Map(Object.entries(flags)); pi.entries = entries;
+			// `implicitCwd` restores the pre-lazy fresh default without adding a checkpoint to pi.entries.
+			const { implicitCwd, ...piFlags } = flags as Record<string, unknown> & { implicitCwd?: boolean };
+			const pi = new Pi(); pi.flags = new Map(Object.entries(piFlags)); pi.entries = entries;
+			const restoredBase = implicitCwd ? [{ type: "custom", customType: "session-mode", data: { version: 2, mode: "implement", scope: { kind: "cwd" } } }] : [];
 			const statuses = new Map<string, string>();
 			const widgets = new Map<string, string[] | undefined>();
 			const notices: string[] = [], acquired: string[] = [], acquiredFiles: string[] = [], confirmations: string[] = [];
@@ -46,7 +52,7 @@ async function fixture(run: (root: string, start: (flags?: Record<string, unknow
 			let fileResolution = (path: string) => path.startsWith("file://") ? fileURLToPath(path) : path;
 			const sessionId = `session-${sessions.length}`;
 			const ctx = { cwd: root, mode: "tui", hasUI: true, signal: undefined as AbortSignal | undefined, isIdle: () => idle, hasPendingMessages: () => pendingMessages, model: { provider: "test" },
-				sessionManager: { getBranch: () => pi.entries, getSessionId: () => sessionId },
+				sessionManager: { getBranch: () => [...restoredBase, ...pi.entries], getSessionId: () => sessionId },
 				ui: { theme: { fg: (_: string, value: string) => value }, setWidget: (key: string, value: string[] | undefined) => widgets.set(key, value), setStatus: (key: string, value: string) => statuses.set(key, value), notify: (text: string) => notices.push(text), confirm: async (_title: string, text: string) => { confirmations.push(text); await confirmationHook(); return confirmResult; } } };
 			const controller = registerSessionMode(pi as never, {
 				acquireLease: async (path, options) => { acquired.push(path); await acquireHook(path, options.signal); return acquireWorktreeLease(path, { ...options, runtimeDir: join(root, "runtime") }); },
@@ -64,6 +70,7 @@ async function fixture(run: (root: string, start: (flags?: Record<string, unknow
 				setPendingMessages: (value: boolean) => { pendingMessages = value; },
 				command: async (name: string, args = "") => { const command = pi.commands.get(name); assert.ok(command); await command.handler(args, { ...ctx }); },
 				tool: (name: string, input: unknown) => pi.handlers.get("tool_call")?.({ toolName: name, input }, ctx),
+				release: async (params: Record<string, unknown> = {}) => JSON.parse((await pi.registered.get("release_scopes")!.execute("call", params, undefined, undefined, ctx)).content[0].text),
 			};
 			sessions.push(session);
 			await pi.handlers.get("session_start")?.({}, ctx);
@@ -76,7 +83,7 @@ async function fixture(run: (root: string, start: (flags?: Record<string, unknow
 }
 
 test("explicit child scopes escape root contention and dynamically acquire native-write targets", async () => fixture(async (root, start) => {
-	const rootWriter = await start({});
+	const rootWriter = await start(IMPLICIT_CWD);
 	const child = await start();
 	await child.command("implement", '"api"');
 	assert.equal(child.controller.state, "implement");
@@ -94,7 +101,7 @@ test("explicit child scopes escape root contention and dynamically acquire nativ
 }));
 
 test("a native wrapper acquires every missing root atomically", async () => fixture(async (root, start) => {
-	const session = await start({});
+	const session = await start(IMPLICIT_CWD);
 	const toolsBefore = session.pi.toolChanges;
 	const input = { tool_uses: [
 		{ recipient_name: "functions.write", parameters: { path: "api/new", content: "x" } },
@@ -107,7 +114,7 @@ test("a native wrapper acquires every missing root atomically", async () => fixt
 }));
 
 test("wrapper contention rolls back new roots and retains the old set", async () => fixture(async (root, start) => {
-	const session = await start({}), holder = await start();
+	const session = await start(IMPLICIT_CWD), holder = await start();
 	await holder.command("implement", "web");
 	const result = await session.tool("multi_tool_use.parallel", { tool_uses: [
 		{ recipient_name: "functions.write", parameters: { path: "api/new", content: "x" } },
@@ -124,7 +131,7 @@ test("wrapper contention rolls back new roots and retains the old set", async ()
 }));
 
 test("a wrapper containing an ungranted non-repository file takes no new leases", async () => fixture(async (root, start) => {
-	const session = await start({});
+	const session = await start(IMPLICIT_CWD);
 	const before = session.acquired.length;
 	const result = await session.tool("multi_tool_use.parallel", { tool_uses: [
 		{ recipient_name: "functions.write", parameters: { path: "api/new", content: "x" } },
@@ -140,7 +147,7 @@ test("dynamic additions support sibling repositories and aliases without losing 
 	try {
 		execFileSync("git", ["-C", outside, "init", "-q", "-b", "main"]);
 		await symlink(outside, join(root, "alias"));
-		const session = await start({});
+		const session = await start(IMPLICIT_CWD);
 		const file = join(dirname(root), `${basename(root)}-config`);
 		await session.command("grant-file", JSON.stringify(file));
 		assert.equal(await session.tool("write", { path: "alias/new", content: "x" }), undefined);
@@ -159,7 +166,7 @@ test("dynamic acquisition refuses a newly Git-owned exact-file grant", async () 
 	const outside = await mkdtemp(join(tmpdir(), "dynamic-file-git-"));
 	try {
 		const file = join(outside, "config.json"); await writeFile(file, "{}");
-		const session = await start({});
+		const session = await start(IMPLICIT_CWD);
 		await session.command("grant-file", JSON.stringify(file));
 		execFileSync("git", ["-C", outside, "init", "-q", "-b", "main"]);
 		const before = session.acquired.length;
@@ -172,7 +179,7 @@ test("dynamic acquisition refuses a newly Git-owned exact-file grant", async () 
 }));
 
 test("a failed dynamic checkpoint retains old authority and blocks the write", async () => fixture(async (root, start) => {
-	const session = await start({});
+	const session = await start(IMPLICIT_CWD);
 	session.pi.appendEntry = () => { throw new Error("checkpoint unavailable"); };
 	const result = await session.tool("write", { path: "api/new", content: "x" });
 	assert.equal(result?.block, true);
@@ -185,7 +192,7 @@ test("a failed dynamic checkpoint retains old authority and blocks the write", a
 }));
 
 test("a partial dynamic checkpoint restores conservatively while retaining live old scopes", async () => fixture(async (root, start) => {
-	const session = await start({});
+	const session = await start(IMPLICIT_CWD);
 	const append = session.pi.appendEntry.bind(session.pi);
 	session.pi.appendEntry = (type: string, data: any) => {
 		if (data.version === 2) throw new Error("second checkpoint failed");
@@ -210,7 +217,7 @@ test("dynamic expansion refuses to silently change an explicit selection origin"
 }));
 
 test("the production ten-second deadline cancels a stalled native acquisition", async () => fixture(async (root, start) => {
-	const session = await start({});
+	const session = await start(IMPLICIT_CWD);
 	session.setAcquireHook((_root: string, signal?: AbortSignal) => new Promise<void>((done) => {
 		assert.ok(signal);
 		if (signal.aborted) done();
@@ -223,7 +230,7 @@ test("the production ten-second deadline cancels a stalled native acquisition", 
 }));
 
 test("abort cancels dynamic acquisition and a simultaneous write is rejected as busy", async () => fixture(async (root, start) => {
-	const session = await start({});
+	const session = await start(IMPLICIT_CWD);
 	let begun!: () => void, finish!: () => void;
 	const ready = new Promise<void>((resolve) => { begun = resolve; });
 	const gate = new Promise<void>((resolve) => { finish = resolve; });
@@ -241,7 +248,7 @@ test("abort cancels dynamic acquisition and a simultaneous write is rejected as 
 }));
 
 test("post-commit cancellation retains the committed selection for later file grants", async () => fixture(async (root, start) => {
-	const session = await start({});
+	const session = await start(IMPLICIT_CWD);
 	const controller = new AbortController(); session.ctx.signal = controller.signal;
 	const append = session.pi.appendEntry.bind(session.pi);
 	session.pi.appendEntry = (kind: string, data: any) => {
@@ -256,7 +263,7 @@ test("post-commit cancellation retains the committed selection for later file gr
 }));
 
 test("holder loss during dynamic acquisition cannot revive implementation or saved authority", async () => fixture(async (root, start) => {
-	const session = await start({});
+	const session = await start(IMPLICIT_CWD);
 	let begun!: () => void, finish!: () => void;
 	const ready = new Promise<void>((resolve) => { begun = resolve; });
 	const gate = new Promise<void>((resolve) => { finish = resolve; });
@@ -276,7 +283,7 @@ test("holder loss during dynamic acquisition cannot revive implementation or sav
 }));
 
 test("shutdown drains an in-hook acquisition and leaves no owned scopes", async () => fixture(async (_root, start) => {
-	const session = await start({});
+	const session = await start(IMPLICIT_CWD);
 	let begun!: () => void, finish!: () => void;
 	const ready = new Promise<void>((resolve) => { begun = resolve; });
 	const gate = new Promise<void>((resolve) => { finish = resolve; });
@@ -292,7 +299,7 @@ test("shutdown drains an in-hook acquisition and leaves no owned scopes", async 
 }));
 
 test("reads, Bash, plan, conflict, and a disabled guard cannot add worktree leases", async () => fixture(async (root, start) => {
-	const holder = await start({});
+	const holder = await start(IMPLICIT_CWD);
 	const before = holder.acquired.length;
 	await holder.tool("read", { path: "api/new" });
 	await holder.tool("bash", { command: "touch api/new" });
@@ -300,7 +307,7 @@ test("reads, Bash, plan, conflict, and a disabled guard cannot add worktree leas
 	holder.setDisabled(true);
 	assert.equal((await holder.tool("write", { path: "api/new", content: "x" }))?.block, true);
 	assert.equal(holder.acquired.length, before);
-	const conflict = await start({});
+	const conflict = await start(IMPLICIT_CWD);
 	assert.equal((await conflict.tool("write", { path: "api/new", content: "x" }))?.block, true);
 	assert.deepEqual(conflict.controller.roots, []);
 	const plan = await start();
@@ -311,7 +318,7 @@ test("reads, Bash, plan, conflict, and a disabled guard cannot add worktree leas
 }));
 
 test("dynamic wrapper expansion enforces the combined 32-root limit before acquisition", async () => fixture(async (root, start) => {
-	const session = await start({});
+	const session = await start(IMPLICIT_CWD);
 	const calls = [];
 	for (let index = 0; index < 32; index++) {
 		const repo = join(root, `extra-${index}`); await mkdir(repo);
@@ -325,7 +332,7 @@ test("dynamic wrapper expansion enforces the combined 32-root limit before acqui
 }));
 
 test("post-acquisition revalidation blocks a retargeted symlink without acquiring its new owner", async () => fixture(async (root, start) => {
-	const session = await start({});
+	const session = await start(IMPLICIT_CWD);
 	const alias = join(root, "alias"); await symlink(join(root, "api"), alias);
 	session.setAcquireHook(async () => { await rm(alias); await symlink(join(root, "web"), alias); });
 	const result = await session.tool("write", { path: "alias/file", content: "x" });
@@ -475,12 +482,12 @@ test("plan supersedes an explicit worktree addition while origin resolution is p
 }));
 
 test("initial contention remains guarded with absent or malformed holder metadata", async () => fixture(async (root, start) => {
-	const holder = await start({});
+	const holder = await start(IMPLICIT_CWD);
 	const metadataPath = join(root, "runtime", `${lockIdentity(root)}.json`);
 	for (const metadata of [undefined, "not json", JSON.stringify({ pid: -1, sessionId: "untrusted-holder", root: "wrong-root" })]) {
 		if (metadata === undefined) await rm(metadataPath, { force: true });
 		else await writeFile(metadataPath, metadata);
-		const contender = await start({});
+		const contender = await start(IMPLICIT_CWD);
 		assert.equal(contender.controller.state, "implement-blocked");
 		assert.deepEqual(contender.controller.roots, []);
 		assert.equal(contender.pi.tools.includes("write"), false);
@@ -593,4 +600,115 @@ test("scoped startup and restoration remain guarded on invalid input or changed 
 	assert.deepEqual(scoped.controller.roots, [join(root, "web")]);
 	assert.equal(scoped.pi.entries.at(-2).data.mode, "plan");
 	assert.equal(scoped.pi.entries.at(-1).data.version, 2);
+}));
+
+test("lazy workspace-root sessions take only their write target's member root and stay lazy on contention", async () => fixture(async (root, start) => {
+	const a = await start({}), b = await start({}), c = await start({});
+	for (const session of [a, b, c]) {
+		assert.equal(session.controller.state, "lazy");
+		assert.deepEqual(session.acquired, []);
+		assert.deepEqual(session.pi.entries, [], "a fresh lazy default is not checkpointed");
+		assert.equal(session.pi.tools.includes("write"), true);
+		assert.equal(session.statuses.get("session-mode"), "lazy");
+	}
+	assert.equal(await a.tool("write", { path: "api/new", content: "x" }), undefined);
+	assert.equal(await b.tool("edit", { path: "web/file", edits: [{ oldText: "a", newText: "b" }] }), undefined);
+	assert.deepEqual(a.controller.roots, [join(root, "api")]);
+	assert.deepEqual(b.controller.roots, [join(root, "web")]);
+	assert.equal(a.controller.state, "implement");
+	assert.deepEqual(a.pi.entries.at(-1).data.scope, { kind: "roots", roots: [join(root, "api")], originCwd: root });
+	const blocked = await c.tool("write", { path: "api/other", content: "y" });
+	assert.equal(blocked?.block, true);
+	assert.match(blocked.reason, /held by another live session/);
+	assert.match(blocked.reason, /remains lazy/);
+	assert.equal(c.controller.state, "lazy");
+	assert.deepEqual(c.controller.roots, []);
+	assert.deepEqual(c.pi.entries, []);
+	assert.equal(await c.tool("write", { path: "root-file", content: "z" }), undefined, "root files still take the root lease");
+	assert.deepEqual(c.controller.roots, [root]);
+	assert.equal((await a.tool("write", { path: "root-file", content: "z" }))?.block, true);
+	assert.deepEqual(a.controller.roots, [join(root, "api")], "existing scopes are retained after root contention");
+}));
+
+test("lazy wrappers acquire every missing member atomically or nothing", async () => fixture(async (root, start) => {
+	const holder = await start(); await holder.command("implement", "web");
+	const session = await start({});
+	const input = (paths: string[]) => ({ tool_uses: paths.map((path) => ({ recipient_name: "functions.write", parameters: { path, content: "x" } })) });
+	const blocked = await session.tool("multi_tool_use.parallel", input(["api/new", "web/new"]));
+	assert.equal(blocked?.block, true);
+	assert.deepEqual(session.controller.roots, []);
+	assert.equal(session.controller.state, "lazy");
+	const free = await acquireWorktreeLease(join(root, "api"), { runtimeDir: join(root, "runtime") });
+	try { assert.equal(free.kind, "held", "the rolled-back member is free"); }
+	finally { if (free.kind === "held") await free.release(); }
+	await holder.command("plan");
+	assert.equal(await session.tool("multi_tool_use.parallel", input(["api/new", "web/new"])), undefined);
+	assert.deepEqual(session.controller.roots, [join(root, "api"), join(root, "web")]);
+}));
+
+test("shell-first work stays guarded in lazy mode until a worktree is actually held", async () => fixture(async (_root, start) => {
+	const session = await start({});
+	for (const command of ["git commit -m nope", "touch api/x", "npm install left-pad"]) {
+		assert.equal((await session.tool("bash", { command }))?.block, true, command);
+	}
+	assert.equal(await session.tool("bash", { command: "git status" }), undefined);
+	assert.equal((await session.tool("subagent", { agent: "worker", task: "edit" }))?.block, true);
+	assert.deepEqual(session.acquired, [], "shell and subagent requests never acquire leases");
+	const prompt = await session.pi.handlers.get("before_agent_start")?.({ systemPrompt: "base" }, session.ctx);
+	assert.match(prompt.systemPrompt, /Lazy implementation: no worktree lease is held/);
+	assert.match(prompt.systemPrompt, /\/implement <root>/);
+	await session.command("implement", "api");
+	assert.equal(session.controller.state, "implement");
+	assert.equal(await session.tool("bash", { command: "git commit -m allowed" }), undefined);
+}));
+
+test("release_scopes returns completed member roots to lazy so another session can take them", async () => fixture(async (root, start) => {
+	const a = await start({}), b = await start({});
+	assert.equal(await a.tool("write", { path: "api/new", content: "x" }), undefined);
+	const blocked = await b.tool("write", { path: "api/new", content: "y" });
+	assert.equal(blocked?.block, true);
+	const released = await a.release();
+	assert.deepEqual(released, { status: "released", released: [join(root, "api")], dirty: [], files: [], checkpoint: "saved" });
+	assert.equal(a.controller.state, "lazy");
+	assert.deepEqual(a.controller.roots, []);
+	assert.deepEqual(a.pi.entries.at(-1).data, { version: 4, mode: "implement", scope: { kind: "lazy", originCwd: root } });
+	const lazyEntries = structuredClone(a.pi.entries);
+	assert.equal(await b.tool("write", { path: "api/new", content: "y" }), undefined);
+	assert.deepEqual(b.controller.roots, [join(root, "api")]);
+	const again = await a.tool("write", { path: "api/next", content: "z" });
+	assert.equal(again?.block, true);
+	assert.equal(a.controller.state, "lazy");
+	assert.equal(await a.tool("write", { path: "web/next", content: "z" }), undefined, "the next bead can take a different member");
+	const restored = await start({}, lazyEntries);
+	assert.equal(restored.controller.state, "lazy", "a restored lazy checkpoint holds no worktree");
+	assert.deepEqual(restored.acquired, []);
+}));
+
+test("lazy intent composes with exact-file grants across release and restoration", async () => fixture(async (root, start) => {
+	const file = join(dirname(root), `${basename(root)}-lazy-config.json`);
+	const session = await start({});
+	await session.command("grant-file", JSON.stringify(file));
+	assert.equal(session.controller.state, "lazy");
+	assert.deepEqual(session.controller.files, [file]);
+	assert.deepEqual(session.pi.entries.at(-1).data, { version: 4, mode: "implement", scope: { kind: "lazy", originCwd: root }, files: [file] });
+	assert.equal(await session.tool("write", { path: file, content: "{}" }), undefined);
+	assert.deepEqual(session.controller.roots, [], "a granted file needs no worktree");
+	assert.equal((await session.tool("bash", { command: "touch /tmp/outside" }))?.block, true);
+	assert.equal(await session.tool("write", { path: "api/new", content: "x" }), undefined);
+	assert.deepEqual(session.controller.roots, [join(root, "api")]);
+	assert.equal(session.pi.entries.at(-1).data.version, 3);
+	await session.release();
+	assert.deepEqual(session.controller.files, [file], "release keeps exact-file grants");
+	assert.equal(session.controller.state, "lazy");
+	const entries = structuredClone(session.pi.entries);
+	await session.pi.handlers.get("session_shutdown")?.({}, session.ctx);
+	const restored = await start({}, entries);
+	assert.equal(restored.controller.state, "lazy");
+	assert.deepEqual(restored.controller.files, [file]);
+	assert.deepEqual(restored.controller.roots, []);
+	assert.equal(restored.confirmations.length, 0);
+	await restored.command("lazy");
+	assert.deepEqual(restored.controller.files, [file], "/lazy keeps grants while /plan clears them");
+	await restored.command("plan");
+	assert.deepEqual(restored.controller.files, []);
 }));

@@ -114,6 +114,18 @@ export class LeaseSet {
 		return this.#drain;
 	}
 
+	/** Release every worktree lease, keep exact-file leases, and invalidate pending operations and preflights. */
+	releaseWorktrees(): Promise<void> {
+		this.#epoch++;
+		this.#revision++;
+		const pending = this.#operation;
+		pending?.controller.abort();
+		const roots = [...this.#roots.values()];
+		this.#roots.clear();
+		this.#drain = Promise.all([this.#drain, ...roots.map((lease) => this.release(lease)), pending?.promise]).then(() => undefined);
+		return this.#drain;
+	}
+
 	private lose(): void {
 		if (this.#lost) return;
 		this.#lost = true;
