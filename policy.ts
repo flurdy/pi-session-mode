@@ -47,6 +47,9 @@ const PANEL_SCRIPTS = new Set(["review-panel.sh", "openrouter-panel.sh", "review
 const PANEL_BLOCK_REASON = "Guarded session: caller-file second-opinion panels are unsupported. Use the installed review-panel-stdin.py helper through its documented literal JSON pipe; it owns private scratch files without source leases. Panel selection and billing consent remain separate.";
 // One fixed shell shape, not a general shell-path or /tmp-write exception.
 const PRIVATE_PANEL_PIPE = /^printf '%s' '[^'\x00]*' \| python3 ~\/\.agents\/skills\/second-opinion\/scripts\/review-panel-stdin\.py$/;
+// One fixed helper shape; the helper owns target, owner-key, hash and state validation.
+const RELEASE_STATE_UPDATE = /^~\/\.agents\/skills\/release-manager\/scripts\/release-state update --owner (?:manager|maintenance) --expect (?:[0-9a-f]{64}|missing) --patch '[^'\x00-\x1f\x7f]*'$/;
+const RELEASE_STATE_REASON = "Guarded session: release-state updates are eligible only as the exact documented command `~/.agents/skills/release-manager/scripts/release-state update --owner <manager|maintenance> --expect <sha256|missing> --patch '<literal JSON>'`. Encode apostrophes in JSON values as \\u0027; no environment prefixes, interpreters, alternate paths, option forms, extra arguments, chains or redirects. Release bookkeeping needs no source lease or /implement.";
 const IN_PLACE_MUTATION = /\b(?:sed\s+(?:-[A-Za-z]*i[A-Za-z]*\b|--in-place\b)|perl\s+-[A-Za-z]*p?i[A-Za-z]*\b|tar\s+[^\n;&|]*-[A-Za-z]*x|unzip\b|vim?\b|nano\b|emacs\b|subl\b|code\s+[^\n;&|]*--wait\b)/i;
 const PACKAGE_MUTATION =
 	/\b(?:npm\s+(?:install|uninstall|update|ci|link|publish)|yarn\s+(?:add|remove|install|publish)|pnpm\s+(?:add|remove|install|update|publish)|pipx?\s+(?:install|uninstall)|cargo\s+(?:add|remove|install|uninstall|update|publish)|go\s+(?:get|install)|go\s+mod\s+(?:download|edit|init|tidy|vendor)|bundle\s+(?:install|update)|gem\s+(?:install|uninstall|update)|composer\s+(?:install|update|require|remove)|apt(?:-get)?\s+(?:install|remove|purge|update|upgrade)|brew\s+(?:install|uninstall|upgrade))\b/i;
@@ -159,10 +162,11 @@ export function guardedToolBlockReason(
 	if (toolName === "bash") {
 		const command = isRecord(input) ? input.command : undefined;
 		if (typeof command !== "string") return undefined;
-		if (PRIVATE_PANEL_PIPE.test(command)) return undefined;
+		if (PRIVATE_PANEL_PIPE.test(command) || RELEASE_STATE_UPDATE.test(command)) return undefined;
 		if (hasCommand(command, isPanelCommand)) return PANEL_BLOCK_REASON;
 		if (hasCommand(command, isMakePushCommand)) return MAKE_PUSH_REASON;
-		return isObviousMutation(command) ? GUARDED_MUTATION_REASON : undefined;
+		if (!isObviousMutation(command)) return undefined;
+		return hasCommand(command, isReleaseStateUpdate) ? RELEASE_STATE_REASON : GUARDED_MUTATION_REASON;
 	}
 	if (toolName === "subagent") return subagentBlockReason(input, options);
 	if (toolName === "subagent_supervisor") {
@@ -341,6 +345,10 @@ function isPanelCommand(words: string[]): boolean {
 		return PANEL_SCRIPTS.has(executable);
 	}
 	return false;
+}
+
+function isReleaseStateUpdate(words: string[]): boolean {
+	return words.some((word, index) => word.split("/").at(-1) === "release-state" && words[index + 1] === "update");
 }
 
 function invokedCommand(words: string[]): { executable: string; args: string[] } | undefined {

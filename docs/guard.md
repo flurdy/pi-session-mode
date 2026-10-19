@@ -86,6 +86,28 @@ and recognizable `make`/`gmake` push targets, whose recipes publish whatever tip
 when they run. Do not request `/implement` scopes to publish. See
 [attended commit publication](publication.md).
 
+## Release-state bookkeeping
+
+Release bookkeeping is not a source edit. The release-manager `release-state` helper writes only
+its project's ignored `.release-state.json` and owns target, hash, owner-key and malformed-state
+validation. Its `read` and publication-record verbs pass the bounded Bash check unchanged.
+`update` names its `--patch` option, which that check reads as the `patch` utility, so guarded
+sessions add one exception for this fixed shape:
+
+```bash
+~/.agents/skills/release-manager/scripts/release-state update --owner <manager|maintenance> --expect <sha256|missing> --patch '<literal JSON>'
+```
+
+The patch is one single-quoted literal without ASCII control characters; encode apostrophes in
+JSON values as `\u0027`. Other `update` forms gain no exception. When the bounded check blocks one,
+for example with an environment prefix, interpreter, alternate or absolute path, option form,
+extra argument, chain, redirect or shell wrapper, its reason names this shape instead of the
+generic message. The exception does not make the bounded check complete.
+
+No source lease, `/implement`, exact-file grant or native write is involved. This is trusted
+installed-helper execution, not digest-verified code or shell isolation, and it grants no
+publication: `publish_commit` keeps its own fresh confirmation.
+
 ## Read-only second opinions
 
 Direct read-only second-opinion routes do not require a source lease. Eligibility is not proof

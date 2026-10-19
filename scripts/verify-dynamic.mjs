@@ -31,6 +31,7 @@ const reviewerDispatched = join(base, "reviewer-dispatched");
 if (stdinHelper) {
 	await writeFile(join(bin, "claude"), `#!/bin/sh\ncat >/dev/null\nprintf fixture > '${reviewerDispatched}'\nprintf 'offline panel fixture review'\n`, { mode: 0o700 });
 }
+const releaseStateHelper = process.env.RELEASE_STATE_HELPER;
 const panelDispatched = join(base, "panel-dispatched");
 const panelArtifacts = join(base, "panel-artifacts");
 await mkdir(panelArtifacts);
@@ -122,6 +123,11 @@ async function launch(name, flags = []) {
 			fixture: { quorum: 1, routes: [{ id: "claude", kind: "local", agent: "claude", role: "offline fixture" }],
 				limits: { maxParallel: 1, maxPromptBytes: 65536, maxOutputTokensPerModel: 2000, defaultTimeoutSeconds: 10 } },
 		} }));
+	}
+	if (releaseStateHelper) {
+		const scripts = join(handoffHome ?? agent, ".agents/skills/release-manager/scripts");
+		await mkdir(scripts, { recursive: true });
+		await writeFile(join(scripts, "release-state"), await readFile(releaseStateHelper), { mode: 0o700 });
 	}
 	await writeFile(join(agent, "settings.json"), JSON.stringify({ defaultProjectTrust: "never", enableInstallTelemetry: false }));
 	const client = new Client(agent, flags); clients.push(client);
@@ -267,6 +273,39 @@ try {
 		await first.roots([]);
 		console.log("Private panel RPC PASS: actual native Bash dispatch in plan mode, real stdin transport/coordinator with stub reviewer, check/run/evaluate, input rejection, scratch cleanup, no source leases or provider requests.");
 	} else console.log("Private panel RPC SKIP: set PANEL_STDIN_HELPER for cross-repository transport coverage.");
+	if (releaseStateHelper) {
+		await writeFile(join(work, ".gitignore"), ".release-state.json\n");
+		const statePath = join(work, ".release-state.json");
+		const releaseState = (args) => ({ name: "bash", arguments: { command: `~/.agents/skills/release-manager/scripts/release-state ${args}` } });
+		const initial = receipt((await first.turn("release-state-read", [releaseState("read")]))[0]);
+		assert.equal(initial.sha256, "missing");
+		const manager = receipt((await first.turn("release-state-manager", [releaseState(`update --owner manager --expect missing --patch '{"quietStreak":1,"deferred":{"admin":{"note":"it\\u0027s rm and git push text"}}}'`)]))[0]);
+		const maintenance = receipt((await first.turn("release-state-maintenance", [releaseState(`update --owner maintenance --expect ${manager.sha256} --patch '{"restartPending":{"admin":true}}'`)]))[0]);
+		const saved = await readFile(statePath, "utf8");
+		assert.deepEqual(JSON.parse(saved), { deferred: { admin: { note: "it's rm and git push text" } }, quietStreak: 1, restartPending: { admin: true } });
+		assert.equal(maintenance.sha256, createHash("sha256").update(saved).digest("hex"));
+		for (const [label, args, reason] of [
+			["stale", `update --owner manager --expect ${manager.sha256} --patch '{"quietStreak":2}'`, /\\"status\\": \\"conflict\\"/],
+			["foreign-key", `update --owner manager --expect ${maintenance.sha256} --patch '{"configApply":{}}'`, /manager may not patch: configApply/],
+		]) {
+			const refused = await first.turn(`release-state-${label}`, [releaseState(args)]);
+			assert.equal(refused[0].isError, true);
+			assert.match(JSON.stringify(refused[0].result), reason);
+		}
+		const exact = `update --owner manager --expect ${maintenance.sha256} --patch '{"quietStreak":3}'`;
+		for (const [index, command] of [
+			`env ~/.agents/skills/release-manager/scripts/release-state ${exact}`,
+			`~/.agents/skills/release-manager/scripts/release-state ${exact}; touch repos/api/release-shell`,
+		].entries()) {
+			const denied = await first.turn(`release-state-denied-${index}`, [{ name: "bash", arguments: { command } }]);
+			assert.equal(denied[0].isError, true);
+			assert.match(JSON.stringify(denied[0].result), /release-state updates are eligible only/);
+		}
+		assert.equal(await readFile(statePath, "utf8"), saved);
+		await absent(join(repos.api, "release-shell"));
+		await first.roots([]);
+		console.log("Release-state RPC PASS: actual native Bash in plan mode, real helper read plus manager and maintenance updates on an ignored fixture state file, helper conflict/owner refusals, non-exact shapes refused before dispatch, no source leases.");
+	} else console.log("Release-state RPC SKIP: set RELEASE_STATE_HELPER for cross-repository bookkeeping coverage.");
 	for (const [index, command] of ["make beads-sync", "project-workspace beads-sync --workspace ."].entries()) {
 		const denied = await first.turn(`sync-denied-${index}`, [{ name: "bash", arguments: { command } }]);
 		assert.equal(denied.length, 1); assert.equal(denied[0].isError, true);
