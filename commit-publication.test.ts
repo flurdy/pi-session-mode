@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import test from "node:test";
 import {
 	executePublication,
@@ -225,8 +225,10 @@ class FakePi {
 	async emit(name: string, ctx: unknown): Promise<void> { for (const handler of this.handlers.get(name) ?? []) await handler({}, ctx); }
 }
 
-function uiContext(confirm: (title: string, message: string) => Promise<boolean>, mode = "tui", session = "session-1") {
-	return { mode, hasUI: mode === "tui", sessionManager: { getSessionId: () => session }, ui: { confirm: (title: string, message: string) => confirm(title, message) } };
+type Dialog = (title: string, options: string[], opts?: { timeout?: number; signal?: AbortSignal }) => Promise<string | undefined>;
+
+function uiContext(select: Dialog, mode = "tui", session = "session-1") {
+	return { mode, hasUI: mode === "tui", sessionManager: { getSessionId: () => session }, ui: { select } };
 }
 
 async function registered(options: { now?: () => number; occupancy?: string } = {}) {
@@ -239,46 +241,57 @@ async function registered(options: { now?: () => number; occupancy?: string } = 
 	return { pi, tool: pi.tools.get("publish_commit")! };
 }
 
-test("publish_commit confirms natively, returns a single-use token and executes once", () => fixture(async ({ work, remote, commit }) => {
+test("publish_commit asks one native push/defer/cancel question, returns a single-use token for push and executes once", () => fixture(async ({ work, remote, commit }) => {
 	const tip = commit("tool candidate");
-	const { pi, tool } = await registered({ occupancy: "held" });
-	const prompts: string[] = [];
-	const ctx = uiContext(async (_title, message) => { prompts.push(message); return true; });
+	let clock = 1_000;
+	const { pi, tool } = await registered({ occupancy: "held", now: () => clock });
+	const prompts: Array<{ title: string; options: string[]; opts?: { timeout?: number; signal?: AbortSignal } }> = [];
+	const ctx = uiContext(async (title, options, opts) => { prompts.push({ title, options, opts }); return "push"; });
 	await pi.emit("session_start", ctx);
 	const confirmed = await tool.execute("c1", { action: "confirm", root: work, commit: tip.slice(0, 8), context: "release-manager: READY\u0007" }, undefined, undefined, ctx);
 	assert.equal(confirmed.details.status, "confirmed");
 	assert.match(confirmed.details.token, /^[0-9a-f]{32}$/);
 	assert.equal(prompts.length, 1);
-	for (const fragment of [tip, "main", "refs/heads/main", remote, "Caller context (unverified)", "\\u0007", "held by another local Pi session", "does not take"]) {
-		assert.ok(prompts[0]!.includes(fragment), `confirmation lacks ${fragment}`);
+	const [dialog] = prompts;
+	assert.deepEqual(dialog!.options, ["defer", "push", "cancel", "why?"], "defer leads so an accidental Enter publishes nothing");
+	assert.equal(dialog!.opts?.timeout, undefined, "the dialog waits for an answer instead of timing out");
+	assert.ok(dialog!.opts?.signal instanceof AbortSignal, "cancellation still closes the dialog");
+	assert.ok(dialog!.title.startsWith(`Publish ${basename(work)} main \u2192 origin?\n`), dialog!.title);
+	for (const fragment of [tip, "refs/heads/main", remote, "Caller context (unverified)", "\\u0007", "held by another local Pi session", "does not take", "defer, cancel and why? publish nothing"]) {
+		assert.ok(dialog!.title.includes(fragment), `dialog lacks ${fragment}`);
 	}
+	clock += 170_000;
 	const published = await tool.execute("e1", { action: "execute", token: confirmed.details.token }, undefined, undefined, ctx);
 	assert.equal(published.details.status, "ok");
 	assert.equal(git(remote, "rev-parse", "refs/heads/main"), tip);
 	await assert.rejects(tool.execute("e2", { action: "execute", token: confirmed.details.token }, undefined, undefined, ctx), /unknown, used or expired/);
 }));
 
-test("publish_commit declines, denies headless use and invalidates tokens on expiry or session change", () => fixture(async ({ work, remote, commit }) => {
+test("publish_commit authorizes nothing for defer, cancel, why? or Esc, denies headless use and invalidates tokens on expiry or session change", () => fixture(async ({ work, remote, commit }) => {
 	const before = git(remote, "rev-parse", "refs/heads/main");
 	const tip = commit("guarded");
 	let clock = 1_000;
 	const { pi, tool } = await registered({ now: () => clock });
-	const ctx = uiContext(async () => false);
+	let choice: string | undefined;
+	const ctx = uiContext(async () => choice);
 	await pi.emit("session_start", ctx);
-	const declined = await tool.execute("c", { action: "confirm", root: work, commit: tip }, undefined, undefined, ctx);
-	assert.equal(declined.details.status, "declined");
-	assert.equal(declined.details.token, undefined);
-	await assert.rejects(tool.execute("r", { action: "confirm", root: work, commit: tip }, undefined, undefined, uiContext(async () => true, "rpc")), /interactive TUI/);
+	for (const [answer, status] of [["defer", "deferred"], ["cancel", "cancelled"], ["why?", "why"], [undefined, "dismissed"], ["Yes", "dismissed"]] as const) {
+		choice = answer;
+		const unauthorized = await tool.execute("c", { action: "confirm", root: work, commit: tip }, undefined, undefined, ctx);
+		assert.equal(unauthorized.details.status, status, String(answer));
+		assert.equal(unauthorized.details.token, undefined, String(answer));
+	}
+	await assert.rejects(tool.execute("r", { action: "confirm", root: work, commit: tip }, undefined, undefined, uiContext(async () => "push", "rpc")), /interactive TUI/);
 	await assert.rejects(tool.execute("m", { action: "execute", root: work, token: "0".repeat(32) }, undefined, undefined, ctx), /only a token/);
-	const approve = uiContext(async () => true);
+	const approve = uiContext(async () => "push");
 	const expired = await tool.execute("c2", { action: "confirm", root: work, commit: tip }, undefined, undefined, approve);
-	clock += 121_000;
+	clock += 301_000;
 	await assert.rejects(tool.execute("x", { action: "execute", token: expired.details.token }, undefined, undefined, approve), /unknown, used or expired/);
 	const replaced = await tool.execute("c3", { action: "confirm", root: work, commit: tip }, undefined, undefined, approve);
 	await pi.emit("session_start", approve);
 	await assert.rejects(tool.execute("y", { action: "execute", token: replaced.details.token }, undefined, undefined, approve), /unknown, used or expired/);
 	const other = await tool.execute("c4", { action: "confirm", root: work, commit: tip }, undefined, undefined, approve);
-	await assert.rejects(tool.execute("z", { action: "execute", token: other.details.token }, undefined, undefined, uiContext(async () => true, "tui", "session-2")), /session/);
+	await assert.rejects(tool.execute("z", { action: "execute", token: other.details.token }, undefined, undefined, uiContext(async () => "push", "tui", "session-2")), /session/);
 	assert.equal(git(remote, "rev-parse", "refs/heads/main"), before);
 }));
 
@@ -288,15 +301,15 @@ test("publish_commit allows one operation at a time and drains an in-flight push
 	await chmod(join(work, ".git", "hooks", "pre-push"), 0o755);
 	const tip = commit("serial");
 	const { pi, tool } = await registered();
-	let release!: (value: boolean) => void;
+	let release!: (value: string) => void;
 	let opened!: () => void;
 	const dialog = new Promise<void>((done) => { opened = done; });
-	const ctx = uiContext(() => new Promise<boolean>((done) => { release = done; opened(); }));
+	const ctx = uiContext(() => new Promise<string>((done) => { release = done; opened(); }));
 	await pi.emit("session_start", ctx);
 	const first = tool.execute("c1", { action: "confirm", root: work, commit: tip }, undefined, undefined, ctx);
 	await dialog;
 	await assert.rejects(tool.execute("c2", { action: "confirm", root: work, commit: tip }, undefined, undefined, ctx), /already running/);
-	release(true);
+	release("push");
 	const token = (await first).details.token;
 	const running = tool.execute("e", { action: "execute", token }, undefined, undefined, ctx);
 	await new Promise((done) => setTimeout(done, 600));

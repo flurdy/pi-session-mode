@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { access, realpath } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { Type } from "typebox";
 import { probeWorktreeLeaseOccupancies, type WorktreeLeaseOccupancy } from "./lease-observer.ts";
 import { safeDisplay } from "./scope.ts";
@@ -18,8 +18,11 @@ const MAX_LISTED_COMMITS = 20;
 const MAX_OUTPUT_BYTES = 1024 * 1024;
 const PREFLIGHT_TIMEOUT_MS = 10_000;
 const DEFAULT_PUSH_TIMEOUT_MS = 120_000;
-const CONFIRM_TIMEOUT_MS = 60_000;
-const TOKEN_TTL_MS = 120_000;
+/** Long enough for the calling skill's bounded readiness recheck between confirm and execute. */
+const TOKEN_TTL_MS = 300_000;
+/** Fixed native choices; `defer` leads so an accidental Enter publishes nothing. */
+const CHOICES = ["defer", "push", "cancel", "why?"] as const;
+const ANSWERS = new Map<string, Exclude<PublicationAnswer, "confirmed">>([["defer", "deferred"], ["cancel", "cancelled"], ["why?", "why"]]);
 const BATCH_SSH = "ssh -o BatchMode=yes -o ConnectTimeout=10";
 const OVERRIDDEN_GIT_ENV = /^GIT_(?:DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|COMMON_DIR|NAMESPACE|CEILING_DIRECTORIES|DISCOVERY_ACROSS_FILESYSTEM|EXEC_PATH|CONFIG(?:_|$))/;
 
@@ -49,6 +52,8 @@ export interface PreparedPublication {
 	};
 }
 export type PublicationStatus = "ok" | "uptodate" | "rejected" | "failed" | "stale" | "unknown";
+/** Outcome of the native dialog; only `confirmed` carries a token. `dismissed` covers Esc and unknown answers. */
+export type PublicationAnswer = "confirmed" | "deferred" | "cancelled" | "why" | "dismissed";
 export interface PublicationReceipt extends Omit<PublicationIdentity, "trackingCommit"> {
 	schemaVersion: "commit-publication/v1";
 	status: PublicationStatus;
@@ -338,9 +343,10 @@ function occupancyLine(observations: WorktreeLeaseOccupancy[]): string {
 	return `Writer lease: ${state} (advisory; this publication does not take or need a source lease)`;
 }
 
-function confirmation(prepared: PreparedPublication, occupancy: string): string {
+function dialog(prepared: PreparedPublication, occupancy: string): string {
 	const { identity, display } = prepared;
 	const lines = [
+		`Publish ${safeDisplay(basename(identity.root))} ${safeDisplay(identity.branch)} → ${identity.remote}?`,
 		`Worktree: ${safeDisplay(JSON.stringify(identity.root))}`,
 		`Branch: ${safeDisplay(identity.branch)}`,
 		`Commit: ${identity.commit}`,
@@ -353,7 +359,7 @@ function confirmation(prepared: PreparedPublication, occupancy: string): string 
 		occupancy,
 		...(display.context !== undefined ? [`Caller context (unverified): ${display.context}`] : []),
 		"",
-		"Publishing makes this exact commit visible remotely and may trigger CI or deployment. Non-force, no tags, no retry. Execution rechecks every value above and refuses on drift.",
+		"push makes this exact commit visible remotely and may trigger CI or deployment: non-force, no tags, no retry; execution rechecks every value above and refuses on drift. defer, cancel and why? publish nothing.",
 	];
 	return lines.join("\n").slice(0, 10_000);
 }
@@ -412,10 +418,10 @@ export function registerCommitPublication(pi: ExtensionAPI, dependencies: Public
 	pi.registerTool({
 		name: "publish_commit",
 		label: "Publish commit",
-		description: "Attended, exact-commit Git publication without a source-writer lease. action=confirm checks one canonical worktree's checked-out branch, same-name upstream, single push URL and fast-forward candidate, then asks a fresh native TUI confirmation and returns a single-use token valid for two minutes in this session. action=execute takes only that token, rechecks everything and pushes that commit to its same-name branch: non-force, no tags, no retry. Returns a commit-publication/v1 receipt: ok, uptodate, rejected, failed, stale or unknown.",
+		description: "Attended, exact-commit Git publication without a source-writer lease. action=confirm checks one canonical worktree's checked-out branch, same-name upstream, single push URL and fast-forward candidate, then asks one native TUI question with the fixed choices defer, push, cancel and why?. It waits for the answer; only push returns a single-use token valid for five minutes in this session, the others return deferred, cancelled, why or dismissed. action=execute takes only that token, rechecks everything and pushes that commit to its same-name branch: non-force, no tags, no retry. Returns a commit-publication/v1 receipt: ok, uptodate, rejected, failed, stale or unknown.",
 		promptSnippet: "Publish one exact, freshly confirmed commit without a source lease",
 		promptGuidelines: [
-			"Use publish_commit only for an attended release step the user is approving now. Never treat READY status, silence, an earlier approval or a scheduled tick as confirmation.",
+			"Use publish_commit only for an attended release step. Its native dialog is the user's answer: do not ask a separate push question first, and never treat READY status, silence, an earlier chat answer or a scheduled tick as confirmation.",
 			"Recollect readiness after a confirm result and before execute; if evidence changed, do not execute the token.",
 			"Never retry rejected, failed, stale or unknown receipts automatically, and never fall back to Bash git push or make recipes when the tool refuses.",
 		],
@@ -454,11 +460,13 @@ export function registerCommitPublication(pi: ExtensionAPI, dependencies: Public
 				const prepared = await preparePublication(request, dependencies, combined);
 				const occupancy = await observe(prepared.identity.root).catch(() => [] as WorktreeLeaseOccupancy[]);
 				combined.throwIfAborted();
-				const approved = await ctx.ui.confirm("Publish commit?", confirmation(prepared, occupancyLine(occupancy)), { timeout: CONFIRM_TIMEOUT_MS, signal: combined });
+				// No timeout: an attended release waits for its answer; only cancellation closes the dialog, and that authorizes nothing.
+				const choice = await ctx.ui.select(dialog(prepared, occupancyLine(occupancy)), [...CHOICES], { signal: combined });
 				if (session !== active || combined.aborted) throw new Error("Publication session changed during confirmation; nothing was authorized");
 				const { trackingCommit: _tracking, ...identity } = prepared.identity;
 				const advisory = occupancy.length === 1 ? occupancy[0]!.kind : "unavailable";
-				if (!approved) return result({ status: "declined", ...identity, occupancy: advisory });
+				const answer: PublicationAnswer = choice === "push" ? "confirmed" : ANSWERS.get(choice ?? "") ?? "dismissed";
+				if (answer !== "confirmed") return result({ status: answer, ...identity, occupancy: advisory });
 				const token = randomBytes(16).toString("hex");
 				const expiresAt = now() + TOKEN_TTL_MS;
 				tokens.set(token, { sessionId: active.id, request, prepared, expiresAt });
