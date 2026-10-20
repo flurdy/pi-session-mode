@@ -10,7 +10,9 @@ import { acquireFileLease } from "./lease.ts";
 import { safeDisplay } from "./scope.ts";
 
 const MAX_BYTES = 65_536;
-const HELPER_SHA256 = "b7cea5b712f0d7ecf1824471200752d70b30ad4d8ba5fa6a49980d08506ba145";
+const HELPER_SHA256 = "776cdd5663a0b8af563b7e86c0285ae39ed553f5cae0306a0c7aa16bcd601750";
+const STORAGE_PARENT = ".agents";
+const LEGACY_STORAGE = join(".claude", "handoffs");
 const SHA256 = /^[0-9a-f]{64}$/;
 const SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 export interface HandoffRequest { date: string; time: string; slug: string; content: string; overwriteSha256?: string }
@@ -46,7 +48,7 @@ async function assertHandoffDirectory(directory: string, home: string, signal?: 
 		signal?.throwIfAborted();
 		if (basename(directory) === ".git") throw new Error("Handoff directory overlaps Git administration");
 		for (const marker of [".git", "HEAD", "objects", "refs"]) {
-			if (marker === ".git" && (directory === home || directory === join(home, ".claude"))) continue;
+			if (marker === ".git" && (directory === home || directory === join(home, STORAGE_PARENT))) continue;
 			try { await lstat(join(directory, marker)); }
 			catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
 			throw new Error("Handoff directory overlaps Git administration or an unsupported repository");
@@ -57,21 +59,36 @@ async function assertHandoffDirectory(directory: string, home: string, signal?: 
 	}
 }
 
+async function assertCanonicalDirectory(path: string): Promise<void> {
+	let info;
+	try { info = await lstat(path); }
+	catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error("Handoff directory unavailable"); throw error; }
+	if (!info.isDirectory() || info.isSymbolicLink() || await realpath(path) !== path) throw new Error("Handoff directory must be canonical and not symlinked");
+}
+
+async function assertMigrated(home: string): Promise<void> {
+	// Hard cutover: while the retired location exists no handoff is written anywhere,
+	// so an unmigrated machine fails visibly instead of splitting the store.
+	try { await lstat(join(home, LEGACY_STORAGE)); }
+	catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+	throw new Error(`Handoff storage migration-required: ~/${LEGACY_STORAGE} still exists; complete the approved move to ~/${STORAGE_PARENT}/handoffs before saving`);
+}
+
 async function directory(home: string, signal?: AbortSignal): Promise<string> {
-	let parent = await realpath(home);
-	if (parent !== home) throw new Error("Handoff home identity changed");
-	for (const name of [".claude", "handoffs"]) {
-		signal?.throwIfAborted();
-		await assertHandoffDirectory(parent, home, signal);
-		const next = join(parent, name);
-		try { await mkdir(next, { mode: 0o700 }); }
-		catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw new Error("Handoff directory unavailable"); }
-		const info = await lstat(next);
-		if (!info.isDirectory() || info.isSymbolicLink() || await realpath(next) !== next) throw new Error("Handoff directory must be canonical and not symlinked");
-		parent = next;
-	}
+	if (await realpath(home) !== home) throw new Error("Handoff home identity changed");
+	await assertMigrated(home);
+	await assertHandoffDirectory(home, home, signal);
+	// ~/.agents already holds the reviewed helper; only the handoffs directory itself may be created.
+	const parent = join(home, STORAGE_PARENT);
+	await assertCanonicalDirectory(parent);
 	await assertHandoffDirectory(parent, home, signal);
-	return parent;
+	signal?.throwIfAborted();
+	const folder = join(parent, "handoffs");
+	try { await mkdir(folder, { mode: 0o700 }); }
+	catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw new Error("Handoff directory unavailable"); }
+	await assertCanonicalDirectory(folder);
+	await assertHandoffDirectory(folder, home, signal);
+	return folder;
 }
 
 async function targetBytes(path: string): Promise<Buffer> {
@@ -192,7 +209,7 @@ export function registerHandoffSave(pi: ExtensionAPI, save = createHandoffSaver(
 	pi.registerTool({
 		name: "save_handoff",
 		label: "Save handoff",
-		description: "Save the rendered wrap-up resume block to the fixed ~/.claude/handoffs location. Available in every guard state without /implement or /grant-file. New files auto-save; collisions never overwrite. overwriteSha256 requests a fresh native TUI confirmation, not automatic approval. Returns a verified wrap-up-save/v1 receipt; no caller-selected paths, commands or environment. Requires the reviewed installed wrap-up helper and Python 3.10+.",
+		description: "Save the rendered wrap-up resume block to the fixed ~/.agents/handoffs location. Available in every guard state without /implement or /grant-file. New files auto-save; collisions never overwrite. overwriteSha256 requests a fresh native TUI confirmation, not automatic approval. Returns a verified wrap-up-save/v1 receipt; no caller-selected paths, commands or environment. Requires the reviewed installed wrap-up helper and Python 3.10+.",
 		parameters: Type.Object({
 			date: Type.String({ pattern: "^\\d{4}-\\d{2}-\\d{2}$" }),
 			time: Type.String({ pattern: "^(?:[01]\\d|2[0-3]):[0-5]\\d$" }),

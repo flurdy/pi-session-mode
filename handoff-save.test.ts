@@ -24,7 +24,7 @@ async function fixture(run: (f: { home: string; runtime: string; save: ReturnTyp
 		await writeFile(join(directory, "save-handoff.py"), await readFile(helper));
 		const runtime = join(home, "runtime");
 		const save = createHandoffSaver({ home, acquire: (file, options) => acquireFileLease(file, { ...options, runtimeDir: runtime }) });
-		await run({ home, runtime, save, target: (slug = "save-proof") => join(home, ".claude/handoffs", `2026-09-23-${slug}.md`) });
+		await run({ home, runtime, save, target: (slug = "save-proof") => join(home, ".agents/handoffs", `2026-09-23-${slug}.md`) });
 	} finally { await rm(root, { recursive: true, force: true }); }
 }
 const context = (confirm = async (_message: string) => true) => ({ sessionId: "fixture", confirm });
@@ -48,8 +48,24 @@ integration("independent sessions and different names save concurrently; same na
 	assert.equal(collision.status, "collision"); assert.equal(collision.suggestedSlug, "one-2");
 }));
 
+integration("legacy storage blocks saves before any directory, lease or helper launch", () => fixture(async ({ home, runtime, target }) => {
+	let launched = false;
+	const save = createHandoffSaver({ home, acquire: (file, options) => acquireFileLease(file, { ...options, runtimeDir: runtime }), run: async () => { launched = true; return { code: 1, stdout: "" }; } });
+	for (const legacy of ["directory", "symlink"]) {
+		if (legacy === "directory") await mkdir(join(home, ".claude/handoffs"), { recursive: true });
+		else { await rm(join(home, ".claude/handoffs"), { recursive: true }); await symlink(join(home, "elsewhere"), join(home, ".claude/handoffs")); }
+		await assert.rejects(save(request(), context()), /migration-required/);
+		assert.equal(launched, false);
+		await assert.rejects(access(join(home, ".agents/handoffs")));
+		await assert.rejects(access(target()));
+	}
+	await rm(join(home, ".claude"), { recursive: true, force: true });
+	await assert.rejects(save(request(), context()), /unverified/);
+	assert.equal(launched, true);
+}));
+
 integration("exact-file contention fails without stealing, and release allows save", () => fixture(async ({ home, runtime, save, target }) => {
-	await mkdir(join(home, ".claude/handoffs"), { recursive: true });
+	await mkdir(join(home, ".agents/handoffs"), { recursive: true });
 	const holder = await acquireFileLease(target(), { runtimeDir: runtime });
 	assert.equal(holder.kind, "held");
 	try { await assert.rejects(save(request(), context()), /held by another/); await assert.rejects(access(target())); }
@@ -75,23 +91,22 @@ integration("confirmed overwrite verifies replacement and cleans temporary files
 	const result = await save({ ...request(), content, overwriteSha256: first.sha256! }, context());
 	assert.equal(result.status, "saved"); assert.equal(result.mode, "overwrite");
 	assert.equal(await readFile(target(), "utf8"), content);
-	assert.deepEqual(await readdir(join(home, ".claude/handoffs")), ["2026-09-23-save-proof.md"]);
+	assert.deepEqual(await readdir(join(home, ".agents/handoffs")), ["2026-09-23-save-proof.md"]);
 }));
 
 integration("rejects path/command overrides, malformed content and changed helper before writing", () => fixture(async ({ home, save }) => {
 	for (const input of [{ ...request(), path: "/tmp/escape" }, { ...request(), home: "/tmp" }, { ...request(), slug: "../escape" }, { ...request(), content: "incomplete" }, { ...request(), content: "x".repeat(65537) }]) {
 		await assert.rejects(save(input, context()));
 	}
-	await assert.rejects(access(join(home, ".claude")));
+	await assert.rejects(access(join(home, ".agents/handoffs")));
 	await writeFile(join(home, ".agents/skills/wrap-up/scripts/save-handoff.py"), "print('unreviewed')");
 	await assert.rejects(save(request(), context()), /helper.*(reviewed|digest)/);
-	await assert.rejects(access(join(home, ".claude")));
+	await assert.rejects(access(join(home, ".agents/handoffs")));
 }));
 
-for (const root of [".", ".claude"]) {
+for (const root of [".", ".agents"]) {
 	integration(`fixed saves work inside a Git-owned ${root} without relaxing ordinary grants`, () => fixture(async ({ home, save, target }) => {
 		const repo = join(home, root);
-		await mkdir(repo, { recursive: true });
 		execFileSync("git", ["init", "-q", repo]);
 		const first = await save(request(), context());
 		assert.equal(first.status, "saved");
@@ -107,19 +122,19 @@ for (const root of [".", ".claude"]) {
 
 integration("symlinked directories, symlink targets and nested Git destinations fail closed", () => fixture(async ({ home, save, target }) => {
 	const outside = join(home, "outside"); await mkdir(outside);
-	await symlink(outside, join(home, ".claude"));
+	await symlink(outside, join(home, ".agents/handoffs"));
 	await assert.rejects(save(request(), context()), /directory/);
 	assert.deepEqual(await readdir(outside), []);
-	await rm(join(home, ".claude")); await mkdir(join(home, ".claude/handoffs"), { recursive: true });
+	await rm(join(home, ".agents/handoffs")); await mkdir(join(home, ".agents/handoffs"));
 	await writeFile(join(outside, "file"), "untouched"); await symlink(join(outside, "file"), target());
 	await assert.rejects(save(request(), context()), /target/);
 	assert.equal(await readFile(join(outside, "file"), "utf8"), "untouched");
-	await rm(target()); await mkdir(join(home, ".claude/handoffs/.git"));
+	await rm(target()); await mkdir(join(home, ".agents/handoffs/.git"));
 	await assert.rejects(save(request(), context()), /Git/);
 }));
 
 integration("Git-owned handoffs retain exact-target leases and coexist with a dotfiles root lease", () => fixture(async ({ home, runtime, target }) => {
-	const repo = join(home, ".claude"); await mkdir(repo);
+	const repo = join(home, ".agents");
 	execFileSync("git", ["init", "-q", repo]);
 	const rootLease = await acquireWorktreeLease(repo, { runtimeDir: runtime });
 	assert.equal(rootLease.kind, "held");
@@ -147,13 +162,13 @@ integration("Git-owned handoffs retain exact-target leases and coexist with a do
 }));
 
 integration("dotfiles Git indirection does not redirect the handoff path", () => fixture(async ({ home, save, target }) => {
-	const repo = join(home, ".claude"); await mkdir(repo);
+	const repo = join(home, ".agents");
 	execFileSync("git", ["init", "-q", "--separate-git-dir", join(home, "git-storage"), repo]);
 	assert.equal((await save(request(), context())).status, "saved");
 	assert.equal(await readFile(target(), "utf8"), request().content);
 }));
 
-for (const location of [".", ".claude", ".claude/handoffs"]) {
+for (const location of [".", ".agents", ".agents/handoffs"]) {
 	for (const marker of ["HEAD", "objects", "refs"]) {
 		integration(`rejects Git administration marker ${location}/${marker}`, () => fixture(async ({ home, save, target }) => {
 			await mkdir(join(home, location), { recursive: true });
@@ -164,24 +179,24 @@ for (const location of [".", ".claude", ".claude/handoffs"]) {
 	}
 }
 
-integration("bare dotfiles repos, nested gitfiles and Git ancestors outside home stay rejected", () => fixture(async ({ home, save, target }) => {
-	const repo = join(home, ".claude");
-	execFileSync("git", ["init", "--bare", "-q", repo]);
+integration("bare repos, nested gitfiles and Git ancestors outside home stay rejected", () => fixture(async ({ home, save, target }) => {
+	const folder = join(home, ".agents/handoffs");
+	execFileSync("git", ["init", "--bare", "-q", folder]);
 	await assert.rejects(save(request(), context()), /Git administration/);
 	await assert.rejects(access(target()));
-	await rm(repo, { recursive: true, force: true });
-	await mkdir(join(repo, "handoffs"), { recursive: true });
-	await writeFile(join(repo, "handoffs/.git"), "gitdir: /fixture/metadata\n");
+	await rm(folder, { recursive: true, force: true });
+	await mkdir(folder);
+	await writeFile(join(folder, ".git"), "gitdir: /fixture/metadata\n");
 	await assert.rejects(save(request(), context()), /Git/);
 	await assert.rejects(access(target()));
-	await rm(join(repo, "handoffs/.git"));
+	await rm(join(folder, ".git"));
 	await mkdir(join(dirname(home), ".git"));
 	await assert.rejects(save(request(), context()), /Git/);
 	await assert.rejects(access(target()));
 }));
 
 integration("Git-owned paths still reject symlinked handoff folders, hardlinks and special targets", () => fixture(async ({ home, save, target }) => {
-	const repo = join(home, ".claude"); await mkdir(repo);
+	const repo = join(home, ".agents");
 	execFileSync("git", ["init", "-q", repo]);
 	const outside = join(home, "outside"); await mkdir(outside);
 	await symlink(outside, join(repo, "handoffs"));
@@ -212,7 +227,7 @@ integration("malformed or failed helper receipts never claim success and release
 	for (const response of [
 		{ code: 0, stdout: "not json" },
 		{ code: 0, stdout: JSON.stringify({ schemaVersion: "wrap-up-save/v1", path: target(), status: "saved", mode: "new", sha256: "0".repeat(64), bytes: 1 }) },
-		{ code: 1, stdout: JSON.stringify({ schemaVersion: "wrap-up-save/v1", path: target(), status: "failure", reason: "recovery-required", backupPath: join(home, ".claude/handoffs/.wrap-up-backup-0123456789abcdef.tmp") }) },
+		{ code: 1, stdout: JSON.stringify({ schemaVersion: "wrap-up-save/v1", path: target(), status: "failure", reason: "recovery-required", backupPath: join(home, ".agents/handoffs/.wrap-up-backup-0123456789abcdef.tmp") }) },
 	]) {
 		const save = createHandoffSaver({ home, acquire: (file, options) => acquireFileLease(file, { ...options, runtimeDir: runtime }), run: async () => response });
 		await assert.rejects(save(request(), context()), response.code === 1 ? /recovery copy:.*wrap-up-backup/ : /unverified/);

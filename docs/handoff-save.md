@@ -14,13 +14,22 @@ Optional `overwriteSha256` requests replacement, not approval. No path, helper, 
 environment or directory argument is accepted, including through parallel wrappers.
 
 The destination is the runtime user's canonical home plus
-`.claude/handoffs/{date}-{slug}.md`. Only the two missing handoff directories may be created,
-with mode `0700`; existing directory permissions are not changed. Git worktrees rooted at
-home or `~/.claude` are supported, including `.git` indirection files: dotfiles version control
-does not relocate the fixed destination. Symlinked directories, symlink/non-regular/hardlinked
-targets, Git administration markers, a repository rooted at `handoffs`, and Git ancestors above
-home are rejected. Only this operation's exact generated target uses the private resolver;
-ordinary `/grant-file` and native-write ownership rules are unchanged.
+`.agents/handoffs/{date}-{slug}.md`. `~/.agents` must already exist as a canonical directory (it
+holds the reviewed helper); only the missing `handoffs` directory may be created, with mode
+`0700`, and existing directory permissions are not changed. Git worktrees rooted at home or
+`~/.agents` are supported, including `.git` indirection files: dotfiles version control does
+not relocate the fixed destination, but keeping private handoffs out of publication remains
+the user's responsibility. Symlinked directories, symlink/non-regular/hardlinked targets, Git
+administration markers, a repository rooted at `handoffs`, and Git ancestors above home are
+rejected. Only this operation's exact generated target uses the private resolver; ordinary
+`/grant-file` and native-write ownership rules are unchanged.
+
+Storage moved from `~/.claude/handoffs` in one coordinated cutover. While that retired
+directory (or a symlink in its place) still exists, the adapter fails with
+`migration-required` before creating a directory, taking a lease or launching the helper, and
+the helper independently refuses with `legacy-storage-present`. There is no legacy fallback,
+dual write or automatic merge: the existing store is moved by a separately approved
+whole-directory operation, after which saves resume unchanged.
 
 The adapter reads the installed
 `~/.agents/skills/wrap-up/scripts/save-handoff.py`, compares it to an exact reviewed SHA-256
@@ -75,6 +84,9 @@ are drained before the extension shuts down; obsolete sessions cannot start a ne
   with `HANDOFF_SAVE_HELPER` set. The script checks and reports that exact host version.
 - Exercise the native overwrite confirmation in a current-Pi isolated TUI before activation;
   fake-dialog tests or RPC refusal alone do not prove the interactive user experience.
+- Activate the adapter and the matching helper revision together: the pinned digest makes an
+  older loaded adapter fail closed against the new helper, and the new adapter against the old.
+  Integrate both during the same paused migration window and reload sessions afterwards.
 - Publish/activate a reviewed extension version and reload each running Pi session separately.
   A skill edit does not upgrade an already-loaded extension. Old sessions without the tool must
   report unsaved rather than use the shell helper as a Pi fallback.
