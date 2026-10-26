@@ -2,10 +2,10 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { access, lstat, realpath, stat } from "node:fs/promises";
-import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
+import { delimiter, dirname, isAbsolute, join } from "node:path";
 import { MAX_FOLDER_GRANTS, resolveExplicitFolders } from "./file-scope.ts";
 import { isWithin } from "./path.ts";
-import { adminRunRefusal, destructiveCommandLines } from "./policy.ts";
+import { adminRunRefusal, destructiveCommandLines, invokedCommand } from "./policy.ts";
 import { safeDisplay } from "./scope.ts";
 
 export const ADMIN_MAX_SCRIPT_BYTES = 16 * 1024;
@@ -164,8 +164,8 @@ export async function prepareAdminRun(request: AdminRunRequest, dependencies: Ad
 	} else {
 		const argv = request.argv!;
 		if (argv.length === 0 || argv.length > ADMIN_MAX_ARGS || argv.some((arg) => typeof arg !== "string" || arg.includes("\0") || arg.length > 4096)) refuse(`Expected 1–${ADMIN_MAX_ARGS} argv strings`);
-		const program = basename(argv[0]!);
-		if ((program === "make" || program === "gmake") && argv.slice(1).some((arg) => MAKE_REDIRECT.test(arg))) {
+		const invoked = invokedCommand(argv);
+		if (invoked && (invoked.executable === "make" || invoked.executable === "gmake") && invoked.args.some((arg) => MAKE_REDIRECT.test(arg))) {
 			refuse("run_admin binds the recipe through cwd: set cwd to the recipe directory instead of using make -C or -f");
 		}
 		command = { kind: "argv", executable: await resolveExecutable(argv[0]!, env), argv: [...argv] };

@@ -91,6 +91,8 @@ test("prepare refuses unsupported shapes before any dialog", async () => {
 			[{ script: "sudo ls" }, /privilege/i],
 			[{ argv: ["make", "-C", repo, "apply"] }, /cwd/],
 			[{ argv: ["make", `--directory=${repo}`, "apply"] }, /cwd/],
+			[{ argv: ["env", "HOME=/tmp/x", "make", "-C", repo, "apply"] }, /cwd/],
+			[{ argv: ["env", "-u", "X", "gmake", "-f", "Other.mk"] }, /cwd/],
 			[{ argv: ["./relative-tool"] }, /executable/i],
 			[{ cwd: "relative" }, /absolute/i],
 			[{ writes: [] }, /folder/i],

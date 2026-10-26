@@ -51,7 +51,7 @@ It is available in lazy, grant-only and implement sessions. It is refused in pla
 ### Before the dialog
 
 - The executable is resolved through `PATH` (bare names) or as an absolute path, and shown canonically. `argv[0]` is preserved for multi-call programs.
-- A repository-backed `cwd` must be clean: committed `HEAD`, no tracked changes and no untracked non-ignored files. Run repository recipes through `argv` with `cwd` set to the recipe directory; `make -C`, `--directory`, `-f` and `--file` are refused so the bound recipe is the one that runs.
+- A repository-backed `cwd` must be clean: committed `HEAD`, no tracked changes and no untracked non-ignored files. Run repository recipes through `argv` with `cwd` set to the recipe directory; `make -C`, `--directory`, `-f` and `--file` are refused, including after `env`, `command` or `exec` prefixes, so the bound recipe is the one that runs.
 - Recognizable Git mutations, `gh`, publication (`make` push targets), workspace and Beads/Dolt remote synchronization, and privilege escalation (`sudo` and similar) are refused. Repository changes need `/implement`, publication uses `publish_commit`, and synchronization keeps its own confirmation. Commands are recognized by their words, including quoted subcommands and commands after shell keywords such as `then` or `do`. This is still bounded pattern recognition: effects hidden in scripts or recipes are not comprehensively detected.
 - A declared folder that contains one of the session's exact-file or folder grants is refused; revoke the grant first. A declared folder inside a held folder grant reuses that grant.
 

@@ -358,7 +358,8 @@ function isReleaseStateUpdate(words: string[]): boolean {
 // Reserved words that may precede a command within one separator-delimited segment.
 const SHELL_KEYWORDS = new Set(["if", "then", "else", "elif", "do", "while", "until", "!", "{", "}", "time"]);
 
-function invokedCommand(words: string[]): { executable: string; args: string[] } | undefined {
+/** The command a word list actually runs after keywords, assignments and env/command/exec prefixes. */
+export function invokedCommand(words: string[]): { executable: string; args: string[] } | undefined {
 	let index = 0;
 	while (index < words.length) {
 		if (SHELL_KEYWORDS.has(words[index]!) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index]!)) { index++; continue; }
