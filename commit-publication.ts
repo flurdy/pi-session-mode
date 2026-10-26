@@ -6,6 +6,7 @@ import { access, realpath } from "node:fs/promises";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { Type } from "typebox";
 import { probeWorktreeLeaseOccupancies, type WorktreeLeaseOccupancy } from "./lease-observer.ts";
+import { OperationReservation } from "./reservation.ts";
 import { safeDisplay } from "./scope.ts";
 
 const COMMIT = /^[0-9a-f]{7,64}$/;
@@ -388,14 +389,17 @@ export interface CommitPublicationLifecycle {
 	sessionShutdown(): Promise<void>;
 }
 
-/** With ownLifecycle false, the caller must invoke the returned hooks from its own session events. */
-export function registerCommitPublication(pi: ExtensionAPI, dependencies: PublicationToolDependencies = {}, options: { ownLifecycle?: boolean } = {}): CommitPublicationLifecycle {
+/**
+ * With ownLifecycle false, the caller must invoke the returned hooks from its own session events.
+ * A shared reservation keeps publication from interleaving with the caller's other exclusive operations.
+ */
+export function registerCommitPublication(pi: ExtensionAPI, dependencies: PublicationToolDependencies = {}, options: { ownLifecycle?: boolean; reservation?: OperationReservation } = {}): CommitPublicationLifecycle {
 	const now = dependencies.now ?? Date.now;
 	const observe = dependencies.observe ?? ((root: string) => probeWorktreeLeaseOccupancies([root]));
 	const tokens = new Map<string, { sessionId: string; request: PublicationRequest; prepared: PreparedPublication; expiresAt: number }>();
 	const pending = new Set<Promise<unknown>>();
 	let session: { id: string; abort: AbortController } | undefined;
-	let busy = false;
+	const reservation = options.reservation ?? new OperationReservation();
 
 	const lifecycle: CommitPublicationLifecycle = {
 		sessionStart(ctx) {
@@ -436,8 +440,9 @@ export function registerCommitPublication(pi: ExtensionAPI, dependencies: Public
 			if (ctx.mode !== "tui" || !ctx.hasUI) throw new Error("Commit publication requires interactive TUI confirmation");
 			const active = session;
 			if (!active || active.id !== ctx.sessionManager.getSessionId() || active.abort.signal.aborted) throw new Error("Publication session is no longer active");
-			if (busy) throw new Error("Another commit publication operation is already running");
-			busy = true;
+			const holder = reservation.holder;
+			const release = reservation.tryReserve("commit publication");
+			if (!release) throw new Error(holder === "commit publication" ? "Another commit publication operation is already running" : `Another session operation (${holder}) is already running`);
 			const operation = (async () => {
 				const combined = signal ? AbortSignal.any([signal, active.abort.signal]) : active.abort.signal;
 				if (params.action === "execute") {
@@ -475,7 +480,7 @@ export function registerCommitPublication(pi: ExtensionAPI, dependencies: Public
 			pending.add(operation);
 			try { return await operation; }
 			catch (error) { throw new Error(safeDisplay(String(error)).slice(0, 4000)); }
-			finally { pending.delete(operation); busy = false; }
+			finally { pending.delete(operation); release(); }
 		},
 	});
 	return lifecycle;

@@ -23,6 +23,7 @@
   },
   "files": [
     "README.md",
+    "admin-run.ts",
     "commit-publication.ts",
     "docs/guard.md",
     "docs/handoff-save.md",
@@ -38,6 +39,7 @@
     "package-activation.ts",
     "path.ts",
     "policy.ts",
+    "reservation.ts",
     "scope.ts",
     "scoped-policy.ts",
     "selection.ts",

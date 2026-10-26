@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
-import { realpath } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import type { FileLeaseResult, HeldWorktreeLease, WorktreeLeaseResult } from "./lease.ts";
+import type { FileLeaseResult, FolderLeaseResult, HeldWorktreeLease, WorktreeLeaseResult } from "./lease.ts";
 import type { PackageActivationEvidence, PackageActivationRequest, PreparedPackageActivation } from "./package-activation.ts";
 import { registerSessionMode, type SessionModeDependencies } from "./session-mode.ts";
 
@@ -98,7 +101,7 @@ function harness(results: WorktreeLeaseResult[] = [held()], options: Partial<Ses
 test("registers scope controls, fixed handoff saving, commit publication and confirmed package activation", () => {
 	const { pi } = harness();
 	assert.deepEqual([...pi.commands.keys()].sort(), ["grant-file", "grants", "implement", "lazy", "lease-holders", "leases", "plan"]);
-	assert.deepEqual([...pi.tools.keys()], ["save_handoff", "publish_commit", "activate_pi_package", "release_scopes"]);
+	assert.deepEqual([...pi.tools.keys()], ["save_handoff", "publish_commit", "activate_pi_package", "release_scopes", "run_admin"]);
 });
 
 test("lease-holders reports the kernel inventory without acquiring and trims oversized payloads", async () => {
@@ -1302,7 +1305,7 @@ test("release_scopes refuses during in-flight writes and its own checks, and blo
 	pi.exec = async () => { started(); await gate; return { code: 0, stdout: "", stderr: "" }; };
 	const first = releaseTool(pi, ctx);
 	await checking;
-	await assert.rejects(releaseTool(pi, ctx), /while a write, scope transition, package activation, release or shutdown/);
+	await assert.rejects(releaseTool(pi, ctx), /while a write, scope transition, package activation, administrative run, publication, release or shutdown/);
 	const [write] = await pi.emit("tool_call", ctx, { toolName: "write", input: { path: "/repo/file", content: "x" } });
 	assert.match((write as { reason: string }).reason, /release is busy/);
 	finish();
@@ -1362,4 +1365,123 @@ test("release_scopes reports a lease loss during its release drain instead of se
 	assert.equal(pi.activeTools.includes("write"), false);
 	assert.equal(pi.appended.some((entry) => (entry.data as { version?: number }).version === 4), false);
 	assert.deepEqual(pi.appended.at(-1)?.data, { version: 2, mode: "plan" });
+});
+
+async function adminFixture() {
+	const base = await realpath(await mkdtemp(join(tmpdir(), "pi-admin-session-")));
+	const target = join(base, "target");
+	await mkdir(target);
+	return { base, target, cleanup: () => rm(base, { recursive: true, force: true }) };
+}
+function folderLeases(log: string[], outcome?: (dir: string) => FolderLeaseResult) {
+	return async (dir: string): Promise<FolderLeaseResult> => {
+		log.push(`acquire ${dir}`);
+		return outcome?.(dir) ?? { kind: "held", dir, holderPid: 1, alive: true, lost: new Promise(() => undefined), async release() { log.push(`release ${dir}`); } };
+	};
+}
+const adminTool = (pi: FakePi, ctx: ReturnType<typeof context>, params: Record<string, unknown>) =>
+	pi.tools.get("run_admin")!.execute("call", params, undefined, undefined, ctx);
+
+test("run_admin runs one confirmed command in lazy mode without taking worktree leases", async () => {
+	const { base, target, cleanup } = await adminFixture();
+	try {
+		const log: string[] = [];
+		const { pi, controller, acquisitions } = harness([], { acquireFolder: folderLeases(log) });
+		const ctx = realContext([]);
+		await pi.emit("session_start", ctx);
+		assert.equal(controller.state, "lazy");
+		const params = { purpose: "Create marker", cwd: base, writes: [target], script: `echo done > '${join(target, "marker")}'` };
+		assert.deepEqual(await pi.emit("tool_call", ctx, { toolName: "run_admin", input: params }), [undefined]);
+		const dialogs: string[] = [];
+		ctx.ui.confirm = async (_title: string, message: string) => { dialogs.push(message); return false; };
+		assert.equal((await adminTool(pi, ctx, params)).details.status, "declined");
+		await assert.rejects(stat(join(target, "marker")));
+		assert.deepEqual(log, [], "a declined run takes no lease");
+		ctx.ui.confirm = async (_title: string, message: string) => { dialogs.push(message); return true; };
+		const result = await adminTool(pi, ctx, params);
+		assert.equal(result.details.status, "ok", JSON.stringify(result.details));
+		assert.equal(await readFile(join(target, "marker"), "utf8"), "done\n");
+		assert.deepEqual(log, [`acquire ${target}`, `release ${target}`]);
+		assert.equal(dialogs.length, 2);
+		assert.match(dialogs[0]!, /Effects are not confined/);
+		assert.equal(controller.state, "lazy");
+		assert.deepEqual([controller.roots, controller.files, acquisitions], [[], [], []]);
+	} finally { await cleanup(); }
+});
+
+test("run_admin is refused in guarded states, without TUI, on contention and over a contained grant", async () => {
+	const { base, target, cleanup } = await adminFixture();
+	try {
+		const log: string[] = [];
+		const params = { purpose: "Create marker", cwd: base, writes: [target], script: `echo done > '${join(target, "marker")}'` };
+		const plan = harness([], { acquireFolder: folderLeases(log) });
+		plan.pi.planFlag = true;
+		const planContext = realContext([]);
+		await plan.pi.emit("session_start", planContext);
+		const [blocked] = await plan.pi.emit("tool_call", planContext, { toolName: "run_admin", input: params }) as Array<{ block: boolean; reason: string }>;
+		assert.equal(blocked?.block, true);
+		assert.match(blocked!.reason, /\/lazy|\/implement/);
+		planContext.ui.confirm = async () => { throw new Error("no dialog in plan"); };
+		assert.equal((await adminTool(plan.pi, planContext, params)).details.status, "refused");
+
+		const contended = harness([], { acquireFolder: folderLeases(log, (dir) => ({ kind: "contended", dir })) });
+		const ctx = realContext([]);
+		await contended.pi.emit("session_start", ctx);
+		const rpc = await adminTool(contended.pi, { ...ctx, mode: "rpc" }, params);
+		assert.equal(rpc.details.status, "refused");
+		assert.match(rpc.details.reason, /TUI/);
+		const refused = await adminTool(contended.pi, ctx, params);
+		assert.equal(refused.details.status, "refused");
+		assert.match(refused.details.reason, /another live session/);
+		await assert.rejects(stat(join(target, "marker")));
+
+		const file = join(target, "config.json");
+		const granted = harness([], {
+			acquireFolder: folderLeases(log),
+			resolveFiles: async () => [file],
+			acquireFile: async () => ({ kind: "held", file, holderPid: 2, alive: true, lost: new Promise(() => {}), release: async () => {} }),
+		});
+		granted.pi.planFlag = true;
+		const fileOnly = realContext([]);
+		await granted.pi.emit("session_start", fileOnly);
+		await granted.pi.commands.get("grant-file")!.handler(JSON.stringify(file), fileOnly);
+		assert.equal(granted.controller.state, "implement");
+		const overlap = await adminTool(granted.pi, fileOnly, params);
+		assert.equal(overlap.details.status, "refused");
+		assert.match(overlap.details.reason, /revoke/i);
+		assert.equal((await adminTool(granted.pi, fileOnly, { ...params, writes: [join(base, "other")] })).details.status, "ok", "file-only sessions may run disjoint admin work");
+	} finally { await cleanup(); }
+});
+
+test("an active admin run blocks native writes, release and publication; lease loss interrupts it", async () => {
+	const { base, target, cleanup } = await adminFixture();
+	try {
+		const log: string[] = [];
+		let loseLease: (() => void) | undefined;
+		const { pi } = harness([], {
+			acquireFolder: async (dir: string): Promise<FolderLeaseResult> => ({
+				kind: "held", dir, holderPid: 1, alive: true,
+				lost: new Promise<void>((resolve) => { loseLease = resolve; }),
+				async release() { log.push("release"); },
+			}),
+		});
+		const ctx = realContext([]);
+		await pi.emit("session_start", ctx);
+		const running = adminTool(pi, ctx, { purpose: "Slow", cwd: base, writes: [target], script: `sleep 1; echo slow > '${join(target, "slow")}'` });
+		await delay(250);
+		const [writeBlock] = await pi.emit("tool_call", ctx, { toolName: "write", input: { path: join(target, "x"), content: "" } }) as Array<{ reason: string }>;
+		assert.match(writeBlock?.reason ?? "", /administrative run/);
+		await assert.rejects(releaseTool(pi, ctx), /administrative run/);
+		await assert.rejects(pi.tools.get("publish_commit")!.execute("call", { action: "confirm", root: base, commit: "abcdef1" }, undefined, undefined, ctx), /admin run/);
+		assert.equal((await running).details.status, "ok");
+		assert.deepEqual(log, ["release"]);
+
+		const interrupted = adminTool(pi, ctx, { purpose: "Lost", cwd: base, writes: [target], script: "sleep 30" });
+		await delay(250);
+		loseLease!();
+		const receipt = (await interrupted).details;
+		assert.equal(receipt.status, "interrupted");
+		assert.match(receipt.reason, /lease/);
+		assert.deepEqual(log, ["release", "release"]);
+	} finally { await cleanup(); }
 });

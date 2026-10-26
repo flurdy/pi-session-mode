@@ -3,6 +3,7 @@ const GUARDED_TOOL_REASONS = new Map<string, string>([
 	["write", "Guarded session: direct file writes are disabled. Switch to /implement after acquiring the worktree lease."],
 	["powershell", "Guarded session: PowerShell commands are disabled. Switch to /implement after acquiring the worktree lease."],
 	["activate_pi_package", "Guarded session: Pi package activation requires live implement mode with a held worktree lease."],
+	["run_admin", "Guarded session: run_admin needs a writable session. Ask the user for /lazy or /implement while idle; never switch modes yourself."],
 ]);
 
 const READ_ONLY_SUBAGENT_ACTIONS = new Set([
@@ -40,6 +41,8 @@ const SUBAGENT_BLOCK_REASON = "Guarded session: this subagent operation may laun
 export interface GuardedToolPolicyOptions {
 	readOnlySubagents?: ReadonlySet<string>;
 	allowNativeWrites?: boolean;
+	/** Writable lazy and file-only sessions may call run_admin; it applies its own confirmation and refusals. */
+	allowAdminRuns?: boolean;
 }
 
 const FILE_MUTATION = /\b(?:rm|rmdir|mv|cp|mkdir|mktemp|touch|chmod|chown|chgrp|ln|tee|truncate|dd|shred|patch|rsync)\b/i;
@@ -158,7 +161,8 @@ export function guardedToolBlockReason(
 	depth = 0,
 ): string | undefined {
 	const directReason = GUARDED_TOOL_REASONS.get(toolName);
-	if (directReason && !(options.allowNativeWrites === true && (toolName === "edit" || toolName === "write"))) return directReason;
+	const allowed = (options.allowNativeWrites === true && (toolName === "edit" || toolName === "write")) || (options.allowAdminRuns === true && toolName === "run_admin");
+	if (directReason && !allowed) return directReason;
 	if (toolName === "bash") {
 		const command = isRecord(input) ? input.command : undefined;
 		if (typeof command !== "string") return undefined;
@@ -419,4 +423,48 @@ function isObviousMutationAtDepth(command: string, depth: number): boolean {
 
 export function isObviousMutation(command: string): boolean {
 	return isObviousMutationAtDepth(command, 0);
+}
+
+const ADMIN_GIT_REASON = "run_admin refuses Git mutations: repository changes need /implement, and publication uses publish_commit.";
+const ADMIN_REMOTE_REASON = "run_admin refuses publication, remote synchronization and raw Beads/Dolt remote or destructive commands; they keep their dedicated, separately approved paths.";
+const ADMIN_PRIVILEGE_REASON = "run_admin cannot escalate privileges; sudo-style prompts are unsupported with closed stdin.";
+const PRIVILEGE_ESCALATION = /\b(?:sudo|su|doas|pkexec|run0)\b/;
+const isGitHubCli = (words: string[]) => invokedCommand(words)?.executable === "gh";
+
+/** Bounded refusal for attended admin runs. Recognizable shapes only: it is not a complete detector of Git or remote effects. */
+export function adminRunRefusal(command: string, depth = 0): string | undefined {
+	for (const payload of constantShellPayloads(command)) {
+		const reason = depth >= MAX_INSPECTION_DEPTH ? ADMIN_REMOTE_REASON : adminRunRefusal(payload, depth + 1);
+		if (reason) return reason;
+	}
+	const inspectable = withoutQuotedText(unquoteGitGlobalOptionValues(command));
+	if (GIT_MUTATION.test(inspectable)) return ADMIN_GIT_REASON;
+	if (BEADS_DESTRUCTIVE_OR_REMOTE.test(inspectable) || databaseMutation(command) || [isWorkspaceSyncCommand, isMakePushCommand, isGitHubCli].some((matches) => hasCommand(command, matches))) return ADMIN_REMOTE_REASON;
+	if (PRIVILEGE_ESCALATION.test(inspectable)) return ADMIN_PRIVILEGE_REASON;
+	return undefined;
+}
+
+const NO_CLOBBER = (arg: string) => arg === "--no-clobber" || arg.startsWith("--update=none") || /^-[A-Za-z]*n[A-Za-z]*$/.test(arg);
+function destructive(words: string[]): boolean {
+	const invoked = invokedCommand(words);
+	if (!invoked) return false;
+	const { executable, args } = invoked;
+	if (["rm", "rmdir", "unlink", "shred", "truncate", "dd"].includes(executable)) return true;
+	if (executable === "mv" || executable === "cp") return !args.some(NO_CLOBBER);
+	if (executable === "ln") return args.some((arg) => arg === "--force" || /^-[A-Za-z]*f/.test(arg));
+	if (["chmod", "chown", "chgrp"].includes(executable)) return args.some((arg) => arg === "--recursive" || /^-[A-Za-z]*R/.test(arg));
+	if (executable === "find") return args.includes("-delete") || args.includes("-exec");
+	if (executable === "rsync") return args.some((arg) => arg.startsWith("--delete") || arg.startsWith("--remove-source-files"));
+	return false;
+}
+
+/** Advisory: lines with recognizable deleting, overwriting or recursive permission commands, shown verbatim (bounded) in the confirmation. */
+export function destructiveCommandLines(script: string): string[] {
+	const flagged: string[] = [];
+	for (const line of script.split("\n")) {
+		const overwrite = /(^|[^<>])>(?![>&])/.test(withoutQuotedText(line).replace(DISCARDED_OUTPUT_REDIRECT, " ").replace(FILE_DESCRIPTOR_DUPLICATION, " "));
+		if ((overwrite || hasCommand(line, destructive)) && line.trim()) flagged.push(line.trim().slice(0, 200));
+		if (flagged.length === 20) break;
+	}
+	return flagged;
 }

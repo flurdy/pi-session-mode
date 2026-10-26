@@ -170,6 +170,13 @@ try {
 	}
 	let results = await first.turn("activation-rpc-denied", [{ name: "activate_pi_package", arguments: { package: "session-mode", version: "v0.4.0", expectedCommit: "2".repeat(40) } }]);
 	assert.equal(results.length, 1); assert.equal(results[0].isError, true);
+	const adminMarker = join(base, "admin-marker");
+	const adminRequest = { name: "run_admin", arguments: { purpose: "Dynamic refusal", cwd: base, writes: [join(base, "admin")], script: `touch '${adminMarker}'` } };
+	assert.ok(tools.includes("run_admin"));
+	results = await first.turn("admin-rpc-refused", [adminRequest]);
+	assert.equal(results.length, 1);
+	assert.equal(receipt(results[0]).status, "refused"); assert.match(receipt(results[0]).reason, /TUI/);
+	await absent(adminMarker);
 	await first.turn("selection-only", []);
 	await first.roots([work]);
 	results = await first.turn("native-write", [write("repos/api/new")]);
@@ -185,6 +192,8 @@ try {
 	await absent(join(repos.other, "no")); await absent(join(repos.web, "no"));
 	await first.roots([work, repos.api]);
 	await peer.send("prompt", { message: "/plan" });
+	results = await peer.turn("admin-plan-blocked", [adminRequest]);
+	assert.equal(results[0].isError, true); await absent(adminMarker);
 	results = await first.turn("atomic-success", [parallel([write("repos/other/yes"), write("repos/web/yes")])]);
 	assert.equal(results[0].isError, false);
 	assert.equal(await readFile(join(repos.other, "yes"), "utf8"), "fixture");
@@ -329,7 +338,7 @@ try {
 	for (const call of calls) assert.equal(resultsInSession.filter((entry) => entry.message.toolCallId === call.id).length, 1, `Unpaired ${call.id}`);
 	const locks = JSON.parse(execFileSync("lslocks", ["--json", "--output", "PATH"], { encoding: "utf8" }));
 	assert.equal((locks.locks ?? []).some((row) => row.path?.startsWith(runtime)), false);
-	console.log("Dynamic RPC PASS: real Pi native write/edit, atomic wrapper, sibling preflights, contention, cancellation, v2 in-turn persistence and reload, paired tool results, unchanged active tools, selection-only no-op, guarded rejection, RPC package-activation denial, caller-file panel and workspace-sync pre-dispatch refusal, optional private stdin panel coverage reported above, clean shutdown. Scripted fixture only; no external model requests or real CLI/auth/billing proof.");
+	console.log("Dynamic RPC PASS: real Pi native write/edit, atomic wrapper, sibling preflights, contention, cancellation, v2 in-turn persistence and reload, paired tool results, unchanged active tools, selection-only no-op, guarded rejection, RPC package-activation denial, run_admin RPC refusal and plan block, caller-file panel and workspace-sync pre-dispatch refusal, optional private stdin panel coverage reported above, clean shutdown. Scripted fixture only; no external model requests or real CLI/auth/billing proof.");
 } finally {
 	for (const client of clients) await client.stop();
 	await rm(base, { recursive: true, force: true });

@@ -3,7 +3,10 @@ import { Type } from "typebox";
 import { realpath } from "node:fs/promises";
 import { isAbsolute, relative, sep } from "node:path";
 import { pathToFileURL } from "node:url";
-import { acquireFileLease, acquireWorktreeLease, type FileLeaseResult, type WorktreeLeaseResult } from "./lease.ts";
+import { acquireFileLease, acquireFolderLease, acquireWorktreeLease, IntentPool, type FileLeaseResult, type FolderLeaseResult, type HeldFolderLease, type WorktreeLeaseResult } from "./lease.ts";
+import { adminRunDialog, adminRunReceiptBase, executeAdminRun, prepareAdminRun, recheckAdminRun, type AdminRunReceipt, type PreparedAdminRun } from "./admin-run.ts";
+import { isWithin } from "./path.ts";
+import { OperationReservation } from "./reservation.ts";
 import { LeaseSet, type HeldScopes, type LeaseSetResult, type ScopeSetRequest } from "./lease-set.ts";
 import { probeWorktreeLeaseOccupancies } from "./lease-observer.ts";
 import { inventoryHeldLeases, type LeaseInventory, type LeaseInventoryOptions } from "./lease-inventory.ts";
@@ -27,6 +30,7 @@ export interface PackageActivationAdapter {
 export interface SessionModeDependencies {
 	acquireLease(cwd: string, options: { sessionId: string; signal?: AbortSignal; expectedRoot?: string }): Promise<WorktreeLeaseResult>;
 	acquireFile?(file: string, options: { sessionId: string; signal?: AbortSignal; expectedFile?: string }): Promise<FileLeaseResult>;
+	acquireFolder?(dir: string, options: { sessionId: string; signal?: AbortSignal; expectedDir?: string; intentPool?: IntentPool }): Promise<FolderLeaseResult>;
 	resolveFiles?(paths: string[], cwd: string, signal?: AbortSignal): Promise<string[]>;
 	isDisabled(): boolean;
 	readOnlySubagents(cwd: string, preferredProvider?: string): Promise<ReadonlySet<string>>;
@@ -79,7 +83,9 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	readOnlySubagents: (cwd, provider) => verifiedReadOnlySubagents(cwd, { preferredProvider: provider }),
 }): SessionModeController {
 	registerHandoffSave(pi);
-	const publication = registerCommitPublication(pi, {}, { ownLifecycle: false });
+	const reservation = new OperationReservation();
+	const publication = registerCommitPublication(pi, {}, { ownLifecycle: false, reservation });
+	let adminRun: { abort: AbortController; done: Promise<void> } | undefined;
 	let mode: SessionMode = "implement";
 	let state: SessionGuardState = "acquiring";
 	let selection: Selection = { mode: "implement", scope: { kind: "cwd" } };
@@ -104,6 +110,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	};
 	const leases = new LeaseSet(dependencies.acquireLease, resolveExplicitRoots, () => {
 		generation++;
+		adminRun?.abort.abort("lease lost: the session's scope leases were revoked");
 		mode = "plan";
 		selection = { mode: "plan" };
 		guardTools();
@@ -113,7 +120,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		try { persistSelection(selection); } catch { /* Write authority is already revoked. */ }
 		void refreshReadOnlySubagents(ctx).catch(() => {});
 		notify(ctx, "A scope lease was lost. All worktree and file scopes are now guarded; reacquire explicitly.", "error");
-	}, { acquireFile: dependencies.acquireFile ?? acquireFileLease, resolveFiles: dependencies.resolveFiles ?? resolveExplicitFiles });
+	}, { acquireFile: dependencies.acquireFile ?? acquireFileLease, resolveFiles: dependencies.resolveFiles ?? resolveExplicitFiles, acquireFolder: dependencies.acquireFolder ?? acquireFolderLease });
 
 	pi.registerFlag("plan", { description: "Start in guarded plan mode without leases", type: "boolean", default: false });
 	pi.registerFlag("implement", { description: "Acquire the cwd worktree lease", type: "boolean", default: false });
@@ -184,7 +191,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		return !dependencies.isDisabled() && writable() && (state === "lazy" || leases.roots.length > 0);
 	}
 	function scopeBusy(): boolean {
-		return shuttingDown || Boolean((implementation && current(implementation.generation)) || dynamicAcquisition || packageActivationOperation || releaseOperation) || activeWrites.size > 0;
+		return shuttingDown || Boolean((implementation && current(implementation.generation)) || dynamicAcquisition || packageActivationOperation || releaseOperation || reservation.holder) || activeWrites.size > 0;
 	}
 	function rejectBusy(ctx: ExtensionContext): boolean {
 		if (ctx.isIdle() && !ctx.hasPendingMessages()) return false;
@@ -520,7 +527,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 						&& ctx.sessionManager.getSessionId() === sessionId
 						&& ctx.mode === "tui" && ctx.hasUI
 						&& state === "implement" && leases.live && leases.roots.length > 0
-						&& !dependencies.isDisabled() && !implementation && !dynamicAcquisition && !releaseOperation && !signal?.aborted;
+						&& !dependencies.isDisabled() && !implementation && !dynamicAcquisition && !releaseOperation && !reservation.holder && !signal?.aborted;
 				} catch { return false; }
 			};
 			if (!eligible()) throw new Error("Pi package activation requires live implement mode with a held worktree lease and no scope transition");
@@ -592,7 +599,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		}, { additionalProperties: false }),
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const refuse = (text: string): never => { throw new Error(`${safeDisplay(text).slice(0, 4000)} Nothing was released.`); };
-			if (scopeBusy()) refuse("Cannot release scopes while a write, scope transition, package activation, release or shutdown is active.");
+			if (scopeBusy()) refuse("Cannot release scopes while a write, scope transition, package activation, administrative run, publication, release or shutdown is active.");
 			if (dependencies.isDisabled() || state === "unguarded") refuse("The session guard is disabled; there are no guarded scopes to release.");
 			if (state === "lazy" && leases.roots.length === 0) {
 				const details = { status: "lazy", released: [], files: leases.files };
@@ -637,6 +644,90 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 				return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details };
 			} finally {
 				if (releaseOperation === operation) releaseOperation = undefined;
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "run_admin",
+		label: "Run Admin",
+		description: "Run one exact bash script or argv command for administrative or installation work outside held worktrees, after a fresh native TUI confirmation that shows the full command, working directory and declared non-Git folders. Single use: the declared folders are leased for coordination, but effects are not confined to them. Refuses Git mutations, publication, remote synchronization and privilege escalation. Returns an admin-run/v1 receipt: ok, failed, declined, refused, stale or interrupted.",
+		promptSnippet: "Run one confirmed administrative script or command outside held worktrees",
+		promptGuidelines: [
+			"Use run_admin for administrative or installation work whose effects fall outside held worktrees, such as migrating or linking files under ~/.agents. Never hand terminal commands back to the user, request an unrelated lease or make a dummy edit instead.",
+			"Prefer a short inspectable bash script, and declare every non-Git folder it changes in writes. For repository recipes use argv with cwd set to the clean recipe directory, never make -C.",
+			"The native dialog is the user's approval of exactly that command once. Never retry a refused, stale, failed or interrupted run automatically; report it.",
+			"run_admin refuses Git mutations, publication and remote synchronization: use /implement, publish_commit or the dedicated workflow instead.",
+		],
+		executionMode: "sequential",
+		parameters: Type.Object({
+			purpose: Type.String({ minLength: 1, maxLength: 300, description: "One-line reason shown in the confirmation" }),
+			cwd: Type.String({ maxLength: 4096, description: "Absolute working directory; a repository-backed cwd must be clean" }),
+			writes: Type.Array(Type.String({ maxLength: 4096 }), { minItems: 1, maxItems: 16, description: "Non-Git folders the run is expected to change; leased for coordination, not confinement" }),
+			script: Type.Optional(Type.String({ maxLength: 16_384, description: "Bash script, at most 200 lines, run with bash --noprofile --norc -c" })),
+			argv: Type.Optional(Type.Array(Type.String({ maxLength: 4096 }), { minItems: 1, maxItems: 32, description: "Command and arguments, run without a shell" })),
+			timeoutSeconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 900, description: "Deadline; default 120" })),
+		}, { additionalProperties: false }),
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const result = (details: AdminRunReceipt) => ({ content: [{ type: "text" as const, text: JSON.stringify(details) }], details });
+			const refused = (reason: string, prepared?: PreparedAdminRun) => result({ ...(prepared ? adminRunReceiptBase(prepared) : { schemaVersion: "admin-run/v1" as const }), status: "refused", reason: safeDisplay(reason).slice(0, 2000) });
+			if (ctx.mode !== "tui" || !ctx.hasUI) return refused("run_admin requires interactive TUI confirmation; RPC, headless and child sessions cannot approve it.");
+			if (dependencies.isDisabled() || state === "unguarded") return refused("The session guard is disabled; run_admin is unavailable.");
+			if ((state !== "lazy" && state !== "implement") || !writable()) return refused(`run_admin needs a writable lazy or implement session (current: ${STATE_META[state].label}). Ask the user for /lazy or /implement while idle.`);
+			if (scopeBusy()) return refused("Another write, scope transition, package activation, publication, administrative run, release or shutdown is active.");
+			const release = reservation.tryReserve("admin run");
+			if (!release) return refused(`Another session operation (${reservation.holder}) is already running.`);
+			const ticket = generation, sessionId = ctx.sessionManager.getSessionId();
+			const abort = new AbortController();
+			let finish!: () => void;
+			adminRun = { abort, done: new Promise<void>((done) => { finish = done; }) };
+			const combined = signal ? AbortSignal.any([signal, abort.signal]) : abort.signal;
+			const eligible = () => {
+				try {
+					return current(ticket) && currentContext?.sessionManager.getSessionId() === sessionId && ctx.sessionManager.getSessionId() === sessionId
+						&& (state === "lazy" || state === "implement") && writable() && !dependencies.isDisabled() && !combined.aborted;
+				} catch { return false; }
+			};
+			const held: HeldFolderLease[] = [];
+			try {
+				let prepared: PreparedAdminRun;
+				try { prepared = await prepareAdminRun(params, {}, combined); }
+				catch (error) { return refused(error instanceof Error ? error.message : String(error)); }
+				const grants = [...leases.files, ...leases.folders];
+				for (const { path } of prepared.writes) {
+					const inside = grants.find((grant) => grant !== path && isWithin(grant, path));
+					if (inside) return refused(`Declared folder ${JSON.stringify(path)} contains the held grant ${JSON.stringify(inside)}; revoke it first. Nothing ran.`, prepared);
+				}
+				if (!eligible()) return result({ ...adminRunReceiptBase(prepared), status: "stale", reason: "The session changed before confirmation; nothing ran." });
+				const confirmed = await ctx.ui.confirm("Run administrative command once?", adminRunDialog(prepared), { timeout: 60_000 });
+				if (!confirmed) return result({ ...adminRunReceiptBase(prepared), status: "declined", reason: "Declined or timed out; nothing ran." });
+				if (!eligible()) return result({ ...adminRunReceiptBase(prepared), status: "stale", reason: "The session changed during confirmation; nothing ran." });
+				const pool = new IntentPool();
+				for (const { path } of prepared.writes) {
+					if (leases.folders.some((folder) => isWithin(path, folder))) continue;
+					const lease = await (dependencies.acquireFolder ?? acquireFolderLease)(path, { sessionId, signal: combined, expectedDir: path, intentPool: pool });
+					if (lease.kind === "held") {
+						held.push(lease);
+						void lease.lost.then(() => abort.abort(`lease lost for ${JSON.stringify(path)}`));
+						continue;
+					}
+					const detail = lease.kind === "contended"
+						? `Folder ${JSON.stringify(path)} overlaps a grant held by another live session${lease.intent ? ` through ${JSON.stringify(lease.intent)}` : ""}`
+						: `Folder lease for ${JSON.stringify(path)} is unavailable: ${lease.detail ?? lease.reason}`;
+					return refused(`${detail}. Nothing ran.`, prepared);
+				}
+				const changed = await recheckAdminRun(prepared, {}, combined);
+				if (changed || !eligible() || held.some((lease) => lease.alive === false)) {
+					return result({ ...adminRunReceiptBase(prepared), status: "stale", reason: `${changed ?? "The session or a declared lease changed before launch"}; nothing ran.` });
+				}
+				return result(await executeAdminRun(prepared, { signal: combined }));
+			} finally {
+				try { await Promise.all(held.map((lease) => lease.release())); }
+				finally {
+					release();
+					if (adminRun?.abort === abort) adminRun = undefined;
+					finish();
+				}
 			}
 		},
 	});
@@ -703,6 +794,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	pi.on("tool_call", async (event, ctx) => {
 		const publicationReason = publicationWrapperBlockReason(event.toolName, event.input);
 		if (publicationReason) return { block: true, reason: publicationReason };
+		if (reservation.holder === "admin run" && NATIVE_WRITE_TOOLS.has(event.toolName)) return { block: true, reason: "An administrative run is active; native writes wait until it finishes." };
 		if (state === "unguarded") return;
 		if (writable()) {
 			const acquisitionReason = await acquireWriteTargets(event.toolName, event.input, ctx);
@@ -711,7 +803,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 			const reason = await scopedWriteBlockReason(event.toolName, event.input, ctx.cwd, leases.roots, { files: leases.files, signal: ctx.signal, isCurrent: () => current(ticket) && writable() && revision === leases.revision });
 			if (reason) return { block: true, reason };
 			if (leases.roots.length === 0) {
-				const guardedReason = guardedToolBlockReason(event.toolName, event.input, { readOnlySubagents, allowNativeWrites: true });
+				const guardedReason = guardedToolBlockReason(event.toolName, event.input, { readOnlySubagents, allowNativeWrites: true, allowAdminRuns: true });
 				if (guardedReason) return { block: true, reason: guardedReason };
 			}
 			return;
@@ -767,7 +859,8 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	});
 	pi.on("session_shutdown", async (_event, ctx) => {
 		shuttingDown = true; generation++; guardTools();
-		await Promise.all([packageActivationDrain, publication.sessionShutdown()]);
+		adminRun?.abort.abort("session shutdown");
+		await Promise.all([packageActivationDrain, publication.sessionShutdown(), adminRun?.done]);
 		await leases.releaseAll();
 		resetDiscovery(); restoreTools();
 		try { ctx.ui.setStatus("session-mode-leases", undefined); ctx.ui.setStatus("session-mode-grants", undefined); ctx.ui.setStatus("session-mode", undefined); ctx.ui.setWidget("session-mode-grants", undefined); } catch { /* Teardown is already complete. */ }
