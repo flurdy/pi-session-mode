@@ -31,6 +31,7 @@ async function fixture(run: (f: Fixture) => Promise<void>): Promise<void> {
 		git(base, "init", "-q", "-b", "main", work);
 		git(work, "config", "user.email", "fixture@example.invalid");
 		git(work, "config", "user.name", "Fixture");
+		git(work, "config", "core.hooksPath", join(work, ".git", "hooks"));
 		git(work, "commit", "-q", "--allow-empty", "-m", "base");
 		git(work, "remote", "add", "origin", remote);
 		git(work, "push", "-q", "-u", "origin", "main");
