@@ -106,6 +106,38 @@ export async function resolveGrantFolder(value: unknown, cwd: string, options: F
 	return canonical;
 }
 
+/**
+ * Canonical native-write target beneath a held folder grant. Missing parents may be created only inside
+ * that grant (or create the granted missing leaf itself); symlink escapes, dangling links, hardlinks,
+ * directories and Git administration shapes are rejected.
+ */
+export async function resolveFolderWrite(value: unknown, cwd: string, folders: readonly string[], signal?: AbortSignal): Promise<string> {
+	const requested = normalizeToolPath(value, cwd);
+	const missing: string[] = [];
+	let existing = requested;
+	while (true) {
+		signal?.throwIfAborted();
+		try { await lstat(existing); break; }
+		catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT" || dirname(existing) === existing) throw error;
+			missing.unshift(basename(existing));
+			existing = dirname(existing);
+		}
+	}
+	const anchor = await realpath(existing);
+	const canonical = join(anchor, ...missing);
+	if (missing.length === 0) {
+		const info = await stat(canonical);
+		if (!info.isFile() || info.nlink !== 1) throw new Error("Expected a regular file with one link");
+	} else if (!(await stat(anchor)).isDirectory()) throw new Error("Nearest existing ancestor is not a directory");
+	const covered = folders.some((folder) => canonical !== folder && isWithin(canonical, folder) && (isWithin(anchor, folder) || anchor === dirname(folder)));
+	if (!covered) throw new Error("Target is not beneath a held folder grant");
+	if ([".git", "HEAD", "objects", "refs"].includes(basename(canonical)) || missing.includes(".git")) throw new Error("Path overlaps Git administration");
+	await assertOutsideGitAdministration(missing.length ? anchor : dirname(canonical), signal);
+	signal?.throwIfAborted();
+	return canonical;
+}
+
 export async function resolveExplicitFolders(paths: string[], cwd: string, options: FolderScopeOptions = {}): Promise<string[]> {
 	if (!Array.isArray(paths) || paths.length === 0 || paths.length > MAX_FOLDER_GRANTS) throw new Error(`Expected 1–${MAX_FOLDER_GRANTS} folder paths`);
 	const folders = new Set<string>();

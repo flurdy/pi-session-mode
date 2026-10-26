@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { restoreSelection, selectionEntries } from "./selection.ts";
+import { restoreSelection, selectionEntries, selectionFolders } from "./selection.ts";
 import { restoreSelectionV2 } from "./fixtures/selection-v2.ts";
 import { restoreSelectionV3 } from "./fixtures/selection-v3.ts";
+import { restoreSelectionV4 } from "./fixtures/selection-v4.ts";
 
 const entry = (data: unknown) => ({ type: "custom", customType: "session-mode", data });
 test("restores legacy modes and leaves the fresh default to the caller", () => {
@@ -33,6 +34,34 @@ test("actual v0.5.0 and v0.2.1 readers fail closed to plan on a newest v4 select
 		assert.deepEqual(restoreSelectionV3(records), { selection: { mode: "plan" }, invalid: true });
 		assert.deepEqual(restoreSelectionV2(records), { selection: { mode: "plan" }, invalid: true });
 		assert.deepEqual(restoreSelectionV3(records.slice(0, 2)).selection, { mode: "plan" }, "the v1 checkpoint precedes the v4 record");
+	}
+});
+test("folder grants persist as v5 after a v1 plan checkpoint, and every older reader fails closed", () => {
+	for (const selection of [
+		{ mode: "implement", scope: { kind: "lazy", originCwd: "/workspace" }, folders: ["/home/user/.agents/handoffs"] },
+		{ mode: "implement", scope: { kind: "lazy", originCwd: "/workspace" }, files: ["/home/user/a.json"], folders: ["/home/user/state"] },
+		{ mode: "implement", scope: { kind: "roots", roots: ["/api"], originCwd: "/workspace" }, folders: ["/home/user/state"] },
+		{ mode: "implement", scope: { kind: "none" }, folders: ["/home/user/state"] },
+	] as const) {
+		const records = selectionEntries(selection);
+		assert.deepEqual(records[0], { version: 1, mode: "plan" });
+		assert.equal(records[1]?.version, 5);
+		assert.equal(records.length, 2);
+		assert.deepEqual(restoreSelection(records.map(entry))?.selection, selection);
+		assert.deepEqual(selectionFolders(selection), selection.folders);
+		const history = [entry({ version: 2, mode: "implement", scope: { kind: "cwd" } }), ...records.map(entry)];
+		for (const older of [restoreSelectionV4, restoreSelectionV3, restoreSelectionV2]) assert.deepEqual(older(history), { selection: { mode: "plan" }, invalid: true });
+	}
+	assert.equal(selectionEntries({ mode: "implement", scope: { kind: "lazy", originCwd: "/w" }, folders: [] })[1]?.version, 4, "no folders keeps the v4 record");
+	for (const data of [
+		{ version: 5, mode: "implement", scope: { kind: "lazy", originCwd: "/w" } },
+		{ version: 5, mode: "implement", scope: { kind: "lazy", originCwd: "/w" }, folders: [] },
+		{ version: 5, mode: "implement", scope: { kind: "lazy", originCwd: "/w" }, folders: ["relative"] },
+		{ version: 5, mode: "implement", scope: { kind: "cwd" }, folders: Array.from({ length: 17 }, (_, index) => `/f${index}`) },
+		{ version: 5, mode: "plan", folders: ["/f"] },
+		{ version: 5, mode: "implement", scope: { kind: "lazy", originCwd: "/w" }, folders: ["/f"], extra: true },
+	]) {
+		assert.deepEqual(restoreSelection([entry({ version: 2, mode: "implement", scope: { kind: "cwd" } }), entry(data)]), { selection: { mode: "plan" }, invalid: true }, JSON.stringify(data));
 	}
 });
 test("scoped checkpoints restore on new versions and safely appear as plan to v1", () => {

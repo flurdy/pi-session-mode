@@ -1,11 +1,11 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { realpath } from "node:fs/promises";
-import { isAbsolute, relative, sep } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { acquireFileLease, acquireFolderLease, acquireWorktreeLease, IntentPool, type FileLeaseResult, type FolderLeaseResult, type HeldFolderLease, type WorktreeLeaseResult } from "./lease.ts";
 import { adminRunDialog, adminRunReceiptBase, executeAdminRun, prepareAdminRun, recheckAdminRun, type AdminRunReceipt, type PreparedAdminRun } from "./admin-run.ts";
-import { isWithin } from "./path.ts";
+import { isWithin, normalizeToolPath } from "./path.ts";
 import { OperationReservation } from "./reservation.ts";
 import { LeaseSet, type HeldScopes, type LeaseSetResult, type ScopeSetRequest } from "./lease-set.ts";
 import { probeWorktreeLeaseOccupancies } from "./lease-observer.ts";
@@ -13,11 +13,11 @@ import { inventoryHeldLeases, type LeaseInventory, type LeaseInventoryOptions } 
 import { defaultPackageActivationDependencies, activatePreparedPackage, preparePackageActivation, type PackageActivationEvidence, type PackageActivationLaunchOptions, type PackageActivationRequest, type PreparedPackageActivation } from "./package-activation.ts";
 import { guardedToolBlockReason } from "./policy.ts";
 import { scopedWriteBlockReason } from "./scoped-policy.ts";
-import { resolveExplicitFiles } from "./file-scope.ts";
+import { resolveExplicitFiles, resolveExplicitFolders } from "./file-scope.ts";
 import { registerHandoffSave } from "./handoff-save.ts";
 import { publicationWrapperBlockReason, registerCommitPublication } from "./commit-publication.ts";
 import { ADDITION_TIMEOUT_MS, parseRootArguments, parseRootFlag, resolveExplicitRoots, safeDisplay, scopeStatus } from "./scope.ts";
-import { restoreSelection, selectionEntries, selectionFiles, type Selection, type WorktreeSelection } from "./selection.ts";
+import { restoreSelection, selectionEntries, selectionFiles, selectionFolders, type Selection, type WorktreeSelection } from "./selection.ts";
 import { verifiedReadOnlySubagents } from "./subagent-policy.ts";
 
 export type SessionMode = "implement" | "plan";
@@ -32,6 +32,7 @@ export interface SessionModeDependencies {
 	acquireFile?(file: string, options: { sessionId: string; signal?: AbortSignal; expectedFile?: string }): Promise<FileLeaseResult>;
 	acquireFolder?(dir: string, options: { sessionId: string; signal?: AbortSignal; expectedDir?: string; intentPool?: IntentPool }): Promise<FolderLeaseResult>;
 	resolveFiles?(paths: string[], cwd: string, signal?: AbortSignal): Promise<string[]>;
+	resolveFolders?(paths: string[], cwd: string, signal?: AbortSignal): Promise<string[]>;
 	isDisabled(): boolean;
 	readOnlySubagents(cwd: string, preferredProvider?: string): Promise<ReadonlySet<string>>;
 	packageActivation?: PackageActivationAdapter;
@@ -42,12 +43,14 @@ export interface SessionModeController {
 	readonly state: SessionGuardState;
 	readonly roots: readonly string[];
 	readonly files: readonly string[];
+	readonly folders: readonly string[];
 }
 interface Implementation {
 	generation: number;
 	key: string;
 	requestedRoots: readonly string[];
 	requestedFiles: readonly string[];
+	requestedFolders: readonly string[];
 	persist: boolean;
 	/** A failed addition started from healthy lazy mode keeps lazy intent. */
 	retainLazy: boolean;
@@ -63,8 +66,10 @@ const STATE_META: Record<SessionGuardState, { label: string; tone: "success" | "
 	lost: { label: "lost", tone: "error" },
 	unguarded: { label: "unguarded", tone: "error" },
 };
-function grantStatus(files: readonly string[]): string {
-	return scopeStatus(files).replace(/^leases:/, "grants:");
+function grantStatus(files: readonly string[], folders: readonly string[] = []): string {
+	const names = [...files.map((file) => basename(file)), ...folders.map((folder) => `${basename(folder)}/`)]
+		.map((name) => safeDisplay(JSON.stringify(name).slice(1, -1)));
+	return `grants:${names.length}${names.length ? ` ${names.join(", ").slice(0, 100)}` : ""}`;
 }
 function boundedScopeList(values: readonly string[]): string {
 	const visible: string[] = [];
@@ -120,7 +125,12 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		try { persistSelection(selection); } catch { /* Write authority is already revoked. */ }
 		void refreshReadOnlySubagents(ctx).catch(() => {});
 		notify(ctx, "A scope lease was lost. All worktree and file scopes are now guarded; reacquire explicitly.", "error");
-	}, { acquireFile: dependencies.acquireFile ?? acquireFileLease, resolveFiles: dependencies.resolveFiles ?? resolveExplicitFiles, acquireFolder: dependencies.acquireFolder ?? acquireFolderLease });
+	}, {
+		acquireFile: dependencies.acquireFile ?? acquireFileLease,
+		resolveFiles: dependencies.resolveFiles ?? resolveExplicitFiles,
+		acquireFolder: dependencies.acquireFolder ?? acquireFolderLease,
+		resolveFolders: dependencies.resolveFolders ?? ((paths, cwd, signal) => resolveExplicitFolders(paths, cwd, signal ? { signal } : {})),
+	});
 
 	pi.registerFlag("plan", { description: "Start in guarded plan mode without leases", type: "boolean", default: false });
 	pi.registerFlag("implement", { description: "Acquire the cwd worktree lease", type: "boolean", default: false });
@@ -143,10 +153,11 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		try {
 			const guarded = next === "lost" || next === "unguarded";
 			ctx.ui.setStatus("session-mode-leases", scopeStatus(guarded ? [] : leases.roots));
-			const files = guarded ? [] : leases.files;
-			ctx.ui.setStatus("session-mode-grants", files.length ? grantStatus(files) : undefined);
+			const files = guarded ? [] : leases.files, folders = guarded ? [] : leases.folders;
+			const granted = files.length + folders.length > 0;
+			ctx.ui.setStatus("session-mode-grants", granted ? grantStatus(files, folders) : undefined);
 			ctx.ui.setStatus("session-mode", ctx.ui.theme.fg(tone, label));
-			ctx.ui.setWidget("session-mode-grants", files.length ? [`${grantStatus(files)} — /grants for exact paths`] : undefined);
+			ctx.ui.setWidget("session-mode-grants", granted ? [`${grantStatus(files, folders)} — /grants for exact paths`] : undefined);
 		} catch { /* State enforcement does not depend on rendering. */ }
 		warnDiscovery(ctx);
 	}
@@ -185,7 +196,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		return selection.mode === "implement" && selection.scope.kind === "lazy" && leases.roots.length === 0 ? "lazy" : "implement";
 	}
 	function writable(): boolean {
-		return (state === "implement" && leases.live) || (state === "lazy" && leases.roots.length === 0 && (leases.files.length === 0 || leases.live));
+		return (state === "implement" && leases.live) || (state === "lazy" && leases.roots.length === 0 && ((leases.files.length === 0 && leases.folders.length === 0) || leases.live));
 	}
 	function acquisitionEligible(): boolean {
 		return !dependencies.isDisabled() && writable() && (state === "lazy" || leases.roots.length > 0);
@@ -235,15 +246,15 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		}
 	}
 
-	function selected(scope: WorktreeSelection, scopes: HeldScopes): Selection {
-		return scopes.files.length ? { mode: "implement", scope, files: scopes.files } : { mode: "implement", scope };
+	function selected(scope: WorktreeSelection, scopes: Pick<HeldScopes, "files" | "folders">): Selection {
+		return { mode: "implement", scope, ...(scopes.files.length ? { files: scopes.files } : {}), ...(scopes.folders.length ? { folders: scopes.folders } : {}) };
 	}
 	function enterScopes(
 		ctx: ExtensionContext,
 		request: ScopeSetRequest,
 		scopeFor: (scopes: HeldScopes, originCwd?: string) => WorktreeSelection,
 		persist = false,
-		expected?: { roots?: readonly string[]; files?: readonly string[]; originCwd?: string },
+		expected?: { roots?: readonly string[]; files?: readonly string[]; folders?: readonly string[]; originCwd?: string },
 		legacyImplicit = false,
 	): Promise<void> {
 		currentContext = ctx;
@@ -254,7 +265,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 			return implementation.promise;
 		}
 		const requestedRoots = request.worktrees.kind === "paths" ? request.worktrees.paths : request.worktrees.kind === "cwd" ? [ctx.cwd] : [];
-		const operation: Implementation = { generation: ++generation, key, requestedRoots, requestedFiles: request.files, persist, retainLazy: state === "lazy", promise: undefined! };
+		const operation: Implementation = { generation: ++generation, key, requestedRoots, requestedFiles: request.files, requestedFolders: request.folders ?? [], persist, retainLazy: state === "lazy", promise: undefined! };
 		implementation = operation;
 		operation.promise = doAcquire(ctx, request, scopeFor, operation, expected, legacyImplicit).finally(() => {
 			if (implementation === operation) implementation = undefined;
@@ -266,7 +277,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		request: ScopeSetRequest,
 		scopeFor: (scopes: HeldScopes, originCwd?: string) => WorktreeSelection,
 		operation: Implementation,
-		expected?: { roots?: readonly string[]; files?: readonly string[]; originCwd?: string },
+		expected?: { roots?: readonly string[]; files?: readonly string[]; folders?: readonly string[]; originCwd?: string },
 		legacyImplicit = false,
 	): Promise<void> {
 		const ticket = operation.generation;
@@ -279,7 +290,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 				if (!current(ticket)) return;
 				unguarded(ctx); notify(ctx, "Session guard disabled by PI_SESSION_GUARD=0.", "warning"); return;
 			}
-			const requested = [...operation.requestedRoots, ...operation.requestedFiles];
+			const requested = [...operation.requestedRoots, ...operation.requestedFiles, ...operation.requestedFolders];
 			const originCwd = request.worktrees.kind === "paths" ? await realpath(ctx.cwd) : undefined;
 			if (!current(ticket)) return;
 			if (expected?.originCwd !== undefined && originCwd !== expected.originCwd) {
@@ -291,13 +302,13 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 				if (!current(ticket)) throw new Error("Scope transition superseded");
 				candidate = selected(scopeFor(scopes, originCwd), scopes);
 				if (operation.persist) persistSelection(candidate);
-			}, expected && { ...(expected.roots ? { roots: expected.roots } : {}), ...(expected.files ? { files: expected.files } : {}) });
+			}, expected && { ...(expected.roots ? { roots: expected.roots } : {}), ...(expected.files ? { files: expected.files } : {}), ...(expected.folders ? { folders: expected.folders } : {}) });
 			if (!current(ticket)) return;
 			if (result.kind === "held" && leases.live) {
 				selection = candidate; lastFailure = undefined; mode = "implement";
 				resetDiscovery(); restoreTools(); setState(ctx, activeState());
 				if (state === "lazy") await refreshReadOnlySubagents(ctx);
-			} else if (result.kind === "unguarded" && legacyImplicit && leases.files.length === 0) {
+			} else if (result.kind === "unguarded" && legacyImplicit && leases.files.length === 0 && leases.folders.length === 0) {
 				selection = { mode: "implement", scope: { kind: "cwd" } };
 				if (operation.persist) persistSelection(selection);
 				unguarded(ctx); notify(ctx, `Session guard unavailable (${result.reason}). This session is unguarded.`, "error");
@@ -305,7 +316,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 				await failScope(ctx, result, requested, ticket, operation.persist, { legacyContention: legacyImplicit && result.kind === "contended", retainLazy: operation.retainLazy });
 			}
 		} catch (error) {
-			if (current(ticket)) await failScope(ctx, error instanceof Error ? error.message : String(error), [...operation.requestedRoots, ...operation.requestedFiles], ticket, operation.persist, { retainLazy: operation.retainLazy });
+			if (current(ticket)) await failScope(ctx, error instanceof Error ? error.message : String(error), [...operation.requestedRoots, ...operation.requestedFiles, ...operation.requestedFolders], ticket, operation.persist, { retainLazy: operation.retainLazy });
 		}
 	}
 	async function enterImplement(ctx: ExtensionContext, paths?: string[], persist = false): Promise<void> {
@@ -313,15 +324,23 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		if (paths === undefined) return enterScopes(ctx, { worktrees: { kind: "cwd" }, files: [] }, () => ({ kind: "cwd" }), persist, undefined, true);
 		return enterScopes(ctx, { worktrees: { kind: "paths", paths }, files: [] }, (scopes, originCwd) => ({ kind: "roots", roots: scopes.roots, originCwd: originCwd! }), persist);
 	}
+	/** Grants keep held worktrees or lazy intent; otherwise they form a grant-only implementation scope. */
+	function grantScope(): WorktreeSelection {
+		return selection.mode === "implement" && (leases.roots.length > 0 || selection.scope.kind === "lazy") ? selection.scope : { kind: "none" };
+	}
 	function enterFiles(ctx: ExtensionContext, paths: string[], expectedFiles: readonly string[], persist = false): Promise<void> {
-		const preserved = selection.mode === "implement" && (leases.roots.length > 0 || selection.scope.kind === "lazy") ? selection.scope : { kind: "none" } as const;
+		const preserved = grantScope();
 		return enterScopes(ctx, { worktrees: { kind: "none" }, files: paths }, () => preserved, persist, { files: expectedFiles });
+	}
+	function enterFolders(ctx: ExtensionContext, paths: string[], expectedFolders: readonly string[], persist = false): Promise<void> {
+		const preserved = grantScope();
+		return enterScopes(ctx, { worktrees: { kind: "none" }, files: [], folders: paths }, () => preserved, persist, { folders: expectedFolders });
 	}
 	/**
 	 * Select lazy intent: release held worktree leases while keeping live exact-file grants, or
 	 * reacquire restored grants. Returns the released roots when it completed without reacquisition.
 	 */
-	async function enterLazy(ctx: ExtensionContext, persist: boolean, restored?: { originCwd: string; files: readonly string[] }): Promise<readonly string[] | undefined> {
+	async function enterLazy(ctx: ExtensionContext, persist: boolean, restored?: { originCwd: string; files: readonly string[]; folders: readonly string[] }): Promise<readonly string[] | undefined> {
 		currentContext = ctx;
 		const ticket = ++generation;
 		let originCwd: string;
@@ -333,12 +352,13 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 			return;
 		}
 		const scope = { kind: "lazy", originCwd } as const;
-		if (restored?.files.length) {
-			await enterScopes(ctx, { worktrees: { kind: "none" }, files: restored.files.map((file) => pathToFileURL(file).href) }, () => scope, true, { files: restored.files });
+		if (restored && (restored.files.length || restored.folders.length)) {
+			const url = (path: string) => pathToFileURL(path).href;
+			await enterScopes(ctx, { worktrees: { kind: "none" }, files: restored.files.map(url), folders: restored.folders.map(url) }, () => scope, true, { files: restored.files, folders: restored.folders });
 			return;
 		}
-		const released = leases.roots, files = leases.live ? leases.files : [];
-		selection = files.length ? { mode: "implement", scope, files } : { mode: "implement", scope };
+		const released = leases.roots;
+		selection = selected(scope, leases.live ? { files: leases.files, folders: leases.folders } : { files: [], folders: [] });
 		mode = "implement"; lastFailure = undefined;
 		let checkpointFailed = false;
 		if (persist) { try { persistSelection(selection); } catch { checkpointFailed = true; } }
@@ -360,20 +380,21 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		return true;
 	}
 	function enterRestored(ctx: ExtensionContext, restored: Exclude<Selection, { mode: "plan" }>): Promise<void> {
-		const files = [...selectionFiles(restored)];
+		const files = [...selectionFiles(restored)], folders = [...selectionFolders(restored)];
 		const worktrees: ScopeSetRequest["worktrees"] = restored.scope.kind === "roots"
 			? { kind: "paths", paths: restored.scope.roots.map((root) => pathToFileURL(root).href) }
 			: restored.scope.kind === "cwd" ? { kind: "cwd" } : { kind: "none" };
 		return enterScopes(
 			ctx,
-			{ worktrees, files: files.map((file) => pathToFileURL(file).href) },
+			{ worktrees, files: files.map((file) => pathToFileURL(file).href), folders: folders.map((folder) => pathToFileURL(folder).href) },
 			(scopes) => restored.scope.kind === "roots" ? { ...restored.scope, roots: scopes.roots } : restored.scope,
-			restored.scope.kind === "roots" || files.length > 0,
+			restored.scope.kind === "roots" || files.length > 0 || folders.length > 0,
 			{
 				...(restored.scope.kind === "roots" ? { roots: restored.scope.roots, originCwd: restored.scope.originCwd } : {}),
 				...(files.length ? { files } : {}),
+				...(folders.length ? { folders } : {}),
 			},
-			worktrees.kind === "cwd" && files.length === 0,
+			worktrees.kind === "cwd" && files.length === 0 && folders.length === 0,
 		);
 	}
 
@@ -429,53 +450,112 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 			}
 		},
 	});
-	pi.registerCommand("grant-file", {
+	function registerGrantCommand(name: string, spec: {
+		description: string; label: string; noun: string; title: string;
+		body(display: string): string;
+		resolve(paths: string[], cwd: string): Promise<string[]>;
+		enter(ctx: ExtensionContext, paths: string[], expected: readonly string[]): Promise<void>;
+	}): void {
+		pi.registerCommand(name, {
+			description: spec.description,
+			handler: async (args, ctx) => {
+				if (rejectBusy(ctx)) return;
+				if (dependencies.isDisabled()) { notify(ctx, `${spec.label} grants are unavailable while the guard is disabled.`, "warning"); return; }
+				if (ctx.mode !== "tui" || !ctx.hasUI) { notify(ctx, `${spec.label} grants require interactive TUI confirmation.`, "warning"); return; }
+				const ticket = generation, sessionId = ctx.sessionManager.getSessionId();
+				const confirmationCurrent = () => {
+					try { return current(ticket) && currentContext?.sessionManager.getSessionId() === sessionId && ctx.sessionManager.getSessionId() === sessionId; }
+					catch { return false; }
+				};
+				const sessionChanged = () => notify(ctx, `${spec.label} grant cancelled because the session changed.`, "warning");
+				try {
+					const paths = parseRootArguments(args);
+					if (!paths.length) throw new Error(`Expected at least one ${spec.noun} path`);
+					const expected = await spec.resolve(paths, ctx.cwd);
+					if (!confirmationCurrent()) { sessionChanged(); return; }
+					if (rejectBusy(ctx)) return;
+					const display = expected.map((path) => safeDisplay(JSON.stringify(path))).join("\n");
+					if (display.length > 10_000) throw new Error(`${spec.label} confirmation scope is too large`);
+					const confirmed = await ctx.ui.confirm(spec.title, spec.body(display), { timeout: 60_000 });
+					if (!confirmed) { notify(ctx, `${spec.label} grant cancelled.`); return; }
+					if (!confirmationCurrent()) { sessionChanged(); return; }
+					if (rejectBusy(ctx)) return;
+					if (dependencies.isDisabled() || ctx.mode !== "tui" || !ctx.hasUI) { notify(ctx, `${spec.label} grant cancelled because the authorization context changed.`, "warning"); return; }
+					await spec.enter(ctx, paths, expected);
+				} catch (error) {
+					if (!confirmationCurrent()) { sessionChanged(); return; }
+					if ((implementation && current(implementation.generation)) || state === "lost") {
+						lastFailure = { requested: [], result: String(error) };
+						notify(ctx, `Grant error: ${String(error)}`, "error"); return;
+					}
+					await failScope(ctx, String(error), [], ++generation, true, { retainLazy: state === "lazy" });
+				}
+			},
+		});
+	}
+	const resolveFolders = (paths: string[], cwd: string) => (dependencies.resolveFolders ?? ((values: string[], base: string) => resolveExplicitFolders(values, base)))(paths, cwd);
+	registerGrantCommand("grant-file", {
 		description: "Confirm and acquire exact non-repository file grants",
+		label: "Exact-file", noun: "exact file", title: "Grant exact file writes?",
+		body: (display) => `The native edit/write tools may change only these non-repository files while their leases remain held:\n\n${display}\n\nWith file-only scopes, obvious Bash, package, Git, system and writer-subagent mutations remain guarded. Other extensions, editors, users and machines are not confined.`,
+		resolve: (paths, cwd) => (dependencies.resolveFiles ?? resolveExplicitFiles)(paths, cwd),
+		enter: (ctx, paths, expected) => enterFiles(ctx, paths, expected, true),
+	});
+	registerGrantCommand("grant-folder", {
+		description: "Confirm and acquire non-repository folder grants for native edit/write",
+		label: "Folder", noun: "folder", title: "Grant folder writes?",
+		body: (display) => `The native edit/write tools may create and change non-repository files beneath these folders while their leases remain held:\n\n${display}\n\nRepositories, symlink escapes, hardlinks and Git administration inside them stay excluded. This does not authorize Bash: without a worktree lease, obvious Bash, package, Git, system and writer-subagent mutations remain guarded, and run_admin needs its own confirmation per run. Other extensions, editors, users and machines are not confined.`,
+		resolve: resolveFolders,
+		enter: (ctx, paths, expected) => enterFolders(ctx, paths, expected, true),
+	});
+	async function heldGrantIdentity(value: string, cwd: string): Promise<string | undefined> {
+		const held = [...leases.files, ...leases.folders];
+		const requested = normalizeToolPath(value, cwd);
+		const candidates = [requested, await realpath(requested).catch(() => undefined), await realpath(dirname(requested)).then((parent) => join(parent, basename(requested)), () => undefined)];
+		return candidates.find((candidate) => candidate !== undefined && held.includes(candidate));
+	}
+	pi.registerCommand("revoke-grants", {
+		description: "Release named (or all) exact-file and folder grants; worktree leases stay held",
 		handler: async (args, ctx) => {
 			if (rejectBusy(ctx)) return;
-			if (dependencies.isDisabled()) { notify(ctx, "Exact-file grants are unavailable while the guard is disabled.", "warning"); return; }
-			if (ctx.mode !== "tui" || !ctx.hasUI) { notify(ctx, "Exact-file grants require interactive TUI confirmation.", "warning"); return; }
-			const ticket = generation, sessionId = ctx.sessionManager.getSessionId();
-			const confirmationCurrent = () => {
-				try { return current(ticket) && currentContext?.sessionManager.getSessionId() === sessionId && ctx.sessionManager.getSessionId() === sessionId; }
-				catch { return false; }
-			};
+			if (scopeBusy()) { notify(ctx, "Another scope transition or operation is active; try again when it finishes.", "warning"); return; }
 			try {
 				const paths = parseRootArguments(args);
-				if (!paths.length) throw new Error("Expected at least one exact file path");
-				const expected = await (dependencies.resolveFiles ?? resolveExplicitFiles)(paths, ctx.cwd);
-				if (!confirmationCurrent()) { notify(ctx, "Exact-file grant cancelled because the session changed.", "warning"); return; }
-				if (rejectBusy(ctx)) return;
-				const display = expected.map((file) => safeDisplay(JSON.stringify(file))).join("\n");
-				if (display.length > 10_000) throw new Error("Exact-file confirmation scope is too large");
-				const confirmed = await ctx.ui.confirm(
-					"Grant exact file writes?",
-					`The native edit/write tools may change only these non-repository files while their leases remain held:\n\n${display}\n\nWith file-only scopes, obvious Bash, package, Git, system and writer-subagent mutations remain guarded. Other extensions, editors, users and machines are not confined.`,
-					{ timeout: 60_000 },
-				);
-				if (!confirmed) { notify(ctx, "Exact-file grant cancelled."); return; }
-				if (!confirmationCurrent()) { notify(ctx, "Exact-file grant cancelled because the session changed.", "warning"); return; }
-				if (rejectBusy(ctx)) return;
-				if (dependencies.isDisabled() || ctx.mode !== "tui" || !ctx.hasUI) { notify(ctx, "Exact-file grant cancelled because the authorization context changed.", "warning"); return; }
-				await enterFiles(ctx, paths, expected, true);
-			} catch (error) {
-				if (!confirmationCurrent()) { notify(ctx, "Exact-file grant cancelled because the session changed.", "warning"); return; }
-				if ((implementation && current(implementation.generation)) || state === "lost") {
-					lastFailure = { requested: [], result: String(error) };
-					notify(ctx, `Grant error: ${String(error)}`, "error"); return;
+				const targets: string[] = [];
+				for (const path of paths) {
+					const identity = await heldGrantIdentity(path, ctx.cwd);
+					if (!identity) { notify(ctx, `${safeDisplay(JSON.stringify(path))} is not a held grant; nothing was revoked. Use /grants to list them.`, "error"); return; }
+					targets.push(identity);
 				}
-				await failScope(ctx, String(error), [], ++generation, true, { retainLazy: state === "lazy" });
-			}
+				if (!paths.length) targets.push(...leases.files, ...leases.folders);
+				if (!targets.length) { notify(ctx, "No exact-file or folder grants are held."); return; }
+				const ticket = ++generation;
+				const remaining = { files: leases.files.filter((file) => !targets.includes(file)), folders: leases.folders.filter((folder) => !targets.includes(folder)) };
+				const scope = selection.mode === "implement" ? selection.scope : { kind: "none" } as const;
+				const grantOnly = leases.roots.length === 0 && scope.kind !== "lazy";
+				const next: Selection = grantOnly && !remaining.files.length && !remaining.folders.length ? { mode: "plan" } : selected(scope, remaining);
+				let checkpointFailed = false;
+				try { persistSelection(next); } catch { checkpointFailed = true; }
+				selection = next; lastFailure = undefined;
+				await leases.releaseGrants(targets);
+				if (!current(ticket)) return;
+				if (next.mode === "plan") { mode = "plan"; guardTools(); setState(ctx, "plan"); await refreshReadOnlySubagents(ctx); }
+				else setState(ctx, activeState());
+				notify(ctx, `Revoked grants ${boundedScopeList(targets)}.${next.mode === "plan" ? " No scopes remain; the session is guarded in plan mode." : ""}`);
+				if (checkpointFailed) notify(ctx, "Grants were revoked, but the selection could not be saved; restart with --plan or reselect scopes.", "error");
+			} catch (error) { notify(ctx, `Revoke error: ${String(error)}`, "error"); }
 		},
 	});
 	pi.registerCommand("grants", {
-		description: "Show held exact-file grants or inspect file identities",
+		description: "Show held exact-file and folder grants or inspect identities",
 		handler: async (args, ctx) => {
 			try {
 				const paths = parseRootArguments(args);
-				const inspected = paths.length ? await (dependencies.resolveFiles ?? resolveExplicitFiles)(paths, ctx.cwd) : undefined;
-				const requested = implementation && current(implementation.generation) ? implementation.requestedFiles : undefined;
-				notify(ctx, JSON.stringify({ state: STATE_META[state].label, held: leases.files, requested, inspected, lastFailure }));
+				const inspected = paths.length
+					? await (dependencies.resolveFiles ?? resolveExplicitFiles)(paths, ctx.cwd).catch(() => resolveFolders(paths, ctx.cwd))
+					: undefined;
+				const requested = implementation && current(implementation.generation) ? [...implementation.requestedFiles, ...implementation.requestedFolders] : undefined;
+				notify(ctx, JSON.stringify({ state: STATE_META[state].label, held: leases.files, folders: leases.folders, requested, inspected, lastFailure }));
 			} catch (error) { notify(ctx, `Grant inspection unavailable: ${String(error)}`, "error"); }
 		},
 	});
@@ -495,7 +575,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		handler: async (_args, ctx) => {
 			try {
 				const inventory = await (dependencies.inventory ?? inventoryHeldLeases)({ signal: ctx.signal });
-				const payload = { state: STATE_META[state].label, held: { worktrees: leases.roots, files: leases.files }, inventory, omittedSessions: 0 };
+				const payload = { state: STATE_META[state].label, held: { worktrees: leases.roots, files: leases.files, folders: leases.folders }, inventory, omittedSessions: 0 };
 				while (inventory.kind === "inventory" && JSON.stringify(payload).length > 10_000 && inventory.sessions.length > 1) {
 					inventory.sessions.pop(); payload.omittedSessions++;
 				}
@@ -602,7 +682,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 			if (scopeBusy()) refuse("Cannot release scopes while a write, scope transition, package activation, administrative run, publication, release or shutdown is active.");
 			if (dependencies.isDisabled() || state === "unguarded") refuse("The session guard is disabled; there are no guarded scopes to release.");
 			if (state === "lazy" && leases.roots.length === 0) {
-				const details = { status: "lazy", released: [], files: leases.files };
+				const details = { status: "lazy", released: [], files: leases.files, folders: leases.folders };
 				return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details };
 			}
 			if (state !== "implement" || !leases.live || leases.roots.length === 0) refuse(`release_scopes requires implement mode with held worktree leases, or lazy mode (current: ${STATE_META[state].label}).`);
@@ -627,7 +707,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 				const originCwd = await realpath(ctx.cwd);
 				if (!unchanged()) refuse("Scopes changed or the release was cancelled during checks.");
 				const releaseTicket = ++generation;
-				selection = leases.files.length ? { mode: "implement", scope: { kind: "lazy", originCwd }, files: leases.files } : { mode: "implement", scope: { kind: "lazy", originCwd } };
+				selection = selected({ kind: "lazy", originCwd }, { files: leases.files, folders: leases.folders });
 				mode = "implement"; lastFailure = undefined;
 				await leases.releaseWorktrees();
 				if (!current(releaseTicket)) {
@@ -640,7 +720,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 				void refreshReadOnlySubagents(ctx).catch(() => {});
 				if (dirty.length) notify(ctx, `Released dirty worktrees ${boundedScopeList(dirty)} on request: ${reason}`, "warning");
 				if (checkpoint === "failed") notify(ctx, "Worktree leases were released, but lazy mode could not be saved; use --lazy when restarting.", "error");
-				const details = { status: "released", released: roots, dirty, ...(dirty.length ? { reason } : {}), files: leases.files, checkpoint };
+				const details = { status: "released", released: roots, dirty, ...(dirty.length ? { reason } : {}), files: leases.files, folders: leases.folders, checkpoint };
 				return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details };
 			} finally {
 				if (releaseOperation === operation) releaseOperation = undefined;
@@ -746,15 +826,13 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		const eligible = () => current(ticket) && acquisitionEligible() && !signal.aborted;
 		const unchanged = () => eligible() && leases.revision === revision;
 		try {
-			const reason = await scopedWriteBlockReason(tool, input, ctx.cwd, leases.roots, { files: leases.files, collectMissingRoots: missing, signal, isCurrent: unchanged });
+			const reason = await scopedWriteBlockReason(tool, input, ctx.cwd, leases.roots, { files: leases.files, folders: leases.folders, collectMissingRoots: missing, signal, isCurrent: unchanged });
 			if (reason) return reason;
 			if (!unchanged()) return "Scope changed or tool cancelled during native-write validation; write blocked.";
 			if (!missing.size) return;
 			for (const root of missing) {
-				if (leases.files.some((file) => {
-					const path = relative(root, file);
-					return path === "" || (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path));
-				})) return `Worktree ${safeDisplay(JSON.stringify(root))} overlaps an exact-file grant; reselect scopes explicitly.`;
+				if (leases.files.some((file) => isWithin(file, root))) return `Worktree ${safeDisplay(JSON.stringify(root))} overlaps an exact-file grant; reselect scopes explicitly.`;
+				if (leases.folders.some((folder) => isWithin(folder, root) || isWithin(root, folder))) return `Worktree ${safeDisplay(JSON.stringify(root))} overlaps a folder grant; reselect scopes explicitly.`;
 			}
 			const originCwd = await realpath(ctx.cwd);
 			if (!unchanged()) return "Scope changed or tool cancelled before acquisition; write blocked.";
@@ -800,7 +878,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 			const acquisitionReason = await acquireWriteTargets(event.toolName, event.input, ctx);
 			if (acquisitionReason) return { block: true, reason: acquisitionReason };
 			const ticket = generation, revision = leases.revision;
-			const reason = await scopedWriteBlockReason(event.toolName, event.input, ctx.cwd, leases.roots, { files: leases.files, signal: ctx.signal, isCurrent: () => current(ticket) && writable() && revision === leases.revision });
+			const reason = await scopedWriteBlockReason(event.toolName, event.input, ctx.cwd, leases.roots, { files: leases.files, folders: leases.folders, signal: ctx.signal, isCurrent: () => current(ticket) && writable() && revision === leases.revision });
 			if (reason) return { block: true, reason };
 			if (leases.roots.length === 0) {
 				const guardedReason = guardedToolBlockReason(event.toolName, event.input, { readOnlySubagents, allowNativeWrites: true, allowAdminRuns: true });
@@ -854,7 +932,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 			mode = "plan"; guardTools(); await refreshReadOnlySubagents(ctx); setState(ctx, "plan");
 			if (conflictingLazy) notify(ctx, "--lazy cannot be combined with --implement or --lease-roots; started in guarded plan mode. Restart with one mode flag.", "error");
 			else if (restored?.invalid) notify(ctx, "Invalid restored scope; reselect worktrees with /implement or exact files with /grant-file.", "error");
-		} else if (selection.scope.kind === "lazy") await enterLazy(ctx, false, { originCwd: selection.scope.originCwd, files: selectionFiles(selection) });
+		} else if (selection.scope.kind === "lazy") await enterLazy(ctx, false, { originCwd: selection.scope.originCwd, files: selectionFiles(selection), folders: selectionFolders(selection) });
 		else await enterRestored(ctx, selection);
 	});
 	pi.on("session_shutdown", async (_event, ctx) => {
@@ -866,5 +944,5 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		try { ctx.ui.setStatus("session-mode-leases", undefined); ctx.ui.setStatus("session-mode-grants", undefined); ctx.ui.setStatus("session-mode", undefined); ctx.ui.setWidget("session-mode-grants", undefined); } catch { /* Teardown is already complete. */ }
 		currentContext = undefined;
 	});
-	return { get mode() { return mode; }, get state() { return state; }, get roots() { return leases.roots; }, get files() { return leases.files; } };
+	return { get mode() { return mode; }, get state() { return state; }, get roots() { return leases.roots; }, get files() { return leases.files; }, get folders() { return leases.folders; } };
 }

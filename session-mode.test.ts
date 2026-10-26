@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -100,7 +101,7 @@ function harness(results: WorktreeLeaseResult[] = [held()], options: Partial<Ses
 
 test("registers scope controls, fixed handoff saving, commit publication and confirmed package activation", () => {
 	const { pi } = harness();
-	assert.deepEqual([...pi.commands.keys()].sort(), ["grant-file", "grants", "implement", "lazy", "lease-holders", "leases", "plan"]);
+	assert.deepEqual([...pi.commands.keys()].sort(), ["grant-file", "grant-folder", "grants", "implement", "lazy", "lease-holders", "leases", "plan", "revoke-grants"]);
 	assert.deepEqual([...pi.tools.keys()], ["save_handoff", "publish_commit", "activate_pi_package", "release_scopes", "run_admin"]);
 });
 
@@ -119,7 +120,7 @@ test("lease-holders reports the kernel inventory without acquiring and trims ove
 	const ctx = context();
 	await pi.commands.get("lease-holders")?.handler("", ctx);
 	let payload = JSON.parse(ctx.notifications.at(-1)!.message);
-	assert.deepEqual(payload.held, { worktrees: [], files: [] });
+	assert.deepEqual(payload.held, { worktrees: [], files: [], folders: [] });
 	assert.equal(payload.inventory.sessions.length, 2);
 	assert.equal(payload.inventory.sessions[0].self, true);
 	assert.doesNotMatch(ctx.notifications.at(-1)!.message, /[\u0000-\u001f\u007f-\u009f]/);
@@ -1216,7 +1217,7 @@ test("release_scopes is sequential, idempotent in lazy and changes nothing outsi
 	assert.equal((lazy.pi.tools.get("release_scopes") as { executionMode?: string }).executionMode, "sequential");
 	const lazyContext = realContext([]);
 	await lazy.pi.emit("session_start", lazyContext);
-	assert.deepEqual((await releaseTool(lazy.pi, lazyContext)).details, { status: "lazy", released: [], files: [] });
+	assert.deepEqual((await releaseTool(lazy.pi, lazyContext)).details, { status: "lazy", released: [], files: [], folders: [] });
 	assert.deepEqual(lazy.pi.appended, []);
 
 	const plan = harness([]); plan.pi.planFlag = true;
@@ -1257,7 +1258,7 @@ test("release_scopes releases clean worktrees to lazy, keeps grants, and blocks 
 	assert.equal((nested as { block?: boolean })?.block, true);
 	await pi.commands.get("grant-file")?.handler(JSON.stringify(file), ctx);
 	const result = await releaseTool(pi, ctx);
-	assert.deepEqual(result.details, { status: "released", released: ["/repo"], dirty: [], files: [file], checkpoint: "saved" });
+	assert.deepEqual(result.details, { status: "released", released: ["/repo"], dirty: [], files: [file], folders: [], checkpoint: "saved" });
 	assert.deepEqual(pi.execCalls.at(-1), ["git", "-C", "/repo", "status", "--porcelain"]);
 	assert.equal(controller.state, "lazy");
 	assert.deepEqual(controller.files, [file]);
@@ -1483,5 +1484,121 @@ test("an active admin run blocks native writes, release and publication; lease l
 		assert.equal(receipt.status, "interrupted");
 		assert.match(receipt.reason, /lease/);
 		assert.deepEqual(log, ["release", "release"]);
+	} finally { await cleanup(); }
+});
+
+async function grantFixture() {
+	const base = await realpath(await mkdtemp(join(tmpdir(), "pi-folder-grant-")));
+	const store = join(base, "store");
+	await mkdir(store);
+	return { base, store, cleanup: () => rm(base, { recursive: true, force: true }) };
+}
+const writeCall = (path: string) => ({ toolName: "write", input: { path, content: "x" } });
+const blockOf = async (pi: FakePi, ctx: ReturnType<typeof context>, event: unknown) => ((await pi.emit("tool_call", ctx, event)) as Array<{ block?: boolean; reason?: string } | undefined>)[0];
+
+test("/grant-folder confirms canonical folders; native writes stay inside and Bash stays guarded", async () => {
+	const { base, store, cleanup } = await grantFixture();
+	try {
+		const log: string[] = [];
+		const { pi, controller } = harness([], { acquireFolder: folderLeases(log) });
+		pi.planFlag = true;
+		const ctx = realContext([]);
+		await pi.emit("session_start", ctx);
+		const dialogs: string[] = [];
+		ctx.ui.confirm = async (_title: string, message: string) => { dialogs.push(message); return false; };
+		await pi.commands.get("grant-folder")!.handler(JSON.stringify(store), ctx);
+		assert.equal(controller.state, "plan");
+		assert.deepEqual(log, [], "a declined grant takes no lease");
+		ctx.ui.confirm = async (_title: string, message: string) => { dialogs.push(message); return true; };
+		await pi.commands.get("grant-folder")!.handler(JSON.stringify(store), ctx);
+		assert.equal(controller.state, "implement");
+		assert.deepEqual(controller.folders, [store]);
+		assert.ok(dialogs[1]!.includes(JSON.stringify(store)));
+		assert.match(dialogs[1]!, /Bash/);
+		assert.equal(await blockOf(pi, ctx, writeCall(join(store, "a", "b.md"))), undefined);
+		const outside = await blockOf(pi, ctx, writeCall(join(base, "other.md")));
+		assert.equal(outside?.block, true);
+		assert.match(outside!.reason!, /grant-folder/);
+		assert.equal((await blockOf(pi, ctx, { toolName: "bash", input: { command: `mkdir ${join(store, "x")}` } }))?.block, true, "a folder grant does not unlock Bash");
+		await pi.commands.get("grants")!.handler("", ctx);
+		assert.deepEqual(JSON.parse(ctx.notifications.at(-1)!.message).folders, [store]);
+		assert.ok(ctx.statuses.some((status) => status?.startsWith("grants:1") && status.includes("store/")));
+		assert.equal((pi.appended.at(-1)?.data as { version?: number }).version, 5);
+	} finally { await cleanup(); }
+});
+
+test("/revoke-grants releases named or all grants; later writes are blocked and a grant-only session returns to plan", async () => {
+	const { base, store, cleanup } = await grantFixture();
+	try {
+		const log: string[] = [];
+		const file = join(base, "config.json");
+		const { pi, controller } = harness([], {
+			acquireFolder: folderLeases(log),
+			resolveFiles: async () => [file],
+			acquireFile: async () => ({ kind: "held", file, holderPid: 2, alive: true, lost: new Promise(() => {}), release: async () => { log.push(`release ${file}`); } }),
+		});
+		pi.planFlag = true;
+		const ctx = realContext([]);
+		await pi.emit("session_start", ctx);
+		await pi.commands.get("grant-folder")!.handler(JSON.stringify(store), ctx);
+		await pi.commands.get("grant-file")!.handler(JSON.stringify(file), ctx);
+		assert.deepEqual([controller.folders, controller.files], [[store], [file]]);
+		await pi.commands.get("revoke-grants")!.handler(JSON.stringify(join(base, "unknown")), ctx);
+		assert.match(ctx.notifications.at(-1)!.message, /not a held grant/);
+		assert.deepEqual(controller.folders, [store]);
+		await pi.commands.get("revoke-grants")!.handler(JSON.stringify(store), ctx);
+		assert.deepEqual([controller.folders, controller.files], [[], [file]]);
+		assert.ok(log.includes(`release ${store}`));
+		assert.equal(controller.state, "implement");
+		assert.equal((await blockOf(pi, ctx, writeCall(join(store, "after.md"))))?.block, true, "revoked folders no longer authorize writes");
+		await pi.commands.get("revoke-grants")!.handler("", ctx);
+		assert.deepEqual([controller.folders, controller.files], [[], []]);
+		assert.equal(controller.state, "plan");
+		assert.deepEqual(pi.appended.at(-1)?.data, { version: 2, mode: "plan" });
+	} finally { await cleanup(); }
+});
+
+test("folder grants restore from v5 on reload; a changed identity guards to plan", async () => {
+	const { base, store, cleanup } = await grantFixture();
+	try {
+		const saved = (data: unknown) => [{ type: "custom", customType: "session-mode", data: { version: 1, mode: "plan" } }, { type: "custom", customType: "session-mode", data }];
+		const log: string[] = [];
+		const eager = harness([], { acquireFolder: folderLeases(log) });
+		await eager.pi.emit("session_start", realContext(saved({ version: 5, mode: "implement", scope: { kind: "none" }, folders: [store] })));
+		assert.equal(eager.controller.state, "implement");
+		assert.deepEqual(eager.controller.folders, [store]);
+		const lazy = harness([], { acquireFolder: folderLeases(log) });
+		await lazy.pi.emit("session_start", realContext(saved({ version: 5, mode: "implement", scope: { kind: "lazy", originCwd: await realpath(process.cwd()) }, folders: [store] })));
+		assert.equal(lazy.controller.state, "lazy");
+		assert.deepEqual(lazy.controller.folders, [store]);
+		assert.deepEqual(log, [`acquire ${store}`, `acquire ${store}`]);
+		await rm(store, { recursive: true });
+		await mkdir(join(base, "elsewhere"));
+		await symlink(join(base, "elsewhere"), store);
+		const changed = harness([], { acquireFolder: folderLeases(log) });
+		const ctx = realContext(saved({ version: 5, mode: "implement", scope: { kind: "none" }, folders: [store] }));
+		await changed.pi.emit("session_start", ctx);
+		assert.equal(changed.controller.state, "plan");
+		assert.deepEqual(changed.controller.folders, []);
+		assert.match(ctx.notifications.map((notice) => notice.message).join("\n"), /folders changed/);
+	} finally { await cleanup(); }
+});
+
+test("lazy sessions keep folder grants and refuse a worktree inside a held folder", async () => {
+	const { store, cleanup } = await grantFixture();
+	try {
+		const { pi, controller, acquisitions } = harness([], { acquireFolder: folderLeases([]) });
+		const ctx = realContext([]);
+		await pi.emit("session_start", ctx);
+		await pi.commands.get("grant-folder")!.handler(JSON.stringify(store), ctx);
+		assert.equal(controller.state, "lazy");
+		assert.deepEqual(controller.folders, [store]);
+		assert.equal(await blockOf(pi, ctx, writeCall(join(store, "plain.md"))), undefined);
+		await mkdir(join(store, "repo"));
+		execFileSync("git", ["-C", join(store, "repo"), "init", "-q", "-b", "main"]);
+		const blocked = await blockOf(pi, ctx, writeCall(join(store, "repo", "file.md")));
+		assert.equal(blocked?.block, true);
+		assert.match(blocked!.reason!, /folder grant/);
+		assert.deepEqual(acquisitions, []);
 	} finally { await cleanup(); }
 });

@@ -668,7 +668,7 @@ test("release_scopes returns completed member roots to lazy so another session c
 	const blocked = await b.tool("write", { path: "api/new", content: "y" });
 	assert.equal(blocked?.block, true);
 	const released = await a.release();
-	assert.deepEqual(released, { status: "released", released: [join(root, "api")], dirty: [], files: [], checkpoint: "saved" });
+	assert.deepEqual(released, { status: "released", released: [join(root, "api")], dirty: [], files: [], folders: [], checkpoint: "saved" });
 	assert.equal(a.controller.state, "lazy");
 	assert.deepEqual(a.controller.roots, []);
 	assert.deepEqual(a.pi.entries.at(-1).data, { version: 4, mode: "implement", scope: { kind: "lazy", originCwd: root } });

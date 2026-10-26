@@ -1,5 +1,5 @@
 import { pathToFileURL } from "node:url";
-import { resolveGrantFile } from "./file-scope.ts";
+import { resolveFolderWrite, resolveGrantFile } from "./file-scope.ts";
 import { MAX_PARALLEL_DEPTH, SAFE_PARALLEL_TOOL_NAMES } from "./policy.ts";
 import { normalizeToolPath, resolveWriteRoot } from "./scope.ts";
 
@@ -7,6 +7,7 @@ interface ScopePolicyOptions {
 	resolveRoot?: typeof resolveWriteRoot;
 	resolveFile?: typeof resolveGrantFile;
 	files?: readonly string[];
+	folders?: readonly string[];
 	collectMissingRoots?: Set<string>;
 	signal?: AbortSignal;
 	isCurrent?: () => boolean;
@@ -54,17 +55,26 @@ export async function scopedWriteBlockReason(
 		}
 		return undefined;
 	} catch {
+		if (options.folders?.length) {
+			try {
+				const file = await resolveFolderWrite(target, cwd, options.folders, options.signal);
+				if (options.isCurrent?.() === false) return "Lease scope changed during tool validation";
+				if (!record(input)) return "Malformed native write input blocked";
+				input.path = pathArgument(file, cwd);
+				return options.isCurrent?.() === false ? "Lease scope changed during tool validation" : undefined;
+			} catch { /* Not beneath a held folder; an exact-file grant may still apply. */ }
+		}
 		try {
 			const file = await (options.resolveFile ?? resolveGrantFile)(target, cwd, options.signal);
 			if (options.isCurrent?.() === false) return "Lease scope changed during tool validation";
 			if (!options.files?.includes(file)) {
-				return `Exact file is not granted. Ask the user to run /grant-file ${JSON.stringify(pathArgument(file, cwd))} while idle.`;
+				return `Exact file is not granted. Ask the user to run /grant-file ${JSON.stringify(pathArgument(file, cwd))}, or /grant-folder for a folder containing it, while idle.`;
 			}
 			if (!record(input)) return "Malformed native write input blocked";
 			input.path = pathArgument(file, cwd);
 			return options.isCurrent?.() === false ? "Lease scope changed during tool validation" : undefined;
 		} catch {
-			return "Cannot establish this file's worktree or exact-file ownership; write blocked. Select a valid /implement or /grant-file scope.";
+			return "Cannot establish this file's worktree, folder or exact-file ownership; write blocked. Select a valid /implement, /grant-folder or /grant-file scope.";
 		}
 	}
 }

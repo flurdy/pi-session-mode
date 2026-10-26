@@ -1,5 +1,5 @@
 import { isAbsolute } from "node:path";
-import { MAX_FILE_GRANTS } from "./file-scope.ts";
+import { MAX_FILE_GRANTS, MAX_FOLDER_GRANTS } from "./file-scope.ts";
 import { MAX_LEASE_ROOTS } from "./scope.ts";
 
 export type WorktreeSelection =
@@ -9,13 +9,16 @@ export type WorktreeSelection =
 type EagerScope = Exclude<WorktreeSelection, { kind: "lazy" }>;
 export type Selection =
 	| { mode: "plan" }
-	| { mode: "implement"; scope: WorktreeSelection; files?: readonly string[] };
+	| { mode: "implement"; scope: WorktreeSelection; files?: readonly string[]; folders?: readonly string[] };
+type LazyScope = Extract<WorktreeSelection, { kind: "lazy" }>;
 export type SelectionEntry =
 	| { version: 1; mode: "plan" }
 	| { version: 2; mode: "plan" }
 	| { version: 2; mode: "implement"; scope: Exclude<EagerScope, { kind: "none" }> }
 	| { version: 3; mode: "implement"; scope: EagerScope; files: readonly string[] }
-	| { version: 4; mode: "implement"; scope: { kind: "lazy"; originCwd: string }; files?: readonly string[] };
+	| { version: 4; mode: "implement"; scope: LazyScope; files?: readonly string[] }
+	/** Written only when folder grants exist, so older readers reject it into guarded plan. */
+	| { version: 5; mode: "implement"; scope: EagerScope | LazyScope; files?: readonly string[]; folders: readonly string[] };
 
 function record(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 function keys(value: Record<string, unknown>, allowed: string[]): boolean { return Object.keys(value).every((key) => allowed.includes(key)); }
@@ -40,8 +43,21 @@ function parseLazy(data: Record<string, unknown>): Selection | undefined {
 	return absoluteSet(data.files, MAX_FILE_GRANTS) ? { mode: "implement", scope: { kind: "lazy", originCwd: scope.originCwd }, files: [...data.files] } : undefined;
 }
 
+function parseFolders(data: Record<string, unknown>): Selection | undefined {
+	if (data.mode !== "implement" || !keys(data, ["version", "mode", "scope", "files", "folders"]) || !absoluteSet(data.folders, MAX_FOLDER_GRANTS)) return undefined;
+	if (data.files !== undefined && !absoluteSet(data.files, MAX_FILE_GRANTS)) return undefined;
+	const lazy = parseLazy({ version: 4, mode: "implement", scope: data.scope });
+	const scope = lazy?.mode === "implement" ? lazy.scope : parseScope(data.scope, true);
+	if (!scope) return undefined;
+	return { mode: "implement", scope, ...(data.files ? { files: [...data.files as string[]] } : {}), folders: [...data.folders] };
+}
+
 export function selectionFiles(selection: Selection): readonly string[] {
 	return selection.mode === "implement" ? selection.files ?? [] : [];
+}
+
+export function selectionFolders(selection: Selection): readonly string[] {
+	return selection.mode === "implement" ? selection.folders ?? [] : [];
 }
 
 /** Returns undefined when the branch has no session-mode entry; the caller chooses the fresh default. */
@@ -72,6 +88,10 @@ export function restoreSelection(entries: readonly unknown[]): { selection: Sele
 				const selection = parseLazy(data);
 				if (selection) return { selection };
 			}
+			if (data.version === 5) {
+				const selection = parseFolders(data);
+				if (selection) return { selection };
+			}
 		}
 		return { selection: { mode: "plan" }, invalid: true };
 	}
@@ -80,8 +100,12 @@ export function restoreSelection(entries: readonly unknown[]): { selection: Sele
 
 export function selectionEntries(selection: Selection): SelectionEntry[] {
 	if (selection.mode === "plan") return [{ version: 1, mode: "plan" }, { version: 2, mode: "plan" }];
-	const files = [...selectionFiles(selection)];
+	const files = [...selectionFiles(selection)], folders = [...selectionFolders(selection)];
 	const scope = selection.scope;
+	if (folders.length) {
+		const saved = scope.kind === "lazy" ? { kind: "lazy" as const, originCwd: scope.originCwd } : scope.kind === "roots" ? { ...scope, roots: [...scope.roots] } : scope;
+		return [{ version: 1, mode: "plan" }, { version: 5, mode: "implement", scope: saved, ...(files.length ? { files } : {}), folders }];
+	}
 	if (scope.kind === "lazy") {
 		const lazy = { kind: "lazy" as const, originCwd: scope.originCwd };
 		return [{ version: 1, mode: "plan" }, files.length ? { version: 4, mode: "implement", scope: lazy, files } : { version: 4, mode: "implement", scope: lazy }];

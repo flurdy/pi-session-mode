@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import { MAX_FOLDER_GRANTS, resolveExplicitFolders, resolveGrantFolder } from "./file-scope.ts";
+import { MAX_FOLDER_GRANTS, resolveExplicitFolders, resolveFolderWrite, resolveGrantFolder } from "./file-scope.ts";
 
 async function fixture() {
 	const base = await realpath(await mkdtemp(join(tmpdir(), "pi-folder-scope-")));
@@ -54,6 +54,32 @@ test("folder scopes reject Git ownership above, at and below the folder", async 
 		const bare = join(root, "bare");
 		await mkdir(join(bare, "objects"), { recursive: true });
 		await assert.rejects(resolveGrantFolder(bare, root, { runtimeDir }), /Git/);
+	} finally { await cleanup(); }
+});
+
+test("native writes resolve beneath held folders and create parents only inside the grant", async () => {
+	const { base, root, cleanup } = await fixture();
+	try {
+		const store = join(root, "store"), fresh = join(root, "fresh");
+		const folders = [store, fresh];
+		assert.equal(await resolveFolderWrite(join(store, "note.md"), root, folders), join(store, "note.md"));
+		assert.equal(await resolveFolderWrite(join(store, "a", "b", "c.md"), root, folders), join(store, "a", "b", "c.md"));
+		assert.equal(await resolveFolderWrite(join(fresh, "deep", "x.md"), root, folders), join(fresh, "deep", "x.md"), "a missing granted folder may be created");
+		await symlink(store, join(root, "alias"));
+		assert.equal(await resolveFolderWrite(join(root, "alias", "new.md"), root, folders), join(store, "new.md"));
+		await mkdir(join(base, "outside"));
+		await writeFile(join(base, "outside", "shared.md"), "x\n");
+		await symlink(join(base, "outside"), join(store, "escape"));
+		await symlink(join(base, "missing-target"), join(store, "dangling"));
+		await link(join(base, "outside", "shared.md"), join(store, "hardlink.md"));
+		await mkdir(join(store, "bare", "objects"), { recursive: true });
+		for (const target of [
+			join(root, "sibling", "x.md"), join(store, "escape", "x.md"), join(store, "dangling"), join(store, "dangling", "x.md"),
+			join(store, "hardlink.md"), join(store, "archive"), store, join(store, ".git", "config"), join(store, "HEAD"), join(store, "bare", "x.md"),
+		]) {
+			await assert.rejects(resolveFolderWrite(target, root, folders), Error, target);
+		}
+		await assert.rejects(resolveFolderWrite(join(store, "note.md"), root, []));
 	} finally { await cleanup(); }
 });
 
