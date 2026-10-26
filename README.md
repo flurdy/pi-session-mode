@@ -1,6 +1,6 @@
 # Pi Session Mode
 
-A [Pi](https://pi.dev) extension for guarded plan mode, Git-worktree writer leases with native-write-driven expansion, and confirmed exact-file grants outside Git. Disjoint repositories and configuration files can be coordinated independently. This is an accidental-change guard, not a sandbox.
+A [Pi](https://pi.dev) extension for guarded plan mode, Git-worktree writer leases with native-write-driven expansion, confirmed exact-file and folder grants outside Git, and attended single-use admin runs. Disjoint repositories and configuration files can be coordinated independently. This is an accidental-change guard, not a sandbox.
 
 See [the guard contract](docs/guard.md) for policy, lease lifetime, compatibility, failure behavior, and explicit bypasses.
 
@@ -24,15 +24,17 @@ For a reviewed mutable checkout, run `make apply`. It owns the existing `~/.pi/a
 
 ## Use
 
-- A fresh session or `/new` starts `lazy`: implementation intent with no worktree lease. The first native `edit`/`write` acquires only its target's canonical worktree; contention blocks that write and the session stays lazy. Until a worktree is held, obvious Bash, package, Git, system and writer-subagent mutations stay guarded, so use `/implement <root>` for shell-first work.
-- `/plan` guards writes, drains pending additions, releases every worktree and file lease, and saves plan mode.
-- `/lazy` releases held worktree leases, keeps exact-file grants, and saves lazy mode. The `release_scopes` agent tool does the same after a task's work is committed and verified; it refuses dirty worktrees unless explicitly allowed with a reason, and refuses while writes or scope transitions are active.
+- A fresh session or `/new` starts `lazy`: implementation intent with no worktree lease. The first native `edit`/`write` acquires only its target's canonical worktree; contention blocks that write and the session stays lazy. Until a worktree is held, obvious Bash, package, Git, system and writer-subagent mutations stay guarded, so use `/implement <root>` for repository shell-first work and `run_admin` for administration outside held worktrees.
+- `/plan` guards writes, drains pending additions, releases every worktree, file and folder lease, and saves plan mode.
+- `/lazy` releases held worktree leases, keeps exact-file and folder grants, and saves lazy mode. The `release_scopes` agent tool does the same after a task's work is committed and verified; it refuses dirty worktrees unless explicitly allowed with a reason, and refuses while writes or scope transitions are active.
 - `/implement` acquires the cwd worktree when none is held; otherwise it retains the current worktree set.
 - `/implement repos/api repos/web` adds those worktree roots without implicitly leasing the workspace root. Quote literal paths containing spaces.
 - `/grant-file ~/.agents/tool/config.json` resolves exact non-Git files, displays their canonical identities, and requires an interactive confirmation before acquiring them. It can establish file-only implementation mode without leasing cwd; the bounded guarded Bash/subagent policy remains active until a worktree is also leased.
+- `/grant-folder ~/.agents/handoffs` confirms non-Git folders; native `edit`/`write` may then create and change files beneath them, never escaping through symlinks or into repositories. Bash policy is unchanged. `/revoke-grants [paths]` releases named or all file and folder grants and keeps worktrees. See [folder grants and admin runs](docs/admin-runs.md).
+- `run_admin` is an agent tool for administration outside held worktrees, such as a migration script or `make apply` installer. Each run shows the full command, working directory and declared folders in a fresh native confirmation and runs exactly once with closed stdin. Its effects are not confined. Git mutations, publication and remote synchronization are refused. See [admin runs](docs/admin-runs.md).
 - `/leases` shows held/requested/failed worktree scopes. `/leases repos/api` inspects that root without acquiring.
 - `/lease-holders` lists every lease held by live local Pi sessions, grouped by session, validated against kernel locks; holder metadata is reported only when it matches.
-- `/grants` shows held/requested/failed exact-file scopes. `/grants path` resolves that file identity without acquiring it.
+- `/grants` shows held/requested/failed exact-file and folder scopes. `/grants path` resolves that identity without acquiring it.
 - Named second-opinion panels can use the installed private stdin helper in plan mode, without source leases or general `/tmp` write permission. The helper requires a supporting guard and owns its scratch files; see [read-only second opinions](docs/guard.md#read-only-second-opinions).
 - `save_handoff` saves a rendered resume block to the fixed `~/.agents/handoffs` directory in every guard state, without repository or `/grant-file` authority. New files auto-save; overwrite requires fresh TUI confirmation. See [handoff saves](docs/handoff-save.md) for helper requirements, concurrency and failure boundaries.
 - Release-manager bookkeeping through the installed `release-state` helper works in guarded sessions without source leases; `update` is exempt only in its exact documented shape. See [release-state bookkeeping](docs/guard.md#release-state-bookkeeping).
@@ -43,7 +45,7 @@ For a reviewed mutable checkout, run `make apply`. It owns the existing `~/.pi/a
 
 **Compatibility change in 0.3:** once an implement session holds at least one live worktree lease, native `edit`/`write` preflight can acquire and persist additional canonical target worktrees without another prompt. Linked, nested and sibling repositories still require their own locks; a supported parallel wrapper acquires all missing roots atomically. This replaces the explicit-only expansion policy in released 0.2.1: leases now prevent writer collisions, not accidental targeting of a different repository. Plan, conflict, lost, unguarded and file-only sessions never auto-expand.
 
-**Compatibility change after 0.5.0:** sessions without a saved selection, including `/new` and `--continue` with no history, start `lazy` instead of leasing cwd. Concurrent sessions launched at a workspace root no longer contend for that root; each takes the member worktree its first write targets. Saved selections still restore, bare `/implement` still leases cwd, and a lazy session that acquires a worktree saves it as explicit roots so a reload reacquires in-progress work. Lazy selections use a v4 checkpoint after a v1 plan checkpoint; older readers resume guarded.
+**Compatibility change after 0.5.0:** sessions without a saved selection, including `/new` and `--continue` with no history, start `lazy` instead of leasing cwd. Concurrent sessions launched at a workspace root no longer contend for that root; each takes the member worktree its first write targets. Saved selections still restore, bare `/implement` still leases cwd, and a lazy session that acquires a worktree saves it as explicit roots so a reload reacquires in-progress work. Lazy selections use a v4 checkpoint after a v1 plan checkpoint; older readers resume guarded. Folder grants use a v5 checkpoint that v4 and older readers also resume guarded. Folder and file grants share ancestor intent locks, so reload every session on a machine together when upgrading or rolling back.
 
 Bash/script effects remain outside path enforcement and cannot trigger expansion. Legacy non-Git or unavailable implicit-cwd sessions (bare `/implement`, `--implement` or a saved cwd selection) remain visibly `unguarded`; start lazy or in plan mode, or explicitly select valid roots, to obtain protection.
 

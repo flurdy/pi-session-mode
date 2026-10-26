@@ -44,7 +44,7 @@ read-back verification; this package does not copy it.
 Each mutation participates in Pi's per-file queue and takes a temporary exact-file kernel lease.
 Distinct target filenames do not contend. The lease is released after each call, including
 failure; it is never added to `/grants` or persisted as session authority. An existing writer
-lease on the same target blocks the operation; the adapter never steals or borrows that lease.
+lease on the same target, or a folder grant covering it, blocks the operation; the adapter never steals or borrows that lease.
 A dotfiles repository's worktree lease is separate and does not block this exact-file operation.
 A cooperating handoff saver uses the same target-file lock; a repository writer or manual writer
 can still modify or publish handoffs outside that lock. Saving does not stage, commit, ignore,

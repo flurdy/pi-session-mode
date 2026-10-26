@@ -25,6 +25,7 @@
     "README.md",
     "admin-run.ts",
     "commit-publication.ts",
+    "docs/admin-runs.md",
     "docs/guard.md",
     "docs/handoff-save.md",
     "docs/package-activation.md",
