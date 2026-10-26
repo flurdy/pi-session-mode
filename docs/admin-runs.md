@@ -52,7 +52,7 @@ It is available in lazy, grant-only and implement sessions. It is refused in pla
 
 - The executable is resolved through `PATH` (bare names) or as an absolute path, and shown canonically. `argv[0]` is preserved for multi-call programs.
 - A repository-backed `cwd` must be clean: committed `HEAD`, no tracked changes and no untracked non-ignored files. Run repository recipes through `argv` with `cwd` set to the recipe directory; `make -C`, `--directory`, `-f` and `--file` are refused so the bound recipe is the one that runs.
-- Recognizable Git mutations, `gh`, publication (`make` push targets), workspace and Beads/Dolt remote synchronization, and privilege escalation (`sudo` and similar) are refused. Repository changes need `/implement`, publication uses `publish_commit`, and synchronization keeps its own confirmation. This is bounded pattern recognition: effects hidden in scripts or recipes are not comprehensively detected.
+- Recognizable Git mutations, `gh`, publication (`make` push targets), workspace and Beads/Dolt remote synchronization, and privilege escalation (`sudo` and similar) are refused. Repository changes need `/implement`, publication uses `publish_commit`, and synchronization keeps its own confirmation. Commands are recognized by their words, including quoted subcommands and commands after shell keywords such as `then` or `do`. This is still bounded pattern recognition: effects hidden in scripts or recipes are not comprehensively detected.
 - A declared folder that contains one of the session's exact-file or folder grants is refused; revoke the grant first. A declared folder inside a held folder grant reuses that grant.
 
 ### Dialog
@@ -61,9 +61,9 @@ The 60-second native confirmation shows the purpose, the full script and its SHA
 
 ### Launch and execution
 
-After approval the tool rechecks the session and takes transient `dir-` leases on the declared folders. It then rebinds every displayed fact: canonical cwd, declared folder identities, repository `HEAD` and cleanliness, and the executable. Contention or any change refuses or returns `stale`; nothing runs and nothing is retried.
+After approval the tool rechecks the session and takes transient `dir-` leases on the declared folders. It then rebinds every displayed fact: canonical cwd, declared folder identities and whether each exists, repository `HEAD` and cleanliness, and the executable. Contention or any change refuses or returns `stale`; nothing runs and nothing is retried.
 
-The command runs in its own process group with stdin closed and `GIT_TERMINAL_PROMPT=0`. Cancellation, the deadline, loss of any declared lease, loss of the session's scopes, reload and shutdown send `SIGTERM` to the group, then `SIGKILL` after two seconds. Group members left after the main process exits are killed and reported as `lingering`; start long-lived services through their own managers. Leases are released only after the process group has ended.
+The command runs in its own process group with stdin closed and `GIT_TERMINAL_PROMPT=0`. Cancellation, the deadline, loss of any declared lease, loss of the session's scopes, reload and shutdown send `SIGTERM` to the group, then `SIGKILL` after two seconds. Group members left after the main process exits are killed and reported as `lingering`; start long-lived services through their own managers. The receipt waits (bounded) until no group member remains and reports any survivor. Leases, including a reused folder grant after a scope loss, are released only after the process group has ended.
 
 ### Receipts
 
@@ -82,7 +82,7 @@ Receipts include the exit code, signal, duration and the last 16 KiB of combined
 
 ## Leases and coordination
 
-Folder grants and declared run folders use a `dir-<sha256>` lock namespace. A folder takes an exclusive lock on itself and shared intent locks on each grantable ancestor (root, home and home ancestors are skipped). Exact-file grants take the same ancestor intents, so a folder lease contends with every grant inside it, and with any grant on an ancestor folder, across sessions, without enumerating descendants. Within a session, intents are shared and reference-counted. Losing any holder loses the whole grant, which drains its remaining holders.
+Folder grants and declared run folders use a `dir-<sha256>` lock namespace. A folder takes an exclusive lock on itself and shared intent locks on each grantable ancestor (root, home and home ancestors are skipped). Exact-file grants take the same ancestor intents, so a folder lease contends with every grant inside it, and with any grant on an ancestor folder, across sessions, without enumerating descendants. Within a session, intents are shared and reference-counted. Losing any holder loses the whole grant and revokes the session's authority at once. Surviving holders stay locked until any interrupted admin run has ended, and only then are they released.
 
 Worktree leases and the public observer are unchanged. Two coordination gaps remain:
 

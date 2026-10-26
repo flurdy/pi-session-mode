@@ -52,6 +52,23 @@ function grantSet(released: string[], acquired: string[] = [], lost: Map<string,
 	});
 }
 
+test("loss revokes authority at once but keeps remaining holders locked until the loss hold settles", async () => {
+	const released: string[] = [];
+	let finishHold!: () => void;
+	const hold = new Promise<void>((resolve) => { finishHold = resolve; });
+	const lostRoot = handle("lost", released);
+	const set = new LeaseSet(async (root) => root === "lost" ? lostRoot.lease : handle(root, released).lease, resolveRoots, () => {}, { holdReleaseOnLoss: () => hold });
+	assert.equal((await set.add(["kept", "lost"], "/cwd", "session")).kind, "held");
+	lostRoot.lose();
+	for (let tick = 0; tick < 3; tick++) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(set.live, false, "authority is revoked immediately");
+	assert.deepEqual(released, [], "remaining holders stay locked while the hold is pending");
+	finishHold();
+	for (let tick = 0; tick < 5; tick++) await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(released.sort(), ["kept", "lost"]);
+	assert.deepEqual(set.roots, []);
+});
+
 test("held folders cover contained grants; a folder containing a held grant is refused before acquisition", async () => {
 	const released: string[] = [], acquired: string[] = [];
 	const set = grantSet(released, acquired);

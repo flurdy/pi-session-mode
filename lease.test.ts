@@ -49,6 +49,7 @@ test("exact-file leases contend on canonical identity without changing worktree 
 		if (first.kind === "held") {
 			process.kill(first.holderPid, "SIGKILL");
 			await first.lost;
+			await first.release();
 		}
 		const replacement = await acquireFileLease(alias, { runtimeDir, sessionId: "replacement" });
 		assert.equal(replacement.kind, "held");

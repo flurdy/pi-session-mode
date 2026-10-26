@@ -1,6 +1,6 @@
 import { lstat, readdir, realpath, stat } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
-import { canonicalHome, isWithin, normalizeToolPath, worktreeLeaseRuntimeDir } from "./path.ts";
+import { basename, dirname, join } from "node:path";
+import { canonicalHome, canonicalPossiblyMissing, isWithin, normalizeToolPath, worktreeLeaseRuntimeDir } from "./path.ts";
 
 export const MAX_FILE_GRANTS = 32;
 export const MAX_FOLDER_GRANTS = 16;
@@ -96,8 +96,7 @@ export async function resolveGrantFolder(value: unknown, cwd: string, options: F
 	}
 	const home = options.home ?? await canonicalHome();
 	if (dirname(canonical) === canonical || isWithin(home, canonical)) throw new Error("Folder scope is too broad: root, home and home ancestors cannot be granted");
-	const runtimeDir = options.runtimeDir ?? worktreeLeaseRuntimeDir();
-	const runtime = await realpath(runtimeDir).catch(() => resolve(runtimeDir));
+	const runtime = await canonicalPossiblyMissing(options.runtimeDir ?? worktreeLeaseRuntimeDir());
 	if (isWithin(canonical, runtime) || isWithin(runtime, canonical)) throw new Error("Folder scope overlaps the private lease runtime directory");
 	if (basename(canonical) === ".git") throw new Error("Folder name overlaps Git administration");
 	await assertOutsideGitAdministration(existing ? canonical : dirname(canonical), signal);

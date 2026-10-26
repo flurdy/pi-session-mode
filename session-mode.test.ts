@@ -1507,6 +1507,36 @@ test("agent guidance offers run_admin and folder grants instead of terminal hand
 	assert.match(planPrompt, /never switch modes yourself/);
 });
 
+test("a lost grant interrupts an admin run that reuses it, and stays locked until the run has ended", async () => {
+	const { base, target, cleanup } = await adminFixture();
+	try {
+		const pidFile = join(base, "run.pid");
+		const running = (pid: number) => { if (!(pid > 0)) return false; try { process.kill(pid, 0); return true; } catch { return false; } };
+		let loseGrant!: () => void;
+		let aliveAtRelease: boolean | undefined;
+		const { pi, controller } = harness([], {
+			acquireFolder: async (dir: string): Promise<FolderLeaseResult> => ({
+				kind: "held", dir, holderPid: 1, alive: true,
+				lost: new Promise<void>((resolve) => { loseGrant = resolve; }),
+				async release() { aliveAtRelease = running(Number(await readFile(pidFile, "utf8").catch(() => ""))); },
+			}),
+		});
+		pi.planFlag = true;
+		const ctx = realContext([]);
+		await pi.emit("session_start", ctx);
+		await pi.commands.get("grant-folder")!.handler(JSON.stringify(target), ctx);
+		const run = adminTool(pi, ctx, { purpose: "Reuse a held grant", cwd: base, writes: [join(target, "inner")], script: `echo $$ > '${pidFile}'\nsleep 30` });
+		await delay(300);
+		loseGrant();
+		const receipt = (await run).details;
+		assert.equal(receipt.status, "interrupted");
+		assert.match(receipt.reason, /lease lost/);
+		for (let tick = 0; tick < 40 && aliveAtRelease === undefined; tick++) await delay(25);
+		assert.equal(aliveAtRelease, false, "the grant was released only after the run had ended");
+		assert.equal(controller.state, "lost");
+	} finally { await cleanup(); }
+});
+
 async function grantFixture() {
 	const base = await realpath(await mkdtemp(join(tmpdir(), "pi-folder-grant-")));
 	const store = join(base, "store");

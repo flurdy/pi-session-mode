@@ -53,7 +53,11 @@ export class LeaseSet {
 		private readonly acquire: AcquireRoot = acquireWorktreeLease,
 		private readonly resolveRoots: ResolveRoots = resolveExplicitRoots,
 		private readonly onLost: () => void = () => {},
-		private readonly options: { timeoutMs?: number; acquireFile?: AcquireFile; resolveFiles?: ResolveFiles; acquireFolder?: AcquireFolder; resolveFolders?: ResolveFolders } = {},
+		private readonly options: {
+			timeoutMs?: number; acquireFile?: AcquireFile; resolveFiles?: ResolveFiles; acquireFolder?: AcquireFolder; resolveFolders?: ResolveFolders;
+			/** After a loss, authority is revoked at once but surviving holders stay locked until this settles. */
+			holdReleaseOnLoss?: () => Promise<void> | undefined;
+		} = {},
 	) {}
 
 	get roots(): string[] { return [...this.#roots.keys()].sort(); }
@@ -151,11 +155,25 @@ export class LeaseSet {
 		return this.#drain;
 	}
 
+	/**
+	 * Revoke all authority at once. Surviving handles are parked: no longer reported or usable, but
+	 * still locked until the configured hold settles, then released together.
+	 */
 	private lose(): void {
 		if (this.#lost) return;
 		this.#lost = true;
 		try { this.onLost(); }
-		finally { void this.releaseAll().catch(() => { /* The rejected drain prevents further acquisitions. */ }); }
+		finally {
+			this.#epoch++;
+			this.#revision++;
+			const pending = this.#operation;
+			pending?.controller.abort();
+			const parked = new Set<HeldScopeLease>([...this.#roots.values(), ...this.#files.values(), ...this.#folders.values(), ...(pending?.added ?? [])]);
+			this.#roots.clear(); this.#files.clear(); this.#folders.clear(); pending?.added.clear();
+			const hold = Promise.resolve(this.options.holdReleaseOnLoss?.()).catch(() => undefined);
+			this.#drain = Promise.all([this.#drain, hold.then(() => Promise.all([...parked].map((lease) => this.release(lease)))), pending?.promise]).then(() => undefined);
+			void this.#drain.catch(() => { /* The rejected drain prevents further acquisitions. */ });
+		}
 	}
 
 	private held(lease: HeldScopeLease): boolean {

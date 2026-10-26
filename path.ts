@@ -1,6 +1,6 @@
 import { realpath } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export function worktreeLeaseRuntimeDir(): string {
@@ -14,6 +14,18 @@ export function isWithin(path: string, ancestor: string): boolean {
 
 export async function canonicalHome(): Promise<string> {
 	return realpath(homedir()).catch(() => homedir());
+}
+
+/** Canonical form of a possibly missing path: the nearest existing ancestor is resolved, missing components appended. */
+export async function canonicalPossiblyMissing(path: string): Promise<string> {
+	const missing: string[] = [];
+	for (let current = resolve(path); ; current = dirname(current)) {
+		try { return join(await realpath(current), ...missing); }
+		catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT" || dirname(current) === current) throw error;
+			missing.unshift(basename(current));
+		}
+	}
 }
 
 export function normalizeToolPath(value: unknown, cwd: string): string {

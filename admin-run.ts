@@ -17,6 +17,7 @@ const MAX_DIALOG_CHARS = 24_000;
 const OUTPUT_LIMIT = 64 * 1024;
 const OUTPUT_TAIL = 16 * 1024;
 const KILL_GRACE_MS = 2000;
+const GROUP_EXIT_POLL_MS = 20;
 const GIT_TIMEOUT_MS = 5000;
 // make options that would run a recipe other than the one bound through cwd.
 const MAKE_REDIRECT = /^(?:-(?!-)[A-Za-z0-9]*[Cf].*|--directory(?:=.*)?|--file(?:=.*)?|--makefile(?:=.*)?)$/;
@@ -217,6 +218,9 @@ export async function recheckAdminRun(prepared: PreparedAdminRun, dependencies: 
 		if (await realpath(prepared.cwd) !== prepared.cwd) return "The working directory changed after confirmation";
 		const declared = prepared.writes.map((write) => write.path);
 		if (JSON.stringify(await resolveFolders(dependencies)(declared, prepared.cwd, signal)) !== JSON.stringify([...declared].sort())) return "A declared folder changed identity after confirmation";
+		for (const write of prepared.writes) {
+			if (await lstat(write.path).then(() => true, () => false) !== write.exists) return `Declared folder ${JSON.stringify(write.path)} appeared or disappeared after confirmation`;
+		}
 		if (JSON.stringify(await bindRepository(prepared.cwd, signal)) !== JSON.stringify(prepared.repository)) return "The working directory's repository changed after confirmation";
 		const { command } = prepared;
 		const program = command.kind === "script" ? "bash" : command.argv[0]!;
@@ -248,7 +252,7 @@ export function executeAdminRun(prepared: PreparedAdminRun, options: { signal?: 
 				...(command.kind === "argv" ? { argv0: command.argv[0]! } : {}),
 			},
 		);
-		let output = "", truncated = false, interruption: string | undefined, lingering = false, settled = false;
+		let output = "", truncated = false, interruption: string | undefined, lingering = false, settled = false, closing = false;
 		let killTimer: NodeJS.Timeout | undefined, lingerTimer: NodeJS.Timeout | undefined;
 		const append = (chunk: Buffer) => {
 			output += chunk.toString("utf8");
@@ -257,7 +261,7 @@ export function executeAdminRun(prepared: PreparedAdminRun, options: { signal?: 
 		const groupAlive = () => { try { process.kill(-child.pid!, 0); return true; } catch { return false; } };
 		const killGroup = (signal: NodeJS.Signals) => { if (child.pid) try { process.kill(-child.pid, signal); } catch { /* Group already gone. */ } };
 		const interrupt = (reason: string) => {
-			if (interruption || settled) return;
+			if (interruption || settled || closing) return;
 			interruption = reason;
 			killGroup("SIGTERM");
 			killTimer = setTimeout(() => killGroup("SIGKILL"), KILL_GRACE_MS);
@@ -277,8 +281,16 @@ export function executeAdminRun(prepared: PreparedAdminRun, options: { signal?: 
 		child.once("error", (error) => finish({ ...base, status: "failed", reason: `Could not start: ${error.message}`, durationMs: Date.now() - started }));
 		// Members still holding the output pipes after the main process exits are terminated after a grace period.
 		child.once("exit", () => { lingerTimer = setTimeout(() => { lingering = true; killGroup("SIGKILL"); }, KILL_GRACE_MS); });
-		child.once("close", (code, signal) => {
+		// Killing is asynchronous: resolve only once no member of the group remains (bounded).
+		const groupGone = async () => {
+			for (let waited = 0; groupAlive() && waited < KILL_GRACE_MS; waited += GROUP_EXIT_POLL_MS) await new Promise((done) => setTimeout(done, GROUP_EXIT_POLL_MS));
+			return !groupAlive();
+		};
+		child.once("close", async (code, signal) => {
+			closing = true;
+			clearTimeout(lingerTimer);
 			if (groupAlive()) { lingering = true; killGroup("SIGKILL"); }
+			const gone = await groupGone();
 			const shown = output.slice(-OUTPUT_TAIL);
 			finish({
 				...base,
@@ -286,6 +298,7 @@ export function executeAdminRun(prepared: PreparedAdminRun, options: { signal?: 
 				...(interruption ? { reason: interruption } : {}),
 				exitCode: code, signal, durationMs: Date.now() - started,
 				...(lingering ? { lingering: true } : {}),
+				...(gone ? {} : { reason: `${interruption ? `${interruption}; ` : ""}process group members survived SIGKILL` }),
 				output: displayLines(shown),
 				outputTruncated: truncated || shown.length < output.length,
 			});

@@ -355,10 +355,13 @@ function isReleaseStateUpdate(words: string[]): boolean {
 	return words.some((word, index) => word.split("/").at(-1) === "release-state" && words[index + 1] === "update");
 }
 
+// Reserved words that may precede a command within one separator-delimited segment.
+const SHELL_KEYWORDS = new Set(["if", "then", "else", "elif", "do", "while", "until", "!", "{", "}", "time"]);
+
 function invokedCommand(words: string[]): { executable: string; args: string[] } | undefined {
 	let index = 0;
 	while (index < words.length) {
-		if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index]!)) { index++; continue; }
+		if (SHELL_KEYWORDS.has(words[index]!) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index]!)) { index++; continue; }
 		const executable = words[index++]!.split("/").at(-1)!;
 		if (["env", "command", "exec"].includes(executable)) {
 			while (words[index]?.startsWith("-")) {
@@ -373,6 +376,12 @@ function invokedCommand(words: string[]): { executable: string; args: string[] }
 }
 
 const isMake = (executable: string) => executable === "make" || executable === "gmake";
+
+// Word-based, so quoted subcommands such as git "push" are recognized; prose arguments of other commands are not.
+function isGitMutationCommand(words: string[]): boolean {
+	const invoked = invokedCommand(words);
+	return invoked?.executable === "git" && GIT_MUTATION.test(["git", ...invoked.args.map((arg) => arg.replace(/\s+/g, "_"))].join(" "));
+}
 
 function isWorkspaceSyncCommand(words: string[]): boolean {
 	const invoked = invokedCommand(words);
@@ -414,6 +423,7 @@ function isObviousMutationAtDepth(command: string, depth: number): boolean {
 		IN_PLACE_MUTATION.test(inspectable) ||
 		PACKAGE_MUTATION.test(inspectable) ||
 		GIT_MUTATION.test(inspectable) ||
+		hasCommand(command, isGitMutationCommand) ||
 		BEADS_DESTRUCTIVE_OR_REMOTE.test(inspectable) ||
 		databaseMutation(command) ||
 		hasCommand(command, isWorkspaceSyncCommand) ||
@@ -438,7 +448,7 @@ export function adminRunRefusal(command: string, depth = 0): string | undefined 
 		if (reason) return reason;
 	}
 	const inspectable = withoutQuotedText(unquoteGitGlobalOptionValues(command));
-	if (GIT_MUTATION.test(inspectable)) return ADMIN_GIT_REASON;
+	if (GIT_MUTATION.test(inspectable) || hasCommand(command, isGitMutationCommand)) return ADMIN_GIT_REASON;
 	if (BEADS_DESTRUCTIVE_OR_REMOTE.test(inspectable) || databaseMutation(command) || [isWorkspaceSyncCommand, isMakePushCommand, isGitHubCli].some((matches) => hasCommand(command, matches))) return ADMIN_REMOTE_REASON;
 	if (PRIVILEGE_ESCALATION.test(inspectable)) return ADMIN_PRIVILEGE_REASON;
 	return undefined;

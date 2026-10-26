@@ -37,6 +37,9 @@ test("folder scopes never cover root, home, home ancestors or the lease runtime"
 		await assert.rejects(resolveGrantFolder(runtimeDir, root, { runtimeDir }), /runtime/i);
 		await assert.rejects(resolveGrantFolder(base, root, { runtimeDir }), /runtime/i);
 		await assert.rejects(resolveGrantFolder(join(runtimeDir, "inner"), root, { runtimeDir }), /runtime/i);
+		await mkdir(join(base, "real"));
+		await symlink(join(base, "real"), join(base, "link"));
+		await assert.rejects(resolveGrantFolder(join(base, "real", "pending-runtime"), root, { runtimeDir: join(base, "link", "pending-runtime") }), /runtime/i, "a missing runtime under a symlinked parent is compared canonically");
 	} finally { await cleanup(); }
 });
 

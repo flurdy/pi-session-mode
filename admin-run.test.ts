@@ -28,7 +28,10 @@ function alive(pid: number): boolean {
 }
 
 test("bounded refusals cover Git mutation, publication, remote sync and privilege escalation only", () => {
-	for (const command of ["git push origin main", "git -C repo commit -m x", "bash -c 'git reset --hard'", "make beads-sync", "make push", "bd dolt push", "gh pr create", "sudo ls"]) {
+	for (const command of [
+		"git push origin main", "git -C repo commit -m x", "bash -c 'git reset --hard'", "make beads-sync", "make push", "bd dolt push", "gh pr create", "sudo ls",
+		"git \"push\" origin main", "if true; then gh pr create; fi", "while true; do make push; done", "{ git commit -m x; }",
+	]) {
 		assert.ok(adminRunRefusal(command), command);
 	}
 	for (const command of ["cp -a a b", "mv -n -T a b", "chmod 700 d", "git status --porcelain", "echo 'git push is refused'", "make apply"]) {
@@ -64,6 +67,9 @@ test("prepare binds canonical writes, script digest and a clean repository; rech
 		await writeFile(join(repo, "untracked.txt"), "x\n");
 		assert.match(await recheckAdminRun(prepared) ?? "", /repository/i);
 		await rm(join(repo, "untracked.txt"));
+		await mkdir(join(home, ".agents", "handoffs"));
+		assert.match(await recheckAdminRun(prepared) ?? "", /appeared or disappeared/, "a destination shown as missing must still be missing");
+		await rm(join(home, ".agents", "handoffs"), { recursive: true });
 		await mkdir(join(base, "elsewhere"));
 		await symlink(join(base, "elsewhere"), join(home, ".agents", "handoffs"));
 		assert.match(await recheckAdminRun(prepared) ?? "", /declared/i);
@@ -157,5 +163,10 @@ test("nonzero exits fail; deadline, cancellation and lingering children end the 
 		assert.equal(lingering.status, "ok");
 		assert.equal(lingering.lingering, true);
 		assert.equal(alive(Number(await readFile(lingerFile, "utf8"))), false);
+
+		const detachedFile = join(home, "detached.pid");
+		const detached = await executeAdminRun(await prepareAdminRun({ purpose: "Detached output", cwd: home, writes, script: `sleep 30 >/dev/null 2>&1 & echo $! > '${detachedFile}'` }));
+		assert.equal(detached.lingering, true);
+		assert.equal(alive(Number(await readFile(detachedFile, "utf8"))), false, "members without the output pipes are gone before the receipt resolves");
 	} finally { await cleanup(); }
 });

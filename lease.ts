@@ -529,16 +529,16 @@ async function takeIntents(path: string, runtimeDir: string, options: AcquireFil
 	return (options.intentPool ?? new IntentPool()).acquire(intentAncestors(path, home), runtimeDir, options);
 }
 
-/** Losing either the exclusive holder or any intent loses the whole lease and drains its remaining holders. */
+/**
+ * Losing either the exclusive holder or any intent loses the whole lease. Surviving holders stay locked
+ * until the owner releases, so an owner can stop dependent work before another session may enter.
+ */
 function withIntents(lease: HeldKernelLease, intents: HeldIntents): { holderPid: number; lost: Promise<void>; readonly alive: boolean; release(): Promise<void> } {
 	let releasing: Promise<void> | undefined;
-	const release = () => (releasing ??= lease.release().finally(() => intents.release()));
-	const lost = Promise.race([lease.lost, intents.lost]);
-	void lost.then(release);
 	return {
 		holderPid: lease.holderPid,
-		lost,
+		lost: Promise.race([lease.lost, intents.lost]),
 		get alive() { return releasing === undefined && lease.alive !== false && intents.alive; },
-		release,
+		release: () => (releasing ??= lease.release().finally(() => intents.release())),
 	};
 }

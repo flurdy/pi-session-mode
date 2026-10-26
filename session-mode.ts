@@ -130,6 +130,8 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		resolveFiles: dependencies.resolveFiles ?? resolveExplicitFiles,
 		acquireFolder: dependencies.acquireFolder ?? acquireFolderLease,
 		resolveFolders: dependencies.resolveFolders ?? ((paths, cwd, signal) => resolveExplicitFolders(paths, cwd, signal ? { signal } : {})),
+		// An interrupted admin run may still be writing; keep every surviving scope locked until it has ended.
+		holdReleaseOnLoss: () => adminRun?.done,
 	});
 
 	pi.registerFlag("plan", { description: "Start in guarded plan mode without leases", type: "boolean", default: false });
