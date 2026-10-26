@@ -5,7 +5,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { acquireFileLease, acquireWorktreeLease, fileLeaseLockPath, lockIdentity, worktreeLeaseLockPath } from "./lease.ts";
+import { acquireFileLease, acquireFolderLease, acquireWorktreeLease, fileLeaseLockPath, folderLeaseLockPath, intentAncestors, IntentPool, lockIdentity, worktreeLeaseLockPath } from "./lease.ts";
+
+async function folderTree(): Promise<{ root: string; runtimeDir: string; cleanup: () => Promise<void> }> {
+	const base = await realpath(await mkdtemp(join(tmpdir(), "pi-folder-lease-")));
+	const root = join(base, "tree");
+	for (const dir of ["a/b", "c/d"]) await mkdir(join(root, dir), { recursive: true });
+	return { root, runtimeDir: join(base, "runtime"), cleanup: () => rm(base, { recursive: true, force: true }) };
+}
+
+function lockHolderPids(path: string, mode: "READ" | "WRITE"): number[] {
+	const { locks } = JSON.parse(execFileSync("lslocks", ["--json", "--output", "PATH,MODE,PID"], { encoding: "utf8" })) as { locks: { path: string; mode: string; pid: number }[] };
+	return locks.filter((lock) => lock.path === path && lock.mode === mode).map((lock) => lock.pid);
+}
 
 async function gitRepo(): Promise<{ repo: string; runtimeDir: string; cleanup: () => Promise<void> }> {
 	const root = await mkdtemp(join(tmpdir(), "pi-session-mode-"));
@@ -54,6 +66,74 @@ test("file acquisition treats canonical identity as literal rather than normaliz
 			if (lease.kind === "held") assert.equal(lease.file, file);
 		} finally { if (lease.kind === "held") await lease.release(); }
 	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("intent ancestors skip root, home and home ancestors", () => {
+	assert.deepEqual(intentAncestors("/home/u/.agents/handoffs/x.md", "/home/u"), ["/home/u/.agents", "/home/u/.agents/handoffs"]);
+	assert.deepEqual(intentAncestors("/tmp/a/b", "/home/u"), ["/tmp", "/tmp/a"]);
+	assert.deepEqual(intentAncestors("/home/u/x.json", "/home/u"), []);
+});
+
+test("folder leases exclude ancestor, descendant and contained-file leases while disjoint folders coexist", async () => {
+	const { root, runtimeDir, cleanup } = await folderTree();
+	const a = new IntentPool(), b = new IntentPool();
+	const held: { release(): Promise<void> }[] = [];
+	try {
+		const folder = await acquireFolderLease(join(root, "a"), { runtimeDir, sessionId: "a", intentPool: a });
+		assert.equal(folder.kind, "held");
+		if (folder.kind !== "held") return;
+		assert.equal(folder.dir, join(root, "a"));
+		for (const target of [join(root, "a", "b"), root]) {
+			const result = await acquireFolderLease(target, { runtimeDir, sessionId: "b", intentPool: b });
+			if (result.kind === "held") held.push(result);
+			assert.equal(result.kind, "contended", target);
+		}
+		const file = await acquireFileLease(join(root, "a", "b", "x.json"), { runtimeDir, sessionId: "b", intentPool: b });
+		if (file.kind === "held") held.push(file);
+		assert.equal(file.kind, "contended");
+		const disjoint = await acquireFolderLease(join(root, "c"), { runtimeDir, sessionId: "b", intentPool: b });
+		assert.equal(disjoint.kind, "held");
+		if (disjoint.kind === "held") held.push(disjoint);
+		await folder.release();
+		const child = await acquireFolderLease(join(root, "a", "b"), { runtimeDir, sessionId: "b", intentPool: b });
+		assert.equal(child.kind, "held");
+		if (child.kind === "held") held.push(child);
+		const mismatch = await acquireFolderLease(join(root, "c"), { runtimeDir, sessionId: "a", intentPool: a, expectedDir: join(root, "other") });
+		assert.equal(mismatch.kind, "unavailable");
+	} finally { for (const lease of held) await lease.release(); await cleanup(); }
+});
+
+test("shared intents are reference-counted per pool and every dependent is lost with the holder", async () => {
+	const { root, runtimeDir, cleanup } = await folderTree();
+	const pool = new IntentPool(), other = new IntentPool();
+	const held: { release(): Promise<void> }[] = [];
+	try {
+		const x = await acquireFileLease(join(root, "a", "x.json"), { runtimeDir, sessionId: "a", intentPool: pool });
+		const y = await acquireFileLease(join(root, "a", "y.json"), { runtimeDir, sessionId: "a", intentPool: pool });
+		assert.equal(x.kind, "held"); assert.equal(y.kind, "held");
+		if (x.kind !== "held" || y.kind !== "held") return;
+		assert.equal(lockHolderPids(folderLeaseLockPath(join(root, "a"), runtimeDir), "READ").length, 1);
+		await x.release();
+		assert.equal((await acquireFolderLease(join(root, "a"), { runtimeDir, sessionId: "b", intentPool: other })).kind, "contended");
+		await y.release();
+		const freed = await acquireFolderLease(join(root, "a"), { runtimeDir, sessionId: "b", intentPool: other });
+		assert.equal(freed.kind, "held");
+		if (freed.kind === "held") await freed.release();
+
+		const file = await acquireFileLease(join(root, "c", "z.json"), { runtimeDir, sessionId: "a", intentPool: pool });
+		const folder = await acquireFolderLease(join(root, "c", "d"), { runtimeDir, sessionId: "a", intentPool: pool });
+		assert.equal(file.kind, "held"); assert.equal(folder.kind, "held");
+		if (file.kind !== "held" || folder.kind !== "held") return;
+		held.push(file, folder);
+		const [intentPid] = lockHolderPids(folderLeaseLockPath(join(root, "c"), runtimeDir), "READ");
+		assert.ok(intentPid);
+		process.kill(intentPid!, "SIGKILL");
+		await Promise.all([file.lost, folder.lost]);
+		assert.equal(file.alive, false); assert.equal(folder.alive, false);
+		const fresh = await acquireFileLease(join(root, "c", "q.json"), { runtimeDir, sessionId: "a", intentPool: pool });
+		assert.equal(fresh.kind, "held");
+		if (fresh.kind === "held") held.push(fresh);
+	} finally { for (const lease of held) await lease.release(); await cleanup(); }
 });
 
 test("release force-terminates a stopped holder before returning", async () => {

@@ -36,7 +36,7 @@ async function scan(runtimeDir: string, locks: unknown[], parents: Record<number
 	});
 }
 
-const metadata = (identity: "root" | "file", path: string, pid: number, parentPid: number, sessionId = "session-" + pid) =>
+const metadata = (identity: "root" | "file" | "dir", path: string, pid: number, parentPid: number, sessionId = "session-" + pid) =>
 	JSON.stringify({ [identity]: path, pid, parentPid, sessionId, startedAt: "2026-01-01T00:00:00.000Z" }) + "\n";
 
 test("missing runtime directory is an empty inventory; a non-private one is unavailable", async () => {
@@ -72,10 +72,10 @@ test("groups held locks by live parent process and binds only fully matching met
 		if (result.kind !== "inventory") return;
 		assert.equal(result.truncated, false);
 		assert.deepEqual(result.sessions, [
-			{ parentPid: 500, self: true, sessionIds: ["self-session"], files: [], worktrees: [
+			{ parentPid: 500, self: true, sessionIds: ["self-session"], files: [], folders: [], worktrees: [
 				{ kind: "worktree", identity: lockIdentity(a), holderPid: 101, parent: "live", parentPid: 500, self: true, binding: "bound", path: a, sessionId: "self-session", startedAt: "2026-01-01T00:00:00.000Z" },
 			] },
-			{ parentPid: 600, self: false, sessionIds: [], worktrees: [
+			{ parentPid: 600, self: false, sessionIds: [], folders: [], worktrees: [
 				{ kind: "worktree", identity: lockIdentity(b), holderPid: 102, parent: "live", parentPid: 600, self: false, binding: "mismatch" },
 			], files: [
 				{ kind: "file", identity: lockIdentity(f), holderPid: 103, parent: "live", parentPid: 600, self: false, binding: "missing" },
@@ -100,12 +100,29 @@ test("gone, unreadable and ambiguous holders stay visible without becoming proof
 		if (result.kind !== "inventory") return;
 		assert.equal(result.sessions.length, 1);
 		const [session] = result.sessions;
-		assert.deepEqual({ ...session, worktrees: undefined }, { self: false, sessionIds: [], files: [], worktrees: undefined });
+		assert.deepEqual({ ...session, worktrees: undefined }, { self: false, sessionIds: [], files: [], folders: [], worktrees: undefined });
 		const byIdentity = new Map(session!.worktrees.map((entry) => [entry.identity, entry]));
 		assert.deepEqual(byIdentity.get(lockIdentity(c)), { kind: "worktree", identity: lockIdentity(c), holderPid: 201, parent: "gone", self: false, binding: "mismatch" });
 		assert.deepEqual(byIdentity.get(lockIdentity(d)), { kind: "worktree", identity: lockIdentity(d), holderPid: 202, parent: "unavailable", self: false, binding: "missing", detail: "holder belongs to another user" });
 		assert.deepEqual(byIdentity.get(lockIdentity(e)), { kind: "worktree", identity: lockIdentity(e), parent: "unavailable", self: false, binding: "mismatch", detail: "lock scan reports several holder pids" });
 		assert.deepEqual(byIdentity.get(lockIdentity(g)), { kind: "worktree", identity: lockIdentity(g), parent: "unavailable", self: false, binding: "mismatch", detail: "lock scan reports no valid holder pid" });
+	} finally { await cleanup(); }
+});
+
+test("exclusive folder locks bind dir metadata while shared intents stay invisible", async () => {
+	const { runtimeDir, cleanup } = await fixture();
+	try {
+		const d = "/home/user/.agents/handoffs";
+		await writeFile(join(runtimeDir, "dir-" + lockIdentity(d) + ".json"), metadata("dir", d, 401, 500, "folder-session"));
+		const result = await scan(runtimeDir, [
+			row(runtimeDir, "dir-" + lockIdentity(d) + ".lock", 401),
+			row(runtimeDir, "dir-" + lockIdentity("/home/user/.agents") + ".lock", 402, "READ"),
+		], { 401: { kind: "live", parentPid: 500 } });
+		assert.equal(result.kind, "inventory");
+		if (result.kind !== "inventory") return;
+		assert.deepEqual(result.sessions, [{ parentPid: 500, self: true, sessionIds: ["folder-session"], worktrees: [], files: [], folders: [
+			{ kind: "folder", identity: lockIdentity(d), holderPid: 401, parent: "live", parentPid: 500, self: true, binding: "bound", path: d, sessionId: "folder-session", startedAt: "2026-01-01T00:00:00.000Z" },
+		] }]);
 	} finally { await cleanup(); }
 });
 

@@ -1,10 +1,12 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, readFile, realpath, unlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { resolveGrantFile } from "./file-scope.ts";
+import { resolveGrantFile, resolveGrantFolder } from "./file-scope.ts";
+import { canonicalHome, isWithin, worktreeLeaseRuntimeDir } from "./path.ts";
+
+export { worktreeLeaseRuntimeDir } from "./path.ts";
 
 export interface LeaseHolderMetadata {
 	root: string;
@@ -47,8 +49,31 @@ export interface HeldFileLease {
 
 export type FileLeaseResult =
 	| HeldFileLease
-	| { kind: "contended"; file: string; holder?: FileLeaseHolderMetadata }
+	| { kind: "contended"; file: string; holder?: FileLeaseHolderMetadata; intent?: string }
 	| { kind: "unavailable"; reason: "invalid" | "flock-unavailable" | "lease-error"; file?: string; detail?: string };
+
+export interface FolderLeaseHolderMetadata {
+	dir: string;
+	pid: number;
+	parentPid: number;
+	sessionId: string;
+	startedAt: string;
+}
+
+export interface HeldFolderLease {
+	kind: "held";
+	dir: string;
+	holderPid: number;
+	lost: Promise<void>;
+	readonly alive?: boolean;
+	release(): Promise<void>;
+}
+
+/** `intent` names the ancestor whose exclusive folder lease blocked this acquisition. */
+export type FolderLeaseResult =
+	| HeldFolderLease
+	| { kind: "contended"; dir: string; holder?: FolderLeaseHolderMetadata; intent?: string }
+	| { kind: "unavailable"; reason: "invalid" | "flock-unavailable" | "lease-error"; dir?: string; detail?: string };
 
 export interface LeaseExecOptions {
 	timeoutMs: number;
@@ -77,7 +102,13 @@ export interface AcquireWorktreeLeaseOptions {
 	writeMetadata?(path: string, contents: string): Promise<void>;
 }
 
-export interface AcquireFileLeaseOptions {
+interface IntentLeaseOptions {
+	/** Session-wide pool sharing ancestor intents; a private pool is used when omitted. */
+	intentPool?: IntentPool;
+	home?: string;
+}
+
+export interface AcquireFileLeaseOptions extends IntentLeaseOptions {
 	expectedFile?: string;
 	signal?: AbortSignal;
 	runtimeDir?: string;
@@ -86,6 +117,17 @@ export interface AcquireFileLeaseOptions {
 	readyTimeoutMs?: number;
 	writeMetadata?(path: string, contents: string): Promise<void>;
 	resolveFile?(file: string, signal?: AbortSignal): Promise<string>;
+}
+
+export interface AcquireFolderLeaseOptions extends IntentLeaseOptions {
+	expectedDir?: string;
+	signal?: AbortSignal;
+	runtimeDir?: string;
+	flockCommand?: string;
+	sessionId?: string;
+	readyTimeoutMs?: number;
+	writeMetadata?(path: string, contents: string): Promise<void>;
+	resolveFolder?(dir: string, signal?: AbortSignal): Promise<string>;
 }
 
 function defaultExec(command: string, args: string[], options: LeaseExecOptions): Promise<LeaseCommandResult> {
@@ -110,16 +152,29 @@ export function lockIdentity(root: string): string {
 	return createHash("sha256").update(root).digest("hex");
 }
 
-export function worktreeLeaseRuntimeDir(): string {
-	return join(process.env.XDG_RUNTIME_DIR || tmpdir(), `pi-session-guard-${process.getuid?.() ?? "user"}`);
-}
-
 export function worktreeLeaseLockPath(root: string, runtimeDir = worktreeLeaseRuntimeDir()): string {
 	return join(runtimeDir, `${lockIdentity(root)}.lock`);
 }
 
 export function fileLeaseLockPath(file: string, runtimeDir = worktreeLeaseRuntimeDir()): string {
 	return join(runtimeDir, `file-${lockIdentity(file)}.lock`);
+}
+
+/** Exclusive folder leases and shared ancestor intents use the same lock file per directory. */
+export function folderLeaseLockPath(dir: string, runtimeDir = worktreeLeaseRuntimeDir()): string {
+	return join(runtimeDir, `dir-${lockIdentity(dir)}.lock`);
+}
+
+/**
+ * Proper ancestors needing a shared intent lock, outermost first. Root, home and home ancestors
+ * can never be granted as folders, so intents there would protect nothing.
+ */
+export function intentAncestors(path: string, home: string): string[] {
+	const ancestors: string[] = [];
+	for (let dir = dirname(path); dir !== dirname(dir); dir = dirname(dir)) {
+		if (!isWithin(home, dir)) ancestors.push(dir);
+	}
+	return ancestors.reverse();
 }
 
 export async function resolveGitRoot(
@@ -184,6 +239,13 @@ type KernelLeaseResult<Metadata> =
 	| { kind: "contended"; holder?: Metadata }
 	| { kind: "unavailable"; reason: "flock-unavailable" | "lease-error"; detail?: string };
 
+type HolderIdentity = "root" | "file" | "dir";
+
+/** Exclusive holders publish diagnostic metadata before reporting ready; shared intents publish none. */
+type KernelLeaseMode<Metadata> =
+	| { kind: "exclusive"; metadataPath: string; metadataFor(holderPid: number): Metadata; identity: HolderIdentity }
+	| { kind: "shared" };
+
 function validHolder(value: Record<string, unknown>): boolean {
 	return typeof value.pid === "number" && Number.isSafeInteger(value.pid) && value.pid > 0
 		&& typeof value.parentPid === "number" && Number.isSafeInteger(value.parentPid) && value.parentPid > 0
@@ -191,13 +253,13 @@ function validHolder(value: Record<string, unknown>): boolean {
 }
 
 /** Shape check only: diagnostic metadata never establishes ownership. */
-export function holderMetadata(value: unknown, identity: "root" | "file"): LeaseHolderMetadata | FileLeaseHolderMetadata | undefined {
+export function holderMetadata(value: unknown, identity: HolderIdentity): LeaseHolderMetadata | FileLeaseHolderMetadata | FolderLeaseHolderMetadata | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const record = value as Record<string, unknown>;
-	return typeof record[identity] === "string" && validHolder(record) ? record as unknown as LeaseHolderMetadata | FileLeaseHolderMetadata : undefined;
+	return typeof record[identity] === "string" && validHolder(record) ? record as unknown as LeaseHolderMetadata | FileLeaseHolderMetadata | FolderLeaseHolderMetadata : undefined;
 }
 
-async function readHolder<Metadata>(path: string, identity: "root" | "file"): Promise<Metadata | undefined> {
+async function readHolder<Metadata>(path: string, identity: HolderIdentity): Promise<Metadata | undefined> {
 	try {
 		return holderMetadata(JSON.parse(await readFile(path, "utf8")), identity) as Metadata | undefined;
 	} catch {
@@ -208,9 +270,7 @@ async function readHolder<Metadata>(path: string, identity: "root" | "file"): Pr
 
 async function acquireKernelLease<Metadata>(
 	lockPath: string,
-	metadataPath: string,
-	metadataFor: (holderPid: number) => Metadata,
-	identity: "root" | "file",
+	mode: KernelLeaseMode<Metadata>,
 	options: KernelLeaseOptions,
 ): Promise<KernelLeaseResult<Metadata>> {
 	const unavailable = (detail: string): KernelLeaseResult<Metadata> => ({ kind: "unavailable", reason: "lease-error", detail });
@@ -223,12 +283,15 @@ async function acquireKernelLease<Metadata>(
 		return unavailable(error instanceof Error ? error.message : String(error));
 	}
 	if (options.signal?.aborted) return unavailable("Lease acquisition cancelled");
-	const metadataTempPath = `${metadataPath}.${randomUUID()}.tmp`;
+	const exclusive = mode.kind === "exclusive" ? mode : undefined;
+	const metadataTempPath = exclusive ? `${exclusive.metadataPath}.${randomUUID()}.tmp` : undefined;
 	const writeMetadata = options.writeMetadata ?? ((path: string, contents: string) => writeFile(path, contents, { mode: 0o600 }));
-	const holderScript = 'if ! IFS= read -r command || [ "$command" != publish ]; then rm -f -- "$1"; exit 70; fi; mv -f -- "$1" "$2" || exit 71; printf "ready\\n"; exec cat >/dev/null';
+	const holderArgs = exclusive
+		? ["sh", "-c", 'if ! IFS= read -r command || [ "$command" != publish ]; then rm -f -- "$1"; exit 70; fi; mv -f -- "$1" "$2" || exit 71; printf "ready\\n"; exec cat >/dev/null', "pi-session-guard", metadataTempPath!, exclusive.metadataPath]
+		: ["sh", "-c", 'printf "ready\\n"; exec cat >/dev/null', "pi-session-guard"];
 	const child = spawn(
 		options.flockCommand ?? "flock",
-		["-n", "-F", "-E", "75", lockPath, "sh", "-c", holderScript, "pi-session-guard", metadataTempPath, metadataPath],
+		[...(exclusive ? [] : ["-s"]), "-n", "-F", "-E", "75", lockPath, ...holderArgs],
 		{ stdio: ["pipe", "pipe", "pipe"] },
 	);
 	return new Promise<KernelLeaseResult<Metadata>>((resolve) => {
@@ -238,7 +301,7 @@ async function acquireKernelLease<Metadata>(
 		let releasing = false;
 		let lostResolve: (() => void) | undefined;
 		const lost = new Promise<void>((done) => (lostResolve = done));
-		const cleanupTemp = () => void unlink(metadataTempPath).catch(() => undefined);
+		const cleanupTemp = () => { if (metadataTempPath) void unlink(metadataTempPath).catch(() => undefined); };
 		const detachAbort = () => options.signal?.removeEventListener("abort", onAbort);
 		const fail = (result: KernelLeaseResult<Metadata>) => {
 			if (phase !== "acquiring") return;
@@ -255,7 +318,8 @@ async function acquireKernelLease<Metadata>(
 		child.once("spawn", () => {
 			if (phase !== "acquiring") return;
 			holderPid = child.pid!;
-			void writeMetadata(metadataTempPath, `${JSON.stringify(metadataFor(holderPid))}\n`)
+			if (!exclusive) return;
+			void writeMetadata(metadataTempPath!, `${JSON.stringify(exclusive.metadataFor(holderPid))}\n`)
 				.then(() => {
 					if (phase !== "acquiring") { cleanupTemp(); return; }
 					child.stdin.write("publish\n");
@@ -275,7 +339,11 @@ async function acquireKernelLease<Metadata>(
 			if (phase === "held") { phase = "finished"; if (!releasing) lostResolve?.(); return; }
 			if (phase !== "acquiring") return;
 			phase = "finished"; cleanupTemp(); clearTimeout(readyTimer);
-			if (code === 75) { void readHolder<Metadata>(metadataPath, identity).then((holder) => resolve({ kind: "contended", holder })); return; }
+			if (code === 75) {
+				if (!exclusive) { resolve({ kind: "contended" }); return; }
+				void readHolder<Metadata>(exclusive.metadataPath, exclusive.identity).then((holder) => resolve({ kind: "contended", holder }));
+				return;
+			}
 			resolve(unavailable(errorOutput.trim() || `flock exited before ready (${code ?? "signal"})`));
 		});
 		child.stdout.on("data", (chunk) => {
@@ -316,13 +384,12 @@ export async function acquireWorktreeLease(cwd: string, options: AcquireWorktree
 	const runtimeDir = options.runtimeDir ?? worktreeLeaseRuntimeDir();
 	const identity = lockIdentity(resolved.root);
 	const sessionId = options.sessionId ?? process.env.PI_SESSION_ID ?? `pid-${process.pid}`;
-	const result = await acquireKernelLease<LeaseHolderMetadata>(
-		worktreeLeaseLockPath(resolved.root, runtimeDir),
-		join(runtimeDir, `${identity}.json`),
-		(holderPid) => ({ root: resolved.root, pid: holderPid, parentPid: process.pid, sessionId, startedAt: new Date().toISOString() }),
-		"root",
-		options,
-	);
+	const result = await acquireKernelLease<LeaseHolderMetadata>(worktreeLeaseLockPath(resolved.root, runtimeDir), {
+		kind: "exclusive",
+		metadataPath: join(runtimeDir, `${identity}.json`),
+		metadataFor: (holderPid) => ({ root: resolved.root, pid: holderPid, parentPid: process.pid, sessionId, startedAt: new Date().toISOString() }),
+		identity: "root",
+	}, options);
 	if (result.kind === "held") return {
 		kind: "held", root: resolved.root, holderPid: result.holderPid, lost: result.lost,
 		get alive() { return result.alive; }, release: () => result.release(),
@@ -342,18 +409,136 @@ export async function acquireFileLease(file: string, options: AcquireFileLeaseOp
 	if (options.signal?.aborted) return { kind: "unavailable", reason: "lease-error", file: resolved, detail: "Lease acquisition cancelled" };
 	if (options.expectedFile !== undefined && options.expectedFile !== resolved) return { kind: "unavailable", reason: "invalid", file: resolved, detail: "File identity changed before acquisition" };
 	const runtimeDir = options.runtimeDir ?? worktreeLeaseRuntimeDir();
+	const intents = await takeIntents(resolved, runtimeDir, options);
+	if (intents.kind === "contended") return { kind: "contended", file: resolved, intent: intents.dir };
+	if (intents.kind === "unavailable") return { ...intents, file: resolved };
 	const identity = lockIdentity(resolved), sessionId = options.sessionId ?? process.env.PI_SESSION_ID ?? `pid-${process.pid}`;
-	const result = await acquireKernelLease<FileLeaseHolderMetadata>(
-		fileLeaseLockPath(resolved, runtimeDir),
-		join(runtimeDir, `file-${identity}.json`),
-		(holderPid) => ({ file: resolved, pid: holderPid, parentPid: process.pid, sessionId, startedAt: new Date().toISOString() }),
-		"file",
-		options,
-	);
-	if (result.kind === "held") return {
-		kind: "held", file: resolved, holderPid: result.holderPid, lost: result.lost,
-		get alive() { return result.alive; }, release: () => result.release(),
-	};
-	if (result.kind === "contended") return { ...result, file: resolved };
+	const result = await acquireKernelLease<FileLeaseHolderMetadata>(fileLeaseLockPath(resolved, runtimeDir), {
+		kind: "exclusive",
+		metadataPath: join(runtimeDir, `file-${identity}.json`),
+		metadataFor: (holderPid) => ({ file: resolved, pid: holderPid, parentPid: process.pid, sessionId, startedAt: new Date().toISOString() }),
+		identity: "file",
+	}, options);
+	if (result.kind === "held") {
+		const lease = withIntents(result, intents);
+		return { kind: "held", file: resolved, holderPid: lease.holderPid, lost: lease.lost, get alive() { return lease.alive; }, release: lease.release };
+	}
+	await intents.release();
 	return { ...result, file: resolved };
+}
+
+export async function acquireFolderLease(dir: string, options: AcquireFolderLeaseOptions = {}): Promise<FolderLeaseResult> {
+	if (!isAbsolute(dir)) return { kind: "unavailable", reason: "invalid", detail: "Expected an absolute folder path" };
+	const runtimeDir = options.runtimeDir ?? worktreeLeaseRuntimeDir();
+	let resolved: string;
+	try {
+		resolved = await (options.resolveFolder ?? ((path, signal) => resolveGrantFolder(pathToFileURL(path).href, "/", { runtimeDir, ...(signal ? { signal } : {}), ...(options.home ? { home: options.home } : {}) })))(dir, options.signal);
+	} catch (error) {
+		return { kind: "unavailable", reason: "invalid", detail: error instanceof Error ? error.message : String(error) };
+	}
+	if (options.signal?.aborted) return { kind: "unavailable", reason: "lease-error", dir: resolved, detail: "Lease acquisition cancelled" };
+	if (options.expectedDir !== undefined && options.expectedDir !== resolved) return { kind: "unavailable", reason: "invalid", dir: resolved, detail: "Folder identity changed before acquisition" };
+	const intents = await takeIntents(resolved, runtimeDir, options);
+	if (intents.kind === "contended") return { kind: "contended", dir: resolved, intent: intents.dir };
+	if (intents.kind === "unavailable") return { ...intents, dir: resolved };
+	const identity = lockIdentity(resolved), sessionId = options.sessionId ?? process.env.PI_SESSION_ID ?? `pid-${process.pid}`;
+	const result = await acquireKernelLease<FolderLeaseHolderMetadata>(folderLeaseLockPath(resolved, runtimeDir), {
+		kind: "exclusive",
+		metadataPath: join(runtimeDir, `dir-${identity}.json`),
+		metadataFor: (holderPid) => ({ dir: resolved, pid: holderPid, parentPid: process.pid, sessionId, startedAt: new Date().toISOString() }),
+		identity: "dir",
+	}, options);
+	if (result.kind === "held") {
+		const lease = withIntents(result, intents);
+		return { kind: "held", dir: resolved, holderPid: lease.holderPid, lost: lease.lost, get alive() { return lease.alive; }, release: lease.release };
+	}
+	await intents.release();
+	return { ...result, dir: resolved };
+}
+
+interface HeldIntents {
+	kind: "held";
+	lost: Promise<void>;
+	readonly alive: boolean;
+	release(): Promise<void>;
+}
+
+export type IntentResult =
+	| HeldIntents
+	| { kind: "contended"; dir: string }
+	| { kind: "unavailable"; reason: "flock-unavailable" | "lease-error"; detail?: string };
+
+interface IntentEntry { lease: HeldKernelLease; count: number }
+
+/**
+ * Shared ancestor intent locks for one session, reference-counted per lock file, so an
+ * exclusive folder lease elsewhere contends with every contained grant without enumerating
+ * descendants. Loss of a shared holder is reported to every dependent lease.
+ */
+export class IntentPool {
+	readonly #entries = new Map<string, IntentEntry>();
+	readonly #pending = new Map<string, Promise<unknown>>();
+
+	async acquire(dirs: readonly string[], runtimeDir: string, options: KernelLeaseOptions = {}): Promise<IntentResult> {
+		const taken: IntentEntry[] = [];
+		const releaseTaken = async () => { await Promise.all(taken.map((entry) => this.#release(entry))); };
+		for (const dir of dirs) {
+			const result = await this.#take(folderLeaseLockPath(dir, runtimeDir), options);
+			if ("count" in result) { taken.push(result); continue; }
+			await releaseTaken();
+			return result.kind === "contended" ? { kind: "contended", dir } : { kind: "unavailable", reason: result.reason, ...(result.detail ? { detail: result.detail } : {}) };
+		}
+		let released: Promise<void> | undefined;
+		return {
+			kind: "held",
+			lost: Promise.race(taken.map((entry) => entry.lease.lost)),
+			get alive() { return released === undefined && taken.every((entry) => entry.lease.alive !== false); },
+			release: () => (released ??= releaseTaken()),
+		};
+	}
+
+	async #take(lockPath: string, options: KernelLeaseOptions): Promise<IntentEntry | Exclude<KernelLeaseResult<never>, HeldKernelLease>> {
+		while (true) {
+			const pending = this.#pending.get(lockPath);
+			if (pending) { await pending; continue; }
+			const existing = this.#entries.get(lockPath);
+			if (existing && existing.lease.alive !== false) { existing.count++; return existing; }
+			if (existing) this.#entries.delete(lockPath);
+			const acquiring = acquireKernelLease<never>(lockPath, { kind: "shared" }, options);
+			this.#pending.set(lockPath, acquiring);
+			let result: KernelLeaseResult<never>;
+			try { result = await acquiring; }
+			finally { this.#pending.delete(lockPath); }
+			if (result.kind !== "held") return result;
+			const entry: IntentEntry = { lease: result, count: 1 };
+			this.#entries.set(lockPath, entry);
+			void result.lost.then(() => { if (this.#entries.get(lockPath) === entry) this.#entries.delete(lockPath); });
+			return entry;
+		}
+	}
+
+	async #release(entry: IntentEntry): Promise<void> {
+		if (--entry.count > 0) return;
+		for (const [path, value] of this.#entries) if (value === entry) this.#entries.delete(path);
+		await entry.lease.release();
+	}
+}
+
+async function takeIntents(path: string, runtimeDir: string, options: AcquireFileLeaseOptions | AcquireFolderLeaseOptions): Promise<IntentResult> {
+	const home = options.home ?? await canonicalHome();
+	return (options.intentPool ?? new IntentPool()).acquire(intentAncestors(path, home), runtimeDir, options);
+}
+
+/** Losing either the exclusive holder or any intent loses the whole lease and drains its remaining holders. */
+function withIntents(lease: HeldKernelLease, intents: HeldIntents): { holderPid: number; lost: Promise<void>; readonly alive: boolean; release(): Promise<void> } {
+	let releasing: Promise<void> | undefined;
+	const release = () => (releasing ??= lease.release().finally(() => intents.release()));
+	const lost = Promise.race([lease.lost, intents.lost]);
+	void lost.then(release);
+	return {
+		holderPid: lease.holderPid,
+		lost,
+		get alive() { return releasing === undefined && lease.alive !== false && intents.alive; },
+		release,
+	};
 }

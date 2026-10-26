@@ -1,6 +1,20 @@
-import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { realpath } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+
+export function worktreeLeaseRuntimeDir(): string {
+	return join(process.env.XDG_RUNTIME_DIR || tmpdir(), `pi-session-guard-${process.getuid?.() ?? "user"}`);
+}
+
+/** True when `path` is `ancestor` itself or lies beneath it; both must be canonical absolute paths. */
+export function isWithin(path: string, ancestor: string): boolean {
+	return path === ancestor || path.startsWith(ancestor === sep ? sep : `${ancestor}${sep}`);
+}
+
+export async function canonicalHome(): Promise<string> {
+	return realpath(homedir()).catch(() => homedir());
+}
 
 export function normalizeToolPath(value: unknown, cwd: string): string {
 	if (typeof value !== "string" || !value || value.includes("\0")) throw new Error("Invalid file path");

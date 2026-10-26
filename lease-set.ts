@@ -1,19 +1,23 @@
-import { acquireFileLease, acquireWorktreeLease, type FileLeaseResult, type HeldFileLease, type HeldWorktreeLease, type WorktreeLeaseResult } from "./lease.ts";
-import { MAX_FILE_GRANTS, resolveExplicitFiles } from "./file-scope.ts";
+import { acquireFileLease, acquireFolderLease, acquireWorktreeLease, IntentPool, type FileLeaseResult, type FolderLeaseResult, type HeldFileLease, type HeldFolderLease, type HeldWorktreeLease, type WorktreeLeaseResult } from "./lease.ts";
+import { MAX_FILE_GRANTS, MAX_FOLDER_GRANTS, resolveExplicitFiles, resolveExplicitFolders } from "./file-scope.ts";
+import { isWithin } from "./path.ts";
 import { ADDITION_TIMEOUT_MS, MAX_LEASE_ROOTS, resolveExplicitRoots } from "./scope.ts";
 
 type AcquireRoot = (root: string, options: { sessionId: string; signal: AbortSignal; expectedRoot?: string }) => Promise<WorktreeLeaseResult>;
-type AcquireFile = (file: string, options: { sessionId: string; signal: AbortSignal; expectedFile?: string }) => Promise<FileLeaseResult>;
+type AcquireFile = (file: string, options: { sessionId: string; signal: AbortSignal; expectedFile?: string; intentPool?: IntentPool }) => Promise<FileLeaseResult>;
+type AcquireFolder = (dir: string, options: { sessionId: string; signal: AbortSignal; expectedDir?: string; intentPool?: IntentPool }) => Promise<FolderLeaseResult>;
 type ResolveRoots = (paths: string[], cwd: string, signal?: AbortSignal) => Promise<string[]>;
 type ResolveFiles = (paths: string[], cwd: string, signal?: AbortSignal) => Promise<string[]>;
-type HeldScopeLease = HeldWorktreeLease | HeldFileLease;
+type ResolveFolders = (paths: string[], cwd: string, signal?: AbortSignal) => Promise<string[]>;
+type HeldScopeLease = HeldWorktreeLease | HeldFileLease | HeldFolderLease;
 export type WorktreeRequest = { kind: "none" } | { kind: "cwd" } | { kind: "paths"; paths: string[] };
-export interface ScopeSetRequest { worktrees: WorktreeRequest; files: string[]; }
-export interface HeldScopes { roots: string[]; files: string[]; }
+export interface ScopeSetRequest { worktrees: WorktreeRequest; files: string[]; folders?: string[]; }
+export interface HeldScopes { roots: string[]; files: string[]; folders: string[]; }
 export type LeaseSetResult =
 	| ({ kind: "held" } & HeldScopes)
 	| Exclude<WorktreeLeaseResult, HeldWorktreeLease>
 	| Exclude<FileLeaseResult, HeldFileLease>
+	| Exclude<FolderLeaseResult, HeldFolderLease>
 	| { kind: "invalid"; detail: string }
 	| { kind: "cancelled" | "busy" };
 interface Operation {
@@ -27,11 +31,17 @@ interface Operation {
 function same(left: readonly string[], right: readonly string[]): boolean {
 	return JSON.stringify([...new Set(left)].sort()) === JSON.stringify([...new Set(right)].sort());
 }
-function leaseKey(lease: HeldScopeLease): string { return "root" in lease ? lease.root : lease.file; }
+function leaseKey(lease: HeldScopeLease): string { return "root" in lease ? lease.root : "file" in lease ? lease.file : lease.dir; }
+function containing(path: string, folders: Iterable<string>): string | undefined {
+	for (const folder of folders) if (folder !== path && isWithin(path, folder)) return folder;
+	return undefined;
+}
 
 export class LeaseSet {
 	readonly #roots = new Map<string, HeldWorktreeLease>();
 	readonly #files = new Map<string, HeldFileLease>();
+	readonly #folders = new Map<string, HeldFolderLease>();
+	readonly #intents = new IntentPool();
 	readonly #releases = new WeakMap<HeldScopeLease, Promise<void>>();
 	#operation?: Operation;
 	#drain: Promise<void> = Promise.resolve();
@@ -43,15 +53,16 @@ export class LeaseSet {
 		private readonly acquire: AcquireRoot = acquireWorktreeLease,
 		private readonly resolveRoots: ResolveRoots = resolveExplicitRoots,
 		private readonly onLost: () => void = () => {},
-		private readonly options: { timeoutMs?: number; acquireFile?: AcquireFile; resolveFiles?: ResolveFiles } = {},
+		private readonly options: { timeoutMs?: number; acquireFile?: AcquireFile; resolveFiles?: ResolveFiles; acquireFolder?: AcquireFolder; resolveFolders?: ResolveFolders } = {},
 	) {}
 
 	get roots(): string[] { return [...this.#roots.keys()].sort(); }
 	get files(): string[] { return [...this.#files.keys()].sort(); }
+	get folders(): string[] { return [...this.#folders.keys()].sort(); }
 	get revision(): number { return this.#revision; }
 	get lost(): boolean { return this.#lost; }
 	get live(): boolean {
-		const leases = [...this.#roots.values(), ...this.#files.values()];
+		const leases = [...this.#roots.values(), ...this.#files.values(), ...this.#folders.values()];
 		return !this.#lost && leases.length > 0 && leases.every((lease) => lease.alive !== false);
 	}
 	get draining(): Promise<void> { return this.#drain; }
@@ -74,7 +85,7 @@ export class LeaseSet {
 		);
 	}
 
-	addScopes(request: ScopeSetRequest, cwd: string, sessionId: string, beforeCommit?: (scopes: HeldScopes) => void, expected?: { roots?: readonly string[]; files?: readonly string[] }, signal?: AbortSignal): Promise<LeaseSetResult> {
+	addScopes(request: ScopeSetRequest, cwd: string, sessionId: string, beforeCommit?: (scopes: HeldScopes) => void, expected?: { roots?: readonly string[]; files?: readonly string[]; folders?: readonly string[] }, signal?: AbortSignal): Promise<LeaseSetResult> {
 		if (signal?.aborted) return Promise.resolve({ kind: "cancelled" });
 		const key = JSON.stringify([cwd, sessionId, request, expected]);
 		if (this.#operation) return this.#operation.key === key ? this.#operation.promise : Promise.resolve({ kind: "busy" });
@@ -108,8 +119,8 @@ export class LeaseSet {
 		this.#revision++;
 		const pending = this.#operation;
 		pending?.controller.abort();
-		const leases = new Set<HeldScopeLease>([...this.#roots.values(), ...this.#files.values(), ...(pending?.added ?? [])]);
-		this.#roots.clear(); this.#files.clear(); pending?.added.clear();
+		const leases = new Set<HeldScopeLease>([...this.#roots.values(), ...this.#files.values(), ...this.#folders.values(), ...(pending?.added ?? [])]);
+		this.#roots.clear(); this.#files.clear(); this.#folders.clear(); pending?.added.clear();
 		this.#drain = Promise.all([this.#drain, ...[...leases].map((lease) => this.release(lease)), pending?.promise]).then(() => undefined);
 		return this.#drain;
 	}
@@ -126,6 +137,20 @@ export class LeaseSet {
 		return this.#drain;
 	}
 
+	/** Release the named exact-file and folder grants (all when omitted), keep worktrees, and invalidate pending operations and preflights. */
+	releaseGrants(paths?: readonly string[]): Promise<void> {
+		this.#epoch++;
+		this.#revision++;
+		const pending = this.#operation;
+		pending?.controller.abort();
+		const leases: HeldScopeLease[] = [];
+		for (const map of [this.#files, this.#folders] as Map<string, HeldFileLease | HeldFolderLease>[]) {
+			for (const [key, lease] of map) if (!paths || paths.includes(key)) { leases.push(lease); map.delete(key); }
+		}
+		this.#drain = Promise.all([this.#drain, ...leases.map((lease) => this.release(lease)), pending?.promise]).then(() => undefined);
+		return this.#drain;
+	}
+
 	private lose(): void {
 		if (this.#lost) return;
 		this.#lost = true;
@@ -134,7 +159,8 @@ export class LeaseSet {
 	}
 
 	private held(lease: HeldScopeLease): boolean {
-		return "root" in lease ? this.#roots.get(lease.root) === lease : this.#files.get(lease.file) === lease;
+		if ("root" in lease) return this.#roots.get(lease.root) === lease;
+		return "file" in lease ? this.#files.get(lease.file) === lease : this.#folders.get(lease.dir) === lease;
 	}
 	private watch(lease: HeldScopeLease, operation: Operation): void {
 		const onLoss = () => { if (this.held(lease) || operation.added.has(lease)) this.lose(); };
@@ -144,12 +170,12 @@ export class LeaseSet {
 		return operation.epoch === this.#epoch && !operation.controller.signal.aborted && !this.#lost;
 	}
 	private scopesWith(added: Iterable<HeldScopeLease>): HeldScopes {
-		const roots = new Set(this.roots), files = new Set(this.files);
-		for (const lease of added) ("root" in lease ? roots : files).add(leaseKey(lease));
-		return { roots: [...roots].sort(), files: [...files].sort() };
+		const roots = new Set(this.roots), files = new Set(this.files), folders = new Set(this.folders);
+		for (const lease of added) ("root" in lease ? roots : "file" in lease ? files : folders).add(leaseKey(lease));
+		return { roots: [...roots].sort(), files: [...files].sort(), folders: [...folders].sort() };
 	}
 
-	private async execute(operation: Operation, request: ScopeSetRequest, cwd: string, sessionId: string, priorDrain: Promise<void>, beforeCommit?: (scopes: HeldScopes) => void, expected?: { roots?: readonly string[]; files?: readonly string[] }): Promise<LeaseSetResult> {
+	private async execute(operation: Operation, request: ScopeSetRequest, cwd: string, sessionId: string, priorDrain: Promise<void>, beforeCommit?: (scopes: HeldScopes) => void, expected?: { roots?: readonly string[]; files?: readonly string[]; folders?: readonly string[] }): Promise<LeaseSetResult> {
 		const signal = operation.controller.signal;
 		let committed = false;
 		try {
@@ -158,13 +184,24 @@ export class LeaseSet {
 			const roots = request.worktrees.kind === "none" ? []
 				: request.worktrees.kind === "cwd" ? [cwd]
 					: await this.resolveRoots(request.worktrees.paths, cwd, signal);
-			const files = request.files.length ? await (this.options.resolveFiles ?? resolveExplicitFiles)(request.files, cwd, signal) : [];
+			const requestedFiles = request.files.length ? await (this.options.resolveFiles ?? resolveExplicitFiles)(request.files, cwd, signal) : [];
+			const requestedFolders = request.folders?.length
+				? await (this.options.resolveFolders ?? ((paths, base, abort) => resolveExplicitFolders(paths, base, abort ? { signal: abort } : {})))(request.folders, cwd, signal)
+				: [];
 			if (expected?.roots && !same(roots, expected.roots)) return { kind: "invalid", detail: "Restored canonical roots changed; select scopes explicitly" };
-			if (expected?.files && !same(files, expected.files)) return { kind: "invalid", detail: "Restored canonical files changed; grant files explicitly" };
+			if (expected?.files && !same(requestedFiles, expected.files)) return { kind: "invalid", detail: "Restored canonical files changed; grant files explicitly" };
+			if (expected?.folders && !same(requestedFolders, expected.folders)) return { kind: "invalid", detail: "Restored canonical folders changed; grant folders explicitly" };
 			if (!this.current(operation)) return { kind: "cancelled" };
-			if (roots.length === 0 && files.length === 0) return { kind: "invalid", detail: "Expected at least one worktree or exact file scope" };
+			if (roots.length === 0 && requestedFiles.length === 0 && requestedFolders.length === 0) return { kind: "invalid", detail: "Expected at least one worktree, exact file or folder scope" };
+			for (const folder of requestedFolders) {
+				const inside = [...this.#files.keys(), ...this.#folders.keys()].find((grant) => grant !== folder && isWithin(grant, folder));
+				if (inside) return { kind: "invalid", detail: `Folder ${JSON.stringify(folder)} contains the held grant ${JSON.stringify(inside)}; revoke it first` };
+			}
+			const folders = requestedFolders.filter((folder) => !this.#folders.has(folder) && !containing(folder, [...this.#folders.keys(), ...requestedFolders]));
+			const files = requestedFiles.filter((file) => !containing(file, [...this.#folders.keys(), ...folders]));
 			if (new Set([...this.roots, ...roots]).size > MAX_LEASE_ROOTS) return { kind: "invalid", detail: `Expected at most ${MAX_LEASE_ROOTS} held worktrees` };
 			if (new Set([...this.files, ...files]).size > MAX_FILE_GRANTS) return { kind: "invalid", detail: `Expected at most ${MAX_FILE_GRANTS} held file grants` };
+			if (new Set([...this.folders, ...folders]).size > MAX_FOLDER_GRANTS) return { kind: "invalid", detail: `Expected at most ${MAX_FOLDER_GRANTS} held folder grants` };
 			for (const root of [...new Set(roots)].sort()) {
 				if (!this.current(operation)) return { kind: "cancelled" };
 				if (this.#roots.has(root)) continue;
@@ -180,7 +217,7 @@ export class LeaseSet {
 			for (const file of [...new Set(files)].sort()) {
 				if (!this.current(operation)) return { kind: "cancelled" };
 				if (this.#files.has(file)) continue;
-				const result = await (this.options.acquireFile ?? acquireFileLease)(file, { signal, sessionId, expectedFile: file });
+				const result = await (this.options.acquireFile ?? acquireFileLease)(file, { signal, sessionId, expectedFile: file, intentPool: this.#intents });
 				if (result.kind === "held") {
 					operation.added.add(result); this.watch(result, operation);
 					if (result.alive === false) this.lose();
@@ -189,17 +226,29 @@ export class LeaseSet {
 				if (!this.current(operation)) return { kind: "cancelled" };
 				if (result.kind !== "held") return result;
 			}
-			if ([...this.#roots.values(), ...this.#files.values(), ...operation.added].some((lease) => lease.alive === false)) this.lose();
+			for (const folder of [...new Set(folders)].sort()) {
+				if (!this.current(operation)) return { kind: "cancelled" };
+				const result = await (this.options.acquireFolder ?? acquireFolderLease)(folder, { signal, sessionId, expectedDir: folder, intentPool: this.#intents });
+				if (result.kind === "held") {
+					operation.added.add(result); this.watch(result, operation);
+					if (result.alive === false) this.lose();
+					if (result.dir !== folder) return { kind: "invalid", detail: "Folder identity changed during acquisition" };
+				}
+				if (!this.current(operation)) return { kind: "cancelled" };
+				if (result.kind !== "held") return result;
+			}
+			if ([...this.#roots.values(), ...this.#files.values(), ...this.#folders.values(), ...operation.added].some((lease) => lease.alive === false)) this.lose();
 			if (!this.current(operation)) return { kind: "cancelled" };
 			const scopes = this.scopesWith(operation.added);
 			beforeCommit?.(scopes);
 			if (!this.current(operation)) return { kind: "cancelled" };
 			for (const lease of operation.added) {
 				if ("root" in lease) this.#roots.set(lease.root, lease);
-				else this.#files.set(lease.file, lease);
+				else if ("file" in lease) this.#files.set(lease.file, lease);
+				else this.#folders.set(lease.dir, lease);
 			}
 			operation.added.clear(); this.#revision++; committed = true;
-			return { kind: "held", roots: this.roots, files: this.files };
+			return { kind: "held", roots: this.roots, files: this.files, folders: this.folders };
 		} catch (error) {
 			return this.current(operation) ? { kind: "invalid", detail: error instanceof Error ? error.message : String(error) } : { kind: "cancelled" };
 		} finally {

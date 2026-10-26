@@ -6,7 +6,13 @@ import { holderMetadata, lockIdentity, worktreeLeaseRuntimeDir } from "./lease.t
 export const DEFAULT_LEASE_INVENTORY_TIMEOUT_MS = 2000;
 export const MAX_INVENTORY_LOCKS = 128;
 const MAX_METADATA_BYTES = 4096;
-const LOCK_NAME = /^(file-)?([0-9a-f]{64})\.lock$/;
+const LOCK_NAME = /^(file-|dir-)?([0-9a-f]{64})\.lock$/;
+type LockKind = "worktree" | "file" | "folder";
+const NAMESPACES: Record<LockKind, { prefix: string; identity: "root" | "file" | "dir" }> = {
+	worktree: { prefix: "", identity: "root" },
+	file: { prefix: "file-", identity: "file" },
+	folder: { prefix: "dir-", identity: "dir" },
+};
 
 export interface CommandOptions {
 	timeoutMs?: number;
@@ -46,7 +52,7 @@ export async function observeParent(pid: number, ownerUid: number | undefined, s
 }
 
 export interface HeldLock {
-	kind: "worktree" | "file";
+	kind: LockKind;
 	identity: string;
 	holderPid?: number;
 	parent: "live" | "gone" | "unavailable";
@@ -67,6 +73,8 @@ export interface LeaseInventorySession {
 	sessionIds: string[];
 	worktrees: HeldLock[];
 	files: HeldLock[];
+	/** Exclusive folder grants; shared ancestor intents are coordination detail and are not listed. */
+	folders: HeldLock[];
 }
 
 export type LeaseInventory =
@@ -81,7 +89,7 @@ export interface LeaseInventoryOptions extends CommandOptions {
 	readParent?(pid: number, signal?: AbortSignal): Promise<ParentObservation>;
 }
 
-interface LockRow { kind: "worktree" | "file"; identity: string; pids: Set<number>; invalidPid: boolean }
+interface LockRow { kind: LockKind; identity: string; pids: Set<number>; invalidPid: boolean }
 
 function lockRows(stdout: string, runtimeDir: string): Map<string, LockRow> | undefined {
 	let payload: { locks?: unknown };
@@ -95,7 +103,7 @@ function lockRows(stdout: string, runtimeDir: string): Map<string, LockRow> | un
 		const name = basename(lock.path);
 		const match = LOCK_NAME.exec(name);
 		if (!match) continue;
-		const row = rows.get(name) ?? { kind: match[1] ? "file" : "worktree", identity: match[2]!, pids: new Set(), invalidPid: false };
+		const row = rows.get(name) ?? { kind: match[1] === "file-" ? "file" : match[1] === "dir-" ? "folder" : "worktree", identity: match[2]!, pids: new Set(), invalidPid: false };
 		if (typeof lock.pid === "number" && Number.isSafeInteger(lock.pid) && lock.pid > 0) row.pids.add(lock.pid);
 		else row.invalidPid = true;
 		rows.set(name, row);
@@ -124,12 +132,12 @@ async function readBoundedMetadata(path: string, signal?: AbortSignal): Promise<
 }
 
 async function bindMetadata(entry: HeldLock, runtimeDir: string, signal?: AbortSignal): Promise<void> {
-	const prefix = entry.kind === "file" ? "file-" : "";
-	const result = await readBoundedMetadata(join(runtimeDir, `${prefix}${entry.identity}.json`), signal);
+	const namespace = NAMESPACES[entry.kind];
+	const result = await readBoundedMetadata(join(runtimeDir, `${namespace.prefix}${entry.identity}.json`), signal);
 	if (result.kind !== "value") { entry.binding = result.kind; return; }
-	const metadata = holderMetadata(result.value, entry.kind === "file" ? "file" : "root");
+	const metadata = holderMetadata(result.value, namespace.identity);
 	if (!metadata) { entry.binding = "invalid"; return; }
-	const path = entry.kind === "file" ? (metadata as { file: string }).file : (metadata as { root: string }).root;
+	const path = (metadata as unknown as Record<string, string>)[namespace.identity]!;
 	const matches = lockIdentity(path) === entry.identity
 		&& metadata.pid === entry.holderPid
 		&& entry.parent === "live" && metadata.parentPid === entry.parentPid;
@@ -141,8 +149,8 @@ function groupSessions(entries: readonly HeldLock[]): LeaseInventorySession[] {
 	const sessions = new Map<number | undefined, LeaseInventorySession>();
 	for (const entry of entries) {
 		const key = entry.parent === "live" ? entry.parentPid : undefined;
-		const session = sessions.get(key) ?? { ...(key === undefined ? {} : { parentPid: key }), self: entry.self, sessionIds: [], worktrees: [], files: [] };
-		(entry.kind === "file" ? session.files : session.worktrees).push(entry);
+		const session = sessions.get(key) ?? { ...(key === undefined ? {} : { parentPid: key }), self: entry.self, sessionIds: [], worktrees: [], files: [], folders: [] };
+		(entry.kind === "file" ? session.files : entry.kind === "folder" ? session.folders : session.worktrees).push(entry);
 		if (entry.sessionId !== undefined && !session.sessionIds.includes(entry.sessionId)) session.sessionIds.push(entry.sessionId);
 		sessions.set(key, session);
 	}

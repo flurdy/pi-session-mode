@@ -216,11 +216,13 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		}
 		const authority = leases.live ? "Existing valid leases are retained." : retained ? "The session remains lazy; no worktree lease is held." : "No scope leases are held; writes remain guarded.";
 		if (typeof result !== "string" && result.kind === "contended") {
-			const value = "root" in result ? result.root : result.file;
+			const value = "root" in result ? result.root : "file" in result ? result.file : result.dir;
 			const escaped = safeDisplay(value);
 			const target = JSON.stringify(escaped.length > 1000 ? `${escaped.slice(0, 970)} … (truncated)` : escaped);
+			const via = "intent" in result && result.intent ? `, which holds the folder ${JSON.stringify(safeDisplay(result.intent).slice(0, 1000))}` : "";
 			if ("root" in result) notify(ctx, `Worktree ${target} is held by another live session. ${authority} Use /leases to inspect, /plan for read-only work, or /implement <root> for a disjoint worktree.`, "warning");
-			else notify(ctx, `Exact file ${target} is held by another live session. ${authority} Use /grants to inspect, /plan for read-only work, or /grant-file <file> for a disjoint file.`, "warning");
+			else if ("file" in result) notify(ctx, `Exact file ${target} is held by another live session${via}. ${authority} Use /grants to inspect, /plan for read-only work, or /grant-file <file> for a disjoint file.`, "warning");
+			else notify(ctx, `Folder ${target} overlaps a grant held by another live session${via}. ${authority} Use /lease-holders to inspect or /plan for read-only work.`, "warning");
 		} else {
 			notify(ctx, `Scope acquisition failed: ${JSON.stringify(lastFailure)}. ${authority}`, "error");
 		}

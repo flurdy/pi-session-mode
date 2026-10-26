@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, mkdir, rm, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { acquireWorktreeLease } from "./lease.ts";
+import { acquireFileLease, acquireFolderLease, acquireWorktreeLease } from "./lease.ts";
 import { LeaseSet } from "./lease-set.ts";
-import type { FileLeaseResult, HeldFileLease, HeldWorktreeLease, WorktreeLeaseResult } from "./lease.ts";
+import type { FileLeaseResult, HeldFileLease, HeldFolderLease, HeldWorktreeLease, WorktreeLeaseResult } from "./lease.ts";
 
 function handle(root: string, released: string[]) {
 	let lose!: () => void;
@@ -30,8 +30,89 @@ function fileHandle(file: string, released: string[]) {
 	};
 	return { lease, lose };
 }
+function folderHandle(dir: string, released: string[]) {
+	let lose!: () => void;
+	let alive = true;
+	const lease: HeldFolderLease = {
+		kind: "held", dir, holderPid: 125,
+		get alive() { return alive; },
+		lost: new Promise<void>((resolve) => { lose = () => { alive = false; resolve(); }; }),
+		async release() { alive = false; released.push(dir); },
+	};
+	return { lease, lose };
+}
 const resolveRoots = async (paths: string[]) => [...new Set(paths)].sort();
 const resolveFiles = async (paths: string[]) => [...new Set(paths)].sort();
+const resolveFolders = async (paths: string[]) => [...new Set(paths)].sort();
+function grantSet(released: string[], acquired: string[] = [], lost: Map<string, () => void> = new Map()) {
+	return new LeaseSet(async (root) => handle(root, released).lease, resolveRoots, () => {}, {
+		resolveFiles, resolveFolders,
+		acquireFile: async (file) => { acquired.push(file); return fileHandle(file, released).lease; },
+		acquireFolder: async (dir) => { acquired.push(dir); const value = folderHandle(dir, released); lost.set(dir, value.lose); return value.lease; },
+	});
+}
+
+test("held folders cover contained grants; a folder containing a held grant is refused before acquisition", async () => {
+	const released: string[] = [], acquired: string[] = [];
+	const set = grantSet(released, acquired);
+	assert.equal((await set.addScopes({ worktrees: { kind: "none" }, files: ["/s/a/x", "/t/y"], folders: ["/s/a", "/s/a/b"] }, "/cwd", "session")).kind, "held");
+	assert.deepEqual(acquired, ["/t/y", "/s/a"], "contained file and folder requests are covered, not acquired");
+	assert.deepEqual(set.folders, ["/s/a"]);
+	assert.deepEqual(set.files, ["/t/y"]);
+	acquired.length = 0;
+	assert.equal((await set.addScopes({ worktrees: { kind: "none" }, files: ["/s/a/z"], folders: ["/s/a/c"] }, "/cwd", "session")).kind, "held");
+	assert.deepEqual(acquired, []);
+	for (const folder of ["/t", "/s"]) {
+		const refused = await set.addScopes({ worktrees: { kind: "none" }, files: [], folders: [folder] }, "/cwd", "session");
+		assert.equal(refused.kind, "invalid");
+		if (refused.kind === "invalid") assert.match(refused.detail, /revoke/i);
+	}
+	assert.deepEqual(acquired, []);
+	const bounded = await set.addScopes({ worktrees: { kind: "none" }, files: [], folders: Array.from({ length: 16 }, (_, index) => `/f${index}`) }, "/cwd", "session");
+	assert.equal(bounded.kind, "invalid", "held plus requested folders exceed the folder bound");
+	await set.releaseAll();
+});
+
+test("selective grant release keeps remaining grants and worktrees, and folder loss revokes the set", async () => {
+	const released: string[] = [], lost = new Map<string, () => void>();
+	const set = grantSet(released, [], lost);
+	assert.equal((await set.addScopes({ worktrees: { kind: "paths", paths: ["repo"] }, files: ["/x", "/y"], folders: ["/d", "/e"] }, "/cwd", "session")).kind, "held");
+	const revision = set.revision;
+	await set.releaseGrants(["/x", "/d"]);
+	assert.ok(set.revision > revision);
+	assert.deepEqual(released.sort(), ["/d", "/x"]);
+	assert.deepEqual([set.roots, set.files, set.folders], [["repo"], ["/y"], ["/e"]]);
+	assert.equal(set.live, true);
+	await set.releaseGrants();
+	assert.deepEqual([set.roots, set.files, set.folders], [["repo"], [], []]);
+	assert.equal((await set.addScopes({ worktrees: { kind: "none" }, files: [], folders: ["/g"] }, "/cwd", "session")).kind, "held");
+	lost.get("/g")!();
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(set.live, false);
+	assert.deepEqual([set.roots, set.files, set.folders], [[], [], []]);
+	await set.releaseAll();
+});
+
+test("real sessions: contained grants block covering folders across sessions, and folders reacquire after revocation", async () => {
+	const base = await realpath(await mkdtemp(join(tmpdir(), "lease-set-folders-")));
+	const root = join(base, "tree"), runtimeDir = join(base, "runtime");
+	const options = {
+		acquireFile: (file: string, value: { sessionId: string; signal: AbortSignal; expectedFile?: string }) => acquireFileLease(file, { ...value, runtimeDir }),
+		acquireFolder: (dir: string, value: { sessionId: string; signal: AbortSignal; expectedDir?: string }) => acquireFolderLease(dir, { ...value, runtimeDir }),
+		resolveFolders,
+	};
+	const a = new LeaseSet(undefined, undefined, undefined, options), b = new LeaseSet(undefined, undefined, undefined, options);
+	try {
+		await mkdir(join(root, "store", "inner"), { recursive: true });
+		assert.equal((await a.addScopes({ worktrees: { kind: "none" }, files: [join(root, "store", "inner", "x.json")], folders: [] }, root, "a")).kind, "held");
+		assert.equal((await b.addScopes({ worktrees: { kind: "none" }, files: [], folders: [join(root, "store")] }, root, "b")).kind, "contended");
+		assert.equal((await b.addScopes({ worktrees: { kind: "none" }, files: [], folders: [join(root, "other")] }, root, "b")).kind, "held");
+		assert.equal((await a.addScopes({ worktrees: { kind: "none" }, files: [], folders: [join(root, "store")] }, root, "a")).kind, "invalid");
+		await a.releaseGrants();
+		assert.equal((await b.addScopes({ worktrees: { kind: "none" }, files: [], folders: [join(root, "store")] }, root, "b")).kind, "held");
+		assert.equal((await a.addScopes({ worktrees: { kind: "none" }, files: [join(root, "store", "inner", "x.json")], folders: [] }, root, "a")).kind, "contended");
+	} finally { await a.releaseAll(); await b.releaseAll(); await rm(base, { recursive: true, force: true }); }
+});
 
 test("mixed additions publish atomically and retain prior scopes on failure", async () => {
 	const released: string[] = [];

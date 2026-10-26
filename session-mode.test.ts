@@ -103,7 +103,7 @@ test("registers scope controls, fixed handoff saving, commit publication and con
 
 test("lease-holders reports the kernel inventory without acquiring and trims oversized payloads", async () => {
 	const session = (parentPid: number, self: boolean, roots: string[]) => ({
-		parentPid, self, sessionIds: self ? ["session-1"] : [], files: [],
+		parentPid, self, sessionIds: self ? ["session-1"] : [], files: [], folders: [],
 		worktrees: roots.map((root) => ({ kind: "worktree" as const, identity: "a".repeat(64), holderPid: parentPid + 1, parent: "live" as const, parentPid, self, binding: "bound" as const, path: root })),
 	});
 	const inventories = [
