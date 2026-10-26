@@ -7,7 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 
 const [agentDir, workDir, installed] = process.argv.slice(2).map((value) => resolve(value));
-const { acquireFileLease, acquireWorktreeLease, lockIdentity } = await import(pathToFileURL(join(installed, "lease.ts")).href);
+const { acquireFileLease, acquireFolderLease, acquireWorktreeLease, lockIdentity } = await import(pathToFileURL(join(installed, "lease.ts")).href);
 const runtimeDir = join(agentDir, "runtime");
 const settingsPath = join(agentDir, "settings.json");
 const settings = JSON.parse(await readFile(settingsPath, "utf8"));
@@ -117,10 +117,15 @@ try {
 	assert.equal(fileContender.kind, "contended");
 	if (fileHolder.kind === "held") await fileHolder.release();
 	await proveFileFree(configFile);
+	const folderHolder = await acquireFolderLease(fileFixture, { runtimeDir: join(runtimeDir, `pi-session-guard-${process.getuid()}`), sessionId: "folder-holder" });
+	assert.equal(folderHolder.kind, "held");
+	assert.equal((await acquireFileLease(configFile, { runtimeDir: join(runtimeDir, `pi-session-guard-${process.getuid()}`), sessionId: "inside-folder" })).kind, "contended");
+	if (folderHolder.kind === "held") await folderHolder.release();
+	await proveFileFree(configFile);
 	const first = launch();
 	const commands = (await first.send("get_commands")).commands;
 	assert.deepEqual(commands.filter((command) => command.source === "extension" && command.sourceInfo?.path === join(installed, "index.ts")).map((command) => command.name).sort(),
-		["grant-file", "grants", "implement", "lazy", "lease-holders", "leases", "plan"]);
+		["grant-file", "grant-folder", "grants", "implement", "lazy", "lease-holders", "leases", "plan", "revoke-grants"]);
 	await first.state("lazy", true);
 	await proveFree();
 	await first.send("prompt", { message: "/implement" });
@@ -219,7 +224,7 @@ assert.equal(result.kind,"held");
 		assert.equal(client.events.some((event) => event.type === "agent_start" || event.type === "extension_error"), false, "unexpected model turn or extension error");
 		assert.doesNotMatch(client.stderr, /Failed to load extension/);
 	}
-	console.log("RPC: single load, fresh lazy start, plan/implement, exact-file command registration and kernel contention, holder loss, reload, shutdown, flag precedence, missing resolver, bypass and exported observer: PASS; no model turns");
+	console.log("RPC: single load, fresh lazy start, plan/implement, exact-file and folder grant command registration, file and folder kernel contention, holder loss, reload, shutdown, flag precedence, missing resolver, bypass and exported observer: PASS; no model turns");
 } finally {
 	for (const client of clients) await client.stop();
 	await rm(fileFixture, { recursive: true, force: true });
