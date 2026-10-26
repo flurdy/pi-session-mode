@@ -1487,6 +1487,26 @@ test("an active admin run blocks native writes, release and publication; lease l
 	} finally { await cleanup(); }
 });
 
+test("agent guidance offers run_admin and folder grants instead of terminal handoffs, and never self-promotes from plan", async () => {
+	const promptOf = async (pi: FakePi, ctx: ReturnType<typeof context>) => ((await pi.emit("before_agent_start", ctx, { systemPrompt: "base" })) as Array<{ systemPrompt: string }>)[0]!.systemPrompt;
+	const lazy = harness([]);
+	const lazyContext = realContext([]);
+	await lazy.pi.emit("session_start", lazyContext);
+	const lazyPrompt = await promptOf(lazy.pi, lazyContext);
+	for (const pattern of [/run_admin/, /never hand terminal commands back to the user/i, /\/grant-folder/, /Folder grants: \[\]/, /repository shell-first work/]) assert.match(lazyPrompt, pattern);
+	const implement = harness();
+	const implementContext = context();
+	await implement.pi.emit("session_start", implementContext);
+	assert.match(await promptOf(implement.pi, implementContext), /run_admin/);
+	const plan = harness([]);
+	plan.pi.planFlag = true;
+	const planContext = realContext([]);
+	await plan.pi.emit("session_start", planContext);
+	const planPrompt = await promptOf(plan.pi, planContext);
+	assert.match(planPrompt, /run_admin and native writes need a writable session/);
+	assert.match(planPrompt, /never switch modes yourself/);
+});
+
 async function grantFixture() {
 	const base = await realpath(await mkdtemp(join(tmpdir(), "pi-folder-grant-")));
 	const store = join(base, "store");
