@@ -24,7 +24,7 @@ For a reviewed mutable checkout, run `make apply`. It owns the existing `~/.pi/a
 
 ## Use
 
-- A fresh session or `/new` starts `lazy`: implementation intent with no worktree lease. The first native `edit`/`write` acquires only its target's canonical worktree; contention blocks that write and the session stays lazy. Until a worktree is held, obvious Bash, package, Git, system and writer-subagent mutations stay guarded, so use `/implement <root>` for repository shell-first work and `run_admin` for administration outside held worktrees.
+- A fresh session or `/new` starts `lazy`: implementation intent with no worktree lease. The first native `edit`/`write` acquires only its target's canonical worktree; contention blocks that write, after an optional attended wait of up to five minutes, and the session stays lazy. Until a worktree is held, obvious Bash, package, Git, system and writer-subagent mutations stay guarded, so use `/implement <root>` for repository shell-first work and `run_admin` for administration outside held worktrees.
 - `/plan` guards writes, drains pending additions, releases every worktree, file and folder lease, and saves plan mode.
 - `/lazy` releases held worktree leases, keeps exact-file and folder grants, and saves lazy mode. The `release_scopes` agent tool does the same after a task's work is committed and verified; it refuses dirty worktrees unless explicitly allowed with a reason, and refuses while writes or scope transitions are active.
 - `/implement` acquires the cwd worktree when none is held; otherwise it retains the current worktree set.

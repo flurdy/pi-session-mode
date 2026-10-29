@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { realpath } from "node:fs/promises";
+import { setTimeout as sleep } from "node:timers/promises";
 import { basename, dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { acquireFileLease, acquireFolderLease, acquireWorktreeLease, IntentPool, type FileLeaseResult, type FolderLeaseResult, type HeldFolderLease, type WorktreeLeaseResult } from "./lease.ts";
@@ -37,6 +38,8 @@ export interface SessionModeDependencies {
 	readOnlySubagents(cwd: string, preferredProvider?: string): Promise<ReadonlySet<string>>;
 	packageActivation?: PackageActivationAdapter;
 	inventory?(options: LeaseInventoryOptions): Promise<LeaseInventory>;
+	/** Bound and retry interval of the attended wait offered after native-write contention. */
+	contentionWait?: { budgetMs: number; pollMs: number };
 }
 export interface SessionModeController {
 	readonly mode: SessionMode;
@@ -57,6 +60,13 @@ interface Implementation {
 	promise: Promise<void>;
 }
 const NATIVE_WRITE_TOOLS = new Set(["edit", "write", "multi_tool_use.parallel"]);
+const CONTENTION_WAIT = { budgetMs: 5 * 60_000, pollMs: 2_000 };
+const WAIT_OFFER_TIMEOUT_MS = 60_000;
+const CONTENTION_GUIDANCE = "The user may be offered a bounded wait; if the write is still blocked, report it rather than retrying it automatically.";
+function clock(ms: number): string {
+	const seconds = Math.max(0, Math.ceil(ms / 1000));
+	return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+}
 const STATE_META: Record<SessionGuardState, { label: string; tone: "success" | "warning" | "error" }> = {
 	acquiring: { label: "acquiring", tone: "warning" },
 	implement: { label: "implement", tone: "success" },
@@ -91,6 +101,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	const reservation = new OperationReservation();
 	const publication = registerCommitPublication(pi, {}, { ownLifecycle: false, reservation });
 	let adminRun: { abort: AbortController; done: Promise<void> } | undefined;
+	let contentionWait: AbortController | undefined;
 	let mode: SessionMode = "implement";
 	let state: SessionGuardState = "acquiring";
 	let selection: Selection = { mode: "implement", scope: { kind: "cwd" } };
@@ -116,6 +127,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	const leases = new LeaseSet(dependencies.acquireLease, resolveExplicitRoots, () => {
 		generation++;
 		adminRun?.abort.abort("lease lost: the session's scope leases were revoked");
+		contentionWait?.abort("lease lost");
 		mode = "plan";
 		selection = { mode: "plan" };
 		guardTools();
@@ -814,6 +826,50 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		},
 	});
 
+	function setWorkingMessage(ctx: ExtensionContext, message?: string): void {
+		try { ctx.ui.setWorkingMessage(message); } catch { /* Progress rendering is not an authority boundary. */ }
+	}
+	/**
+	 * Offer one attended, bounded wait after native-write contention. Each retry is the ordinary
+	 * nonblocking acquisition with its own deadline and identity checks; nothing is queued, reserved
+	 * or stolen, and any result other than contention ends the wait. Returns undefined when no dialog
+	 * can be shown, a reason when the wait ended without a new result, or the final result.
+	 */
+	async function waitForContention(
+		ctx: ExtensionContext, root: string, retry: (signal: AbortSignal) => Promise<LeaseSetResult>,
+		still: () => boolean, track: (signal: AbortSignal) => void,
+	): Promise<LeaseSetResult | string | undefined> {
+		if (!ctx.hasUI || typeof ctx.ui.select !== "function") return undefined;
+		const { budgetMs, pollMs } = dependencies.contentionWait ?? CONTENTION_WAIT;
+		const stop = new AbortController();
+		contentionWait = stop;
+		const turn = ctx.signal ? AbortSignal.any([ctx.signal, stop.signal]) : stop.signal;
+		// The attended phase replaces the ten-second preflight deadline; each retry keeps its own.
+		track(turn);
+		const wait = `Wait up to ${clock(budgetMs)} (Esc cancels)`;
+		try {
+			let choice: string | undefined;
+			try {
+				choice = await ctx.ui.select(`Worktree ${safeDisplay(JSON.stringify(root))} is held by another live session. Wait for its release?`, [wait, "Stop: block this write"], { timeout: WAIT_OFFER_TIMEOUT_MS, signal: turn });
+			} catch { choice = undefined; }
+			if (choice !== wait) return "the offered wait was not accepted";
+			const budget = AbortSignal.timeout(budgetMs), deadline = Date.now() + budgetMs;
+			const waiting = AbortSignal.any([turn, budget]);
+			track(waiting);
+			while (!waiting.aborted && still()) {
+				setWorkingMessage(ctx, `Waiting for worktree lease ${safeDisplay(basename(root))}: ${clock(deadline - Date.now())} left. Esc cancels.`);
+				const result = await retry(waiting);
+				if (result.kind === "held" || (result.kind !== "contended" && !waiting.aborted)) return result;
+				if (!(await sleep(pollMs, true, { signal: waiting }).catch(() => false))) break;
+			}
+			return budget.aborted ? `waited ${clock(budgetMs)} without release` : "the wait was cancelled";
+		} finally {
+			track(turn);
+			setWorkingMessage(ctx, undefined);
+			if (contentionWait === stop) contentionWait = undefined;
+		}
+	}
+
 	async function acquireWriteTargets(tool: string, input: unknown, ctx: ExtensionContext): Promise<string | undefined> {
 		if (!NATIVE_WRITE_TOOLS.has(tool) || !acquisitionEligible()) return;
 		if (dynamicAcquisition || releaseOperation || (implementation && current(implementation.generation))) return "Another scope acquisition or release is busy; write blocked.";
@@ -824,7 +880,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		const missing = new Set<string>();
 		const abort = ctx.signal;
 		const deadline = AbortSignal.timeout(ADDITION_TIMEOUT_MS);
-		const signal = abort ? AbortSignal.any([abort, deadline]) : deadline;
+		let signal = abort ? AbortSignal.any([abort, deadline]) : deadline;
 		const eligible = () => current(ticket) && acquisitionEligible() && !signal.aborted;
 		const unchanged = () => eligible() && leases.revision === revision;
 		try {
@@ -842,16 +898,25 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 			if ((selection.scope.kind === "roots" || selection.scope.kind === "lazy") && selection.scope.originCwd !== originCwd) return "Origin cwd changed; reselect scopes explicitly.";
 			const roots = [...missing].sort();
 			let candidate: Selection = selection;
-			const result = await leases.addScopes(
+			const sessionId = ctx.sessionManager.getSessionId();
+			const acquire = (attempt: AbortSignal) => leases.addScopes(
 				{ worktrees: { kind: "paths", paths: roots.map((root) => pathToFileURL(root).href) }, files: [] },
-				ctx.cwd, ctx.sessionManager.getSessionId(),
+				ctx.cwd, sessionId,
 				(scopes) => {
 					if (!unchanged()) throw new Error("Native-write acquisition superseded or cancelled");
 					candidate = selected({ kind: "roots", roots: scopes.roots, originCwd }, scopes);
 					persistSelection(candidate);
 				},
-				{ roots }, signal,
+				{ roots }, attempt,
 			);
+			let result = await acquire(signal), waited: string | undefined;
+			if (result.kind === "contended" && "root" in result && unchanged()) {
+				const outcome = await waitForContention(ctx, result.root, acquire,
+					() => current(ticket) && acquisitionEligible() && leases.revision === revision,
+					(active) => { signal = active; });
+				if (typeof outcome === "string") waited = outcome;
+				else if (outcome) result = outcome;
+			}
 			if (result.kind === "held" && current(ticket) && (state === "implement" || state === "lazy") && leases.live) {
 				selection = candidate; lastFailure = undefined;
 				setState(ctx, activeState());
@@ -860,7 +925,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 			if (result.kind !== "held") {
 				lastFailure = { requested: roots, result };
 				const detail = result.kind === "contended" && "root" in result
-					? `Worktree ${JSON.stringify(result.root)} is held by another live session`
+					? `Worktree ${JSON.stringify(result.root)} is held by another live session${waited ? ` (${waited})` : ""}`
 					: `${result.kind}${"detail" in result ? `: ${result.detail}` : ""}`;
 				return safeDisplay(`Dynamic lease acquisition blocked for ${boundedScopeList(roots)}: ${detail.slice(0, 2000)}. ${lazy ? "The session remains lazy with no new worktree lease." : "Existing valid scopes are retained."}`);
 			}
@@ -903,9 +968,9 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		const grants = `Exact-file grants: ${boundedScopeList(leases.files)}. Folder grants: ${boundedScopeList(leases.folders)}.`;
 		const common = "Native writes to other non-repository files need explicit /grant-file or /grant-folder confirmation. For administrative or installation work outside held worktrees (for example linking or migrating files under ~/.agents), use run_admin: one native confirmation per exact command, never confined to its declared folders. Never hand terminal commands back to the user, request an unrelated lease or make a dummy edit instead. Shell/script effects are not automatically scoped: never use them as a scope-expansion workaround. Reads, Beads claims, prose and subagent requests do not acquire leases.";
 		const guidance = state === "lazy" && writable()
-			? `Lazy implementation: no worktree lease is held yet. ${grants} The first native edit/write acquires only its target's canonical Git worktree; do not ask for /implement for that path. Contention or unavailable identity blocks that write and the session stays lazy. Until a worktree is held, obvious Bash, package, Git, system and writer-subagent mutations stay guarded; for repository shell-first work ask the user for /implement <root> while idle. ${common}`
+			? `Lazy implementation: no worktree lease is held yet. ${grants} The first native edit/write acquires only its target's canonical Git worktree; do not ask for /implement for that path. Contention or unavailable identity blocks that write and the session stays lazy. ${CONTENTION_GUIDANCE} Until a worktree is held, obvious Bash, package, Git, system and writer-subagent mutations stay guarded; for repository shell-first work ask the user for /implement <root> while idle. ${common}`
 			: state === "implement" && leases.live
-			? `Leased worktrees: ${boundedScopeList(leases.roots)}. ${grants} ${leases.roots.length ? "Native edit/write calls can acquire and persist their canonical target worktree leases automatically; do not ask for a redundant /implement command for that supported path. Contention or unavailable identity blocks the write. After the task's work is committed and verified, release_scopes returns held worktrees to lazy mode; it refuses dirty worktrees unless the user explicitly allows them." : "Grant-only sessions cannot auto-acquire worktrees and retain the bounded guarded shell/subagent policy; ask for /implement while idle before repository work."} ${common}`
+			? `Leased worktrees: ${boundedScopeList(leases.roots)}. ${grants} ${leases.roots.length ? `Native edit/write calls can acquire and persist their canonical target worktree leases automatically; do not ask for a redundant /implement command for that supported path. Contention or unavailable identity blocks the write. ${CONTENTION_GUIDANCE} After the task's work is committed and verified, release_scopes returns held worktrees to lazy mode; it refuses dirty worktrees unless the user explicitly allows them.` : "Grant-only sessions cannot auto-acquire worktrees and retain the bounded guarded shell/subagent policy; ask for /implement while idle before repository work."} ${common}`
 			: "[GUARDED SESSION]\nDo not modify source files, Git, package or system state; ask the user to select /implement scopes first. Read-only analysis, safe subagent management and verified direct read-only reviewers are allowed.\nOrdinary local Beads triage means a local mutation in any resolver-proven owning store, not only cwd. Use bd -C <proven directory> for comments, create, update and close without /implement or a worktree lease. If ownership resolution is ambiguous, unavailable or not-found, write nothing; repository-specific tracker rules still win. Beads writes do not acquire source leases.\nVerify effective export, backup and synchronization side effects, not just command syntax or commented config examples. A configured Dolt remote alone does not make a local comment a sync request. Follow the applicable remote/destructive policy separately; /implement alone does not authorize remote or destructive actions. Workspace synchronization uses make beads-sync after fresh explicit confirmation; never synchronize during list, resolver or triage workflows.\nrun_admin and native writes need a writable session: ask the user for /lazy or /implement while idle; never switch modes yourself.";
 		return { systemPrompt: `${event.systemPrompt}\n\n${guidance}\nException: save_handoff is a dedicated, fixed-destination handoff save operation available in every guard state without repository leases or /grant-file. Use it for wrap-up; it grants no native write or shell authority. Never substitute a Bash helper when this tool is missing or fails.\nException: publish_commit is the attended exact-commit publication tool, available in every guard state without a source lease. Each push needs its own fresh native confirmation; never ask for /implement to publish, and never fall back to Bash or make pushes when it is missing or refuses.` };
 	});
@@ -941,6 +1006,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	pi.on("session_shutdown", async (_event, ctx) => {
 		shuttingDown = true; generation++; guardTools();
 		adminRun?.abort.abort("session shutdown");
+		contentionWait?.abort("session shutdown");
 		await Promise.all([packageActivationDrain, publication.sessionShutdown(), adminRun?.done]);
 		await leases.releaseAll();
 		resetDiscovery(); restoreTools();

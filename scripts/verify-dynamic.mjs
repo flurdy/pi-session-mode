@@ -47,8 +47,13 @@ async function until(predicate, label) {
 	throw new Error(`Timed out: ${label}`);
 }
 async function absent(path) { await assert.rejects(access(path)); }
+const stopOffer = (event) => event.options.find((option) => option.startsWith("Stop"));
+const waitOffer = (event) => event.options.find((option) => option.startsWith("Wait up to"));
+const isOffer = (event) => event.type === "extension_ui_request" && event.method === "select";
 class Client {
 	pending = new Map(); events = []; sequence = 0; buffer = ""; stderr = "";
+	/** Answers contention-wait offers; unknown select dialogs are cancelled. */
+	selectAnswer = stopOffer;
 	constructor(agent, flags) {
 		this.child = spawn("pi", ["--mode", "rpc", "--offline", "--no-skills", "--no-context-files", "--no-approve", "--session", join(agent, "session.jsonl"), "--provider", "lease-fixture", "--model", "fixed", "-e", join(target, "index.ts"), "-e", join(source, "fixtures", "native-write-provider.ts"), ...flags], {
 			cwd: work, env: { HOME: handoffHome ?? agent, PATH: `${bin}:${process.env.PATH}`, TERM: "xterm-256color", PI_CODING_AGENT_DIR: agent, XDG_RUNTIME_DIR: runtime, TMPDIR: panelArtifacts, PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" }, stdio: ["pipe", "pipe", "pipe"],
@@ -63,6 +68,10 @@ class Client {
 				if (!line) continue;
 				const event = JSON.parse(line); this.events.push(event);
 				if (event.type === "response") this.pending.get(event.id)?.(event);
+				if (isOffer(event)) {
+					const value = this.selectAnswer(event);
+					this.child.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: event.id, ...(value === undefined ? { cancelled: true } : { value }) })}\n`);
+				}
 			}
 		});
 		this.child.stderr.on("data", (chunk) => { this.stderr = (this.stderr + chunk).slice(-8000); });
@@ -184,14 +193,27 @@ try {
 	assert.equal(await readFile(join(repos.api, "new"), "utf8"), "fixture");
 	await first.roots([work, repos.api]);
 	assert.deepEqual((await first.snapshot()).tools, tools);
+	let offers = first.events.length;
 	results = await first.turn("contention", [write("repos/web/blocked")]);
 	assert.equal(results[0].isError, true); await absent(join(repos.web, "blocked"));
+	assert.match(JSON.stringify(results[0].result), /the offered wait was not accepted/);
+	const offer = first.events.slice(offers).find(isOffer);
+	assert.match(offer.title, /held by another live session/); assert.equal(offer.timeout, 60000);
 	await first.roots([work, repos.api]);
 	results = await first.turn("atomic-conflict", [parallel([write("repos/other/no"), write("repos/web/no")])]);
 	assert.equal(results[0].isError, true);
 	await absent(join(repos.other, "no")); await absent(join(repos.web, "no"));
 	await first.roots([work, repos.api]);
+	first.selectAnswer = waitOffer;
+	offers = first.events.length;
+	const waiting = first.turn("contention-wait", [write("repos/web/waited")]);
+	await until(() => first.events.slice(offers).some(isOffer), "contention wait offer");
 	await peer.send("prompt", { message: "/plan" });
+	results = await waiting;
+	first.selectAnswer = stopOffer;
+	assert.equal(results[0].isError, false, JSON.stringify(results));
+	assert.equal(await readFile(join(repos.web, "waited"), "utf8"), "fixture");
+	await first.roots([work, repos.api, repos.web]);
 	results = await peer.turn("admin-plan-blocked", [adminRequest]);
 	assert.equal(results[0].isError, true); await absent(adminMarker);
 	results = await first.turn("atomic-success", [parallel([write("repos/other/yes"), write("repos/web/yes")])]);
@@ -338,7 +360,7 @@ try {
 	for (const call of calls) assert.equal(resultsInSession.filter((entry) => entry.message.toolCallId === call.id).length, 1, `Unpaired ${call.id}`);
 	const locks = JSON.parse(execFileSync("lslocks", ["--json", "--output", "PATH"], { encoding: "utf8" }));
 	assert.equal((locks.locks ?? []).some((row) => row.path?.startsWith(runtime)), false);
-	console.log("Dynamic RPC PASS: real Pi native write/edit, atomic wrapper, sibling preflights, contention, cancellation, v2 in-turn persistence and reload, paired tool results, unchanged active tools, selection-only no-op, guarded rejection, RPC package-activation denial, run_admin RPC refusal and plan block, caller-file panel and workspace-sync pre-dispatch refusal, optional private stdin panel coverage reported above, clean shutdown. Scripted fixture only; no external model requests or real CLI/auth/billing proof.");
+	console.log("Dynamic RPC PASS: real Pi native write/edit, atomic wrapper, sibling preflights, contention with a declined and an accepted attended wait, cancellation, v2 in-turn persistence and reload, paired tool results, unchanged active tools, selection-only no-op, guarded rejection, RPC package-activation denial, run_admin RPC refusal and plan block, caller-file panel and workspace-sync pre-dispatch refusal, optional private stdin panel coverage reported above, clean shutdown. Scripted fixture only; no external model requests or real CLI/auth/billing proof.");
 } finally {
 	for (const client of clients) await client.stop();
 	await rm(base, { recursive: true, force: true });

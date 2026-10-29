@@ -10,6 +10,7 @@ import { acquireFileLease, acquireWorktreeLease, lockIdentity } from "./lease.ts
 import { registerSessionMode } from "./session-mode.ts";
 
 type Handler = (event: any, ctx: any) => any;
+type DialogOptions = { timeout?: number; signal?: AbortSignal };
 const IMPLICIT_CWD = { implicitCwd: true };
 class Pi {
 	tools = ["read", "bash", "edit", "write"];
@@ -46,6 +47,8 @@ async function fixture(run: (root: string, start: (flags?: Record<string, unknow
 			const statuses = new Map<string, string>();
 			const widgets = new Map<string, string[] | undefined>();
 			const notices: string[] = [], acquired: string[] = [], acquiredFiles: string[] = [], confirmations: string[] = [];
+			const selections: ({ title: string; options: string[] } & DialogOptions)[] = [], workingMessages: (string | undefined)[] = [];
+			const waitTiming = { budgetMs: 2000, pollMs: 10 };
 			let confirmResult = true, confirmationHook: () => void | Promise<void> = () => {}, idle = true, pendingMessages = false;
 			let acquireHook: (path: string, signal?: AbortSignal) => void | Promise<void> = () => {};
 			let disabled = false;
@@ -53,14 +56,23 @@ async function fixture(run: (root: string, start: (flags?: Record<string, unknow
 			const sessionId = `session-${sessions.length}`;
 			const ctx = { cwd: root, mode: "tui", hasUI: true, signal: undefined as AbortSignal | undefined, isIdle: () => idle, hasPendingMessages: () => pendingMessages, model: { provider: "test" },
 				sessionManager: { getBranch: () => [...restoredBase, ...pi.entries], getSessionId: () => sessionId },
-				ui: { theme: { fg: (_: string, value: string) => value }, setWidget: (key: string, value: string[] | undefined) => widgets.set(key, value), setStatus: (key: string, value: string) => statuses.set(key, value), notify: (text: string) => notices.push(text), confirm: async (_title: string, text: string) => { confirmations.push(text); await confirmationHook(); return confirmResult; } } };
+				ui: { theme: { fg: (_: string, value: string) => value }, setWidget: (key: string, value: string[] | undefined) => widgets.set(key, value), setStatus: (key: string, value: string) => statuses.set(key, value), setWorkingMessage: (message?: string) => workingMessages.push(message), notify: (text: string) => notices.push(text), confirm: async (_title: string, text: string) => { confirmations.push(text); await confirmationHook(); return confirmResult; } } };
 			const controller = registerSessionMode(pi as never, {
 				acquireLease: async (path, options) => { acquired.push(path); await acquireHook(path, options.signal); return acquireWorktreeLease(path, { ...options, runtimeDir: join(root, "runtime") }); },
 				acquireFile: async (path, options) => { acquiredFiles.push(path); return acquireFileLease(path, { ...options, runtimeDir: join(root, "runtime"), resolveFile: async (file) => file }); },
 				resolveFiles: async (paths) => [...new Set(paths.map(fileResolution))].sort(),
 				isDisabled: () => disabled, readOnlySubagents: async () => new Set(),
+				contentionWait: waitTiming,
 			});
-			const session = { pi, ctx, controller, statuses, widgets, notices, acquired, acquiredFiles, confirmations,
+			const session = { pi, ctx, controller, statuses, widgets, notices, acquired, acquiredFiles, confirmations, selections, workingMessages,
+				/** Without a select dialog (the default here) contention blocks at once, as in headless sessions. */
+				setSelect: (choose?: (title: string, options: string[], opts: DialogOptions) => string | undefined | Promise<string | undefined>) => {
+					(ctx.ui as Record<string, unknown>).select = choose && (async (title: string, options: string[], opts: DialogOptions = {}) => {
+						selections.push({ title, options, ...opts });
+						return choose(title, options, opts);
+					});
+				},
+				setWaitTiming: (timing: Partial<typeof waitTiming>) => Object.assign(waitTiming, timing),
 				setConfirm: (value: boolean) => { confirmResult = value; },
 				setAcquireHook: (hook: typeof acquireHook) => { acquireHook = hook; },
 				setDisabled: (value: boolean) => { disabled = value; },
@@ -711,4 +723,155 @@ test("lazy intent composes with exact-file grants across release and restoration
 	assert.deepEqual(restored.controller.files, [file], "/lazy keeps grants while /plan clears them");
 	await restored.command("plan");
 	assert.deepEqual(restored.controller.files, []);
+}));
+
+const choose = (pattern: RegExp) => (_title: string, options: string[]) => options.find((option) => pattern.test(option));
+const WAIT = /^Wait up to/, STOP = /^Stop/;
+async function until(predicate: () => boolean, label: string): Promise<void> {
+	for (let i = 0; i < 500; i++) { if (predicate()) return; await delay(10); }
+	assert.fail(`Timed out waiting for ${label}`);
+}
+async function stillHeld(root: string, path: string): Promise<void> {
+	const probe = await acquireWorktreeLease(path, { runtimeDir: join(root, "runtime") });
+	try { assert.equal(probe.kind, "contended", `${path} stays held`); }
+	finally { if (probe.kind === "held") await probe.release(); }
+}
+
+test("an accepted contention wait acquires the released worktree, then allows the write", async () => fixture(async (root, start) => {
+	const holder = await start(); await holder.command("implement", "api");
+	const session = await start({});
+	session.setSelect(choose(WAIT));
+	session.setWaitTiming({ budgetMs: 5000 });
+	const pending = session.tool("write", { path: "api/new", content: "x" });
+	await until(() => session.acquired.length >= 3, "repeated attempts");
+	assert.equal(session.selections.length, 1);
+	const [offer] = session.selections;
+	assert.match(offer.title, /api.*held by another live session/);
+	assert.deepEqual(offer.options.map((option: string) => option.split(" ")[0]), ["Wait", "Stop:"]);
+	assert.equal(offer.timeout, 60_000); assert.ok(offer.signal);
+	assert.equal(session.controller.state, "lazy", "waiting changes no state");
+	assert.deepEqual(session.pi.entries, []);
+	assert.ok(session.workingMessages.some((message: string | undefined) => /^Waiting for worktree lease api: \d+:\d\d left/.test(message ?? "")));
+	const busy = await session.tool("write", { path: "web/new", content: "y" });
+	assert.equal(busy?.block, true); assert.match(busy.reason, /busy/);
+	await assert.rejects(session.release(), /Cannot release scopes/);
+	await holder.command("plan");
+	assert.equal(await pending, undefined);
+	assert.deepEqual(session.controller.roots, [join(root, "api")]);
+	assert.equal(session.controller.state, "implement");
+	assert.deepEqual(session.pi.entries.at(-1).data.scope, { kind: "roots", roots: [join(root, "api")], originCwd: root });
+	assert.equal(session.workingMessages.at(-1), undefined, "progress is cleared");
+	await stillHeld(root, join(root, "api"));
+}));
+
+test("declined, dismissed and dialog-less contention blocks at once without retrying", async () => fixture(async (_root, start) => {
+	const holder = await start(); await holder.command("implement", "api");
+	const session = await start({});
+	for (const [answer, label] of [[choose(STOP), "stop"], [async () => undefined, "dismissed"]] as const) {
+		session.setSelect(answer);
+		const attempts = session.acquired.length;
+		const blocked = await session.tool("write", { path: "api/new", content: label });
+		assert.equal(blocked?.block, true, label);
+		assert.match(blocked.reason, /held by another live session \(the offered wait was not accepted\)/, label);
+		assert.equal(session.acquired.length, attempts + 1, `${label} makes no retry`);
+	}
+	assert.equal(session.selections.length, 2);
+	session.setSelect(choose(WAIT));
+	session.ctx.hasUI = false;
+	const headless = await session.tool("write", { path: "api/new", content: "z" });
+	assert.equal(headless?.block, true); assert.doesNotMatch(headless.reason, /offered wait/);
+	assert.equal(session.selections.length, 2, "headless sessions are never offered a wait");
+	assert.equal(session.controller.state, "lazy");
+	assert.deepEqual(session.controller.roots, []);
+	assert.deepEqual(session.pi.entries, []);
+	const prompt = await session.pi.handlers.get("before_agent_start")?.({ systemPrompt: "base" }, session.ctx);
+	assert.match(prompt.systemPrompt, /offered a bounded wait; if the write is still blocked, report it rather than retrying/);
+}));
+
+test("an unreleased worktree ends the wait at its bound and leaves the holder untouched", async () => fixture(async (root, start) => {
+	const holder = await start(); await holder.command("implement", "api");
+	const session = await start({});
+	session.setSelect(choose(WAIT));
+	session.setWaitTiming({ budgetMs: 150 });
+	const began = Date.now();
+	const blocked = await session.tool("write", { path: "api/new", content: "x" });
+	assert.equal(blocked?.block, true);
+	assert.match(blocked.reason, /held by another live session \(waited 0:01 without release\)/);
+	assert.ok(Date.now() - began >= 150);
+	assert.ok(session.acquired.length > 2, "the wait retried");
+	assert.equal(session.controller.state, "lazy");
+	assert.deepEqual(session.controller.roots, []);
+	assert.deepEqual(session.pi.entries, []);
+	assert.deepEqual(holder.controller.roots, [join(root, "api")]);
+	await stillHeld(root, join(root, "api"));
+}));
+
+test("turn cancellation and shutdown end a wait or an open offer promptly", async () => fixture(async (root, start) => {
+	const holder = await start(); await holder.command("implement", "api");
+	const session = await start({});
+	session.setSelect(choose(WAIT));
+	session.setWaitTiming({ budgetMs: 60_000, pollMs: 50 });
+	const turn = new AbortController(); session.ctx.signal = turn.signal;
+	const pending = session.tool("write", { path: "api/new", content: "x" });
+	await until(() => session.acquired.length >= 2, "waiting");
+	turn.abort();
+	const cancelled = await pending;
+	assert.equal(cancelled?.block, true); assert.match(cancelled.reason, /cancelled/);
+	session.ctx.signal = undefined;
+	session.setSelect((_title: string, _options: string[], opts: DialogOptions) => new Promise<undefined>((resolve) => opts.signal?.addEventListener("abort", () => resolve(undefined), { once: true })));
+	const offered = session.tool("write", { path: "api/new", content: "y" });
+	await until(() => session.selections.length === 2, "second offer");
+	await session.pi.handlers.get("session_shutdown")?.({}, session.ctx);
+	assert.equal((await offered)?.block, true);
+	assert.deepEqual(session.controller.roots, []);
+	assert.deepEqual(session.pi.entries, []);
+	await stillHeld(root, join(root, "api"));
+}));
+
+test("losing an existing lease while waiting ends the wait without reviving authority", async () => fixture(async (root, start) => {
+	const holder = await start(); await holder.command("implement", "api");
+	const session = await start(IMPLICIT_CWD);
+	session.setSelect(choose(WAIT));
+	session.setWaitTiming({ budgetMs: 60_000, pollMs: 50 });
+	const pending = session.tool("write", { path: "api/new", content: "x" });
+	await until(() => session.acquired.length >= 3, "waiting");
+	const metadata = JSON.parse(await readFile(join(root, "runtime", `${lockIdentity(root)}.json`), "utf8"));
+	process.kill(metadata.pid, "SIGKILL");
+	assert.equal((await pending)?.block, true);
+	assert.equal(session.controller.state, "lost");
+	assert.deepEqual(session.controller.roots, []);
+	assert.equal(session.pi.entries.at(-1).data.mode, "plan");
+	await stillHeld(root, join(root, "api"));
+}));
+
+test("a non-contention failure while waiting is reported instead of retried", async () => fixture(async (_root, start) => {
+	const holder = await start(); await holder.command("implement", "api");
+	const session = await start({});
+	session.setSelect(choose(WAIT));
+	session.setWaitTiming({ budgetMs: 60_000 });
+	session.setAcquireHook(() => { if (session.acquired.length >= 3) throw new Error("simulated lease failure"); });
+	const blocked = await session.tool("write", { path: "api/new", content: "x" });
+	assert.equal(blocked?.block, true);
+	assert.match(blocked.reason, /invalid: simulated lease failure/);
+	assert.equal(session.acquired.length, 3, "no retry after a non-contention result");
+	assert.equal(session.controller.state, "lazy");
+	assert.deepEqual(session.controller.roots, []);
+}));
+
+test("two waiters race for a released worktree: exactly one acquires it and nothing is stolen", async () => fixture(async (root, start) => {
+	const holder = await start(); await holder.command("implement", "api");
+	const waiters = [await start({}), await start({})];
+	for (const waiter of waiters) { waiter.setSelect(choose(WAIT)); waiter.setWaitTiming({ budgetMs: 1500, pollMs: 5 }); }
+	const pending = waiters.map((waiter, index) => waiter.tool("write", { path: `api/${index}`, content: "x" }));
+	await until(() => waiters.every((waiter) => waiter.acquired.length >= 3), "both waiting");
+	await holder.command("plan");
+	const results = await Promise.all(pending);
+	const winners = waiters.filter((_waiter, index) => results[index] === undefined);
+	assert.equal(winners.length, 1, "exactly one waiter acquires the worktree");
+	const loser = waiters.find((waiter) => !winners.includes(waiter))!;
+	assert.match(results[waiters.indexOf(loser)].reason, /held by another live session \(waited/);
+	assert.deepEqual(winners[0].controller.roots, [join(root, "api")]);
+	assert.deepEqual(loser.controller.roots, []);
+	assert.equal(loser.controller.state, "lazy");
+	await stillHeld(root, join(root, "api"));
 }));
