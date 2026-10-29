@@ -832,13 +832,13 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	/**
 	 * Offer one attended, bounded wait after native-write contention. Each retry is the ordinary
 	 * nonblocking acquisition with its own deadline and identity checks; nothing is queued, reserved
-	 * or stolen, and any result other than contention ends the wait. Returns undefined when no dialog
-	 * can be shown, a reason when the wait ended without a new result, or the final result.
+	 * or stolen, and any result other than worktree contention ends the wait. Returns undefined when
+	 * no dialog can be shown; otherwise keeps the latest result and any reason the wait ended.
 	 */
 	async function waitForContention(
-		ctx: ExtensionContext, root: string, retry: (signal: AbortSignal) => Promise<LeaseSetResult>,
+		ctx: ExtensionContext, initial: Extract<WorktreeLeaseResult, { kind: "contended" }>, retry: (signal: AbortSignal) => Promise<LeaseSetResult>,
 		still: () => boolean, track: (signal: AbortSignal) => void,
-	): Promise<LeaseSetResult | string | undefined> {
+	): Promise<{ result: LeaseSetResult; reason?: string } | undefined> {
 		if (!ctx.hasUI || typeof ctx.ui.select !== "function") return undefined;
 		const { budgetMs, pollMs } = dependencies.contentionWait ?? CONTENTION_WAIT;
 		const stop = new AbortController();
@@ -850,19 +850,26 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		try {
 			let choice: string | undefined;
 			try {
-				choice = await ctx.ui.select(`Worktree ${safeDisplay(JSON.stringify(root))} is held by another live session. Wait for its release?`, [wait, "Stop: block this write"], { timeout: WAIT_OFFER_TIMEOUT_MS, signal: turn });
+				choice = await ctx.ui.select(`Worktree ${safeDisplay(JSON.stringify(initial.root))} is held by another live session. Wait for all requested worktrees?`, [wait, "Stop: block this write"], { timeout: WAIT_OFFER_TIMEOUT_MS, signal: turn });
 			} catch { choice = undefined; }
-			if (choice !== wait) return "the offered wait was not accepted";
+			if (choice !== wait) return { result: initial, reason: "the offered wait was not accepted" };
 			const budget = AbortSignal.timeout(budgetMs), deadline = Date.now() + budgetMs;
 			const waiting = AbortSignal.any([turn, budget]);
 			track(waiting);
+			let latest = initial;
+			const progress = () => setWorkingMessage(ctx, `Waiting for worktree lease ${safeDisplay(basename(latest.root))}: ${clock(deadline - Date.now())} left. Esc cancels.`);
+			progress();
 			while (!waiting.aborted && still()) {
-				setWorkingMessage(ctx, `Waiting for worktree lease ${safeDisplay(basename(root))}: ${clock(deadline - Date.now())} left. Esc cancels.`);
 				const result = await retry(waiting);
-				if (result.kind === "held" || (result.kind !== "contended" && !waiting.aborted)) return result;
+				if (result.kind !== "contended" || !("root" in result)) {
+					if (!waiting.aborted || result.kind === "held") return { result };
+					break;
+				}
+				latest = result;
+				progress();
 				if (!(await sleep(pollMs, true, { signal: waiting }).catch(() => false))) break;
 			}
-			return budget.aborted ? `waited ${clock(budgetMs)} without release` : "the wait was cancelled";
+			return { result: latest, reason: budget.aborted ? `waited ${clock(budgetMs)} without acquiring all requested worktrees` : "the wait was cancelled" };
 		} finally {
 			track(turn);
 			setWorkingMessage(ctx, undefined);
@@ -911,11 +918,10 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 			);
 			let result = await acquire(signal), waited: string | undefined;
 			if (result.kind === "contended" && "root" in result && unchanged()) {
-				const outcome = await waitForContention(ctx, result.root, acquire,
+				const outcome = await waitForContention(ctx, result, acquire,
 					() => current(ticket) && acquisitionEligible() && leases.revision === revision,
 					(active) => { signal = active; });
-				if (typeof outcome === "string") waited = outcome;
-				else if (outcome) result = outcome;
+				if (outcome) { result = outcome.result; waited = outcome.reason; }
 			}
 			if (result.kind === "held" && current(ticket) && (state === "implement" || state === "lazy") && leases.live) {
 				selection = candidate; lastFailure = undefined;

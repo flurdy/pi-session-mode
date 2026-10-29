@@ -8,6 +8,7 @@ import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { acquireFileLease, acquireWorktreeLease, lockIdentity } from "./lease.ts";
 import { registerSessionMode } from "./session-mode.ts";
+import { ADDITION_TIMEOUT_MS } from "./scope.ts";
 
 type Handler = (event: any, ctx: any) => any;
 type DialogOptions = { timeout?: number; signal?: AbortSignal };
@@ -796,7 +797,7 @@ test("an unreleased worktree ends the wait at its bound and leaves the holder un
 	const began = Date.now();
 	const blocked = await session.tool("write", { path: "api/new", content: "x" });
 	assert.equal(blocked?.block, true);
-	assert.match(blocked.reason, /held by another live session \(waited 0:01 without release\)/);
+	assert.match(blocked.reason, /held by another live session \(waited 0:01 without acquiring all requested worktrees\)/);
 	assert.ok(Date.now() - began >= 150);
 	assert.ok(session.acquired.length > 2, "the wait retried");
 	assert.equal(session.controller.state, "lazy");
@@ -839,6 +840,7 @@ test("losing an existing lease while waiting ends the wait without reviving auth
 	process.kill(metadata.pid, "SIGKILL");
 	assert.equal((await pending)?.block, true);
 	assert.equal(session.controller.state, "lost");
+	assert.equal(session.selections[0].signal.aborted, true, "loss aborts the offer/turn signal, not only the polling condition");
 	assert.deepEqual(session.controller.roots, []);
 	assert.equal(session.pi.entries.at(-1).data.mode, "plan");
 	await stillHeld(root, join(root, "api"));
@@ -873,5 +875,66 @@ test("two waiters race for a released worktree: exactly one acquires it and noth
 	assert.deepEqual(winners[0].controller.roots, [join(root, "api")]);
 	assert.deepEqual(loser.controller.roots, []);
 	assert.equal(loser.controller.state, "lazy");
+	await stillHeld(root, join(root, "api"));
+}));
+
+test("offers and accepted waits can outlive the original ten-second preflight deadline", async () => fixture(async (root, start) => {
+	const holder = await start(); await holder.command("implement", "api web");
+	const offered = await start({}), waiting = await start({});
+	let accept!: () => void;
+	const gate = new Promise<void>((resolve) => { accept = resolve; });
+	offered.setSelect(async (title: string, options: string[]) => { await gate; return choose(WAIT)(title, options); });
+	waiting.setSelect(choose(WAIT));
+	for (const session of [offered, waiting]) session.setWaitTiming({ budgetMs: 30_000, pollMs: 100 });
+	const began = Date.now();
+	const pending = [offered.tool("write", { path: "api/new", content: "x" }), waiting.tool("write", { path: "web/new", content: "y" })];
+	await until(() => offered.selections.length === 1 && waiting.workingMessages.length >= 2, "offer and accepted wait");
+	try {
+		await delay(ADDITION_TIMEOUT_MS + 100);
+		assert.ok(Date.now() - began > ADDITION_TIMEOUT_MS);
+		assert.equal(offered.selections[0].signal.aborted, false, "the offer has its own sixty-second deadline");
+		assert.deepEqual(offered.pi.entries, []); assert.deepEqual(waiting.pi.entries, []);
+		await holder.command("plan");
+	} finally { accept(); }
+	assert.deepEqual(await Promise.all(pending), [undefined, undefined]);
+	assert.deepEqual(offered.controller.roots, [join(root, "api")]);
+	assert.deepEqual(waiting.controller.roots, [join(root, "web")]);
+	assert.deepEqual(waiting.pi.entries.at(-1).data.scope.roots, [join(root, "web")]);
+}));
+
+test("multi-root contention reports the latest blocked worktree and rolls back other additions", async () => fixture(async (root, start) => {
+	const apiHolder = await start(); await apiHolder.command("implement", "api");
+	const webHolder = await start(); await webHolder.command("implement", "web");
+	const session = await start(IMPLICIT_CWD);
+	session.setSelect(choose(WAIT)); session.setWaitTiming({ budgetMs: 1000, pollMs: 20 });
+	const pending = session.tool("multi_tool_use.parallel", { tool_uses: ["api/new", "web/new"].map((path) => ({
+		recipient_name: "functions.write", parameters: { path, content: "x" },
+	})) });
+	await until(() => session.workingMessages.some((message: string | undefined) => message?.startsWith("Waiting for worktree lease api:")), "first blocked root");
+	await apiHolder.command("plan");
+	await until(() => session.workingMessages.some((message: string | undefined) => message?.startsWith("Waiting for worktree lease web:")), "next blocked root");
+	const blocked = await pending;
+	assert.equal(blocked?.block, true);
+	assert.match(blocked.reason, /Worktree ".*\/web" is held by another live session \(waited/);
+	assert.equal(session.selections.length, 1, "one offer covers the entire original root set");
+	assert.deepEqual(session.controller.roots, [root], "the original scope stays held");
+	assert.deepEqual(session.pi.entries, [], "no partial acquisition was saved");
+	await stillHeld(root, root); await stillHeld(root, join(root, "web"));
+	const free = await acquireWorktreeLease(join(root, "api"), { runtimeDir: join(root, "runtime") });
+	try { assert.equal(free.kind, "held", "free roots are rolled back after each unsuccessful retry"); }
+	finally { if (free.kind === "held") await free.release(); }
+}));
+
+test("shutdown aborts an accepted wait without waiting for the next polling interval", { timeout: 3000 }, async () => fixture(async (root, start) => {
+	const holder = await start(); await holder.command("implement", "api");
+	const session = await start({});
+	session.setSelect(choose(WAIT)); session.setWaitTiming({ budgetMs: 60_000, pollMs: 60_000 });
+	const pending = session.tool("write", { path: "api/new", content: "x" });
+	await until(() => session.workingMessages.length >= 2, "accepted wait sleeping");
+	await session.pi.handlers.get("session_shutdown")?.({}, session.ctx);
+	assert.equal((await pending)?.block, true);
+	assert.equal(session.selections[0].signal.aborted, true);
+	assert.deepEqual(session.controller.roots, []); assert.deepEqual(session.pi.entries, []);
+	assert.equal(session.workingMessages.at(-1), undefined);
 	await stillHeld(root, join(root, "api"));
 }));
