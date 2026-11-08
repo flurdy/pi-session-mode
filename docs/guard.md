@@ -254,4 +254,19 @@ auth. It deep-imports `src/agents/agents.js` under the active Pi agent directory
 is not a stability guarantee. Keep absence, malformed definitions and unsafe contracts fail-closed;
 do not vendor the resolver or turn discovery failures into approval.
 
-Consumers use `@flurdy/pi-session-mode/lease-observer`; do not copy the implementation. Its new batch function supplements the existing single-root function. See the [README](../README.md) for installation, verification and downgrade boundaries.
+### Verification options
+
+Run `npm run check` with the Node version in `.nvmrc`, then commit before running `npm run verify:git-install`. The latter requires a clean tracked working tree. It installs that exact local commit through a temporary loopback Git server into an isolated Pi agent directory, verifies commands and real lease lifecycle, and checks the exported observer from a scratch consumer. It also runs `verify:dynamic` against the installed package with a local scripted provider fixture: actual Pi native tools, contention, cancellation, in-turn persistence and reload, with no external model requests. No user installation is modified.
+
+Optional cross-repository smokes use reviewed installed helpers. Set these variables before `npm run verify:git-install`; absent helpers leave the corresponding coverage explicitly skipped:
+
+| Variable | Reviewed agent-skills path | Additional coverage |
+|---|---|---|
+| `PANEL_STDIN_HELPER` | `skills/second-opinion/scripts/review-panel-stdin.py` | Plan-mode check/run/evaluate with a stub reviewer. |
+| `RELEASE_STATE_HELPER` | `skills/release-manager/scripts/release-state` | Plan-mode release-state read/update against an ignored fixture state file. |
+
+Use absolute paths to those helpers. Neither smoke makes external model requests. Handoff saves have their own [helper verification requirements](handoff-save.md#verification-and-rollout).
+
+For a separate current-host smoke, run `node scripts/verify-dynamic.mjs` outside `npm run`, with `PI_VERIFY_HOST_VERSION` set to the exact output of `pi --version`. npm scripts prefer the development-pinned Pi; the explicit version checks that the separate smoke uses the intended host.
+
+Consumers use `@flurdy/pi-session-mode/lease-observer`; do not copy the implementation. Its new batch function supplements the existing single-root function. See the [README](../README.md) for installation and downgrade boundaries.

@@ -1,16 +1,15 @@
 # Pi Session Mode
 
-A [Pi](https://pi.dev) extension for guarded plan mode, Git-worktree writer leases with native-write-driven expansion, confirmed exact-file and folder grants outside Git, and attended single-use admin runs. Disjoint repositories and configuration files can be coordinated independently. This is an accidental-change guard, not a sandbox.
+A [Pi](https://pi.dev) extension for guarded plan mode, Git-worktree writer leases, confirmed non-Git file/folder grants and attended admin runs.
 
-See [the guard contract](docs/guard.md) for policy, lease lifetime, compatibility, failure behavior, and explicit bypasses.
+**An accidental-change guard, not a sandbox.** Leases coordinate cooperating local Pi sessions; shell/script effects are not path-confined. See the [guard contract](docs/guard.md) for policy and failure boundaries.
 
 ## Requirements
 
-- Pi 0.85.1 or newer; development and lifecycle checks use 0.85.1.
-- Git and util-linux `flock` for writer exclusion; Linux `lslocks` for optional occupancy observation.
-- Node.js from `.nvmrc` for development.
-
-Pi supplies its core package at runtime; the peer range deliberately accepts the host version. The optional guarded-reviewer integration requires the compiled package layout from `pi-subagents` 0.68.0 or newer and fails closed when its discovery API is unavailable; see the contract.
+- Pi 0.85.1 or newer; development and lifecycle checks use 0.85.1. An open host peer range does not certify later versions.
+- Git and util-linux `flock`; Linux `lslocks` for optional occupancy observation.
+- Node.js from `.nvmrc` for development. Pi supplies its core package at runtime.
+- Optional guarded reviewers: `pi-subagents` 0.68.0+ with its compiled discovery API. Missing/incompatible discovery fails closed; see [runtime compatibility](docs/guard.md#runtime-and-distribution).
 
 ## Install
 
@@ -20,69 +19,113 @@ Pin a reviewed immutable Git ref:
 pi install git:github.com/flurdy/pi-session-mode@<commit-or-tag>
 ```
 
-For a reviewed mutable checkout, run `make apply`. It owns the existing `~/.pi/agent/extensions/flurdy-session-mode` link. Do not enable a Git package and a checkout link together. Restart Pi after first installation; use `/reload` for later edits. Each reload releases the old lease before attempting to reacquire it.
+Or, from a reviewed mutable checkout, run `make apply` to manage `~/.pi/agent/extensions/flurdy-session-mode`. **Do not enable both sources.** Restart Pi after first installation; use `/reload` for later edits. Reload releases old leases before reacquiring the saved selection.
 
-## Use
+## Everyday use
 
-- A fresh session or `/new` starts `lazy`: implementation intent with no worktree lease. The first native `edit`/`write` acquires only its target's canonical worktree; contention blocks that write, after an optional attended wait of up to five minutes, and the session stays lazy. Until a worktree is held, obvious Bash, package, Git, system and writer-subagent mutations stay guarded, so use `/implement <root>` for repository shell-first work and `run_admin` for administration outside held worktrees.
-- `/plan` guards writes, drains pending additions, releases every worktree, file and folder lease, and saves plan mode.
-- `/lazy` releases held worktree leases, keeps exact-file and folder grants, and saves lazy mode. The `release_scopes` agent tool does the same after a task's work is committed and verified; it refuses dirty worktrees unless explicitly allowed with a reason, and refuses while writes or scope transitions are active.
-- `/implement` acquires the cwd worktree when none is held; otherwise it retains the current worktree set.
-- `/implement repos/api repos/web` adds those worktree roots without implicitly leasing the workspace root. Quote literal paths containing spaces.
-- `/grant-file ~/.agents/tool/config.json` resolves exact non-Git files, displays their canonical identities, and requires an interactive confirmation before acquiring them. It can establish file-only implementation mode without leasing cwd; the bounded guarded Bash/subagent policy remains active until a worktree is also leased.
-- `/grant-folder ~/.agents/handoffs` confirms non-Git folders; native `edit`/`write` may then create and change files beneath them, never escaping through symlinks or into repositories. Bash policy is unchanged. `/revoke-grants [paths]` releases named or all file and folder grants and keeps worktrees. See [folder grants and admin runs](docs/admin-runs.md).
-- `run_admin` is an agent tool for administration outside held worktrees, such as a migration script or `make apply` installer. Each run shows the full command, working directory and declared folders in a fresh native confirmation and runs exactly once with closed stdin. Its effects are not confined. Git mutations, publication and remote synchronization are refused. See [admin runs](docs/admin-runs.md).
-- `/leases` shows held/requested/failed worktree scopes. `/leases repos/api` inspects that root without acquiring.
-- `/lease-holders` lists every lease held by live local Pi sessions, grouped by session, validated against kernel locks; holder metadata is reported only when it matches.
-- `/grants` shows held/requested/failed exact-file and folder scopes. `/grants path` resolves that identity without acquiring it.
-- Named second-opinion panels can use the installed private stdin helper in plan mode, without source leases or general `/tmp` write permission. The helper requires a supporting guard and owns its scratch files; see [read-only second opinions](docs/guard.md#read-only-second-opinions).
-- `save_handoff` saves a rendered resume block to the fixed `~/.agents/handoffs` directory in every guard state, without repository or `/grant-file` authority. New files auto-save; overwrite requires fresh TUI confirmation. See [handoff saves](docs/handoff-save.md) for helper requirements, concurrency and failure boundaries.
-- Release-manager bookkeeping through the installed `release-state` helper works in guarded sessions without source leases; `update` is exempt only in its exact documented shape. See [release-state bookkeeping](docs/guard.md#release-state-bookkeeping).
-- `publish_commit` publishes one exact, freshly confirmed commit to its same-name upstream in every guard state, without a source-writer lease. Each push needs its own native TUI question, which offers `defer`, `push`, `cancel` and `why?` and waits for the answer; only `push` returns a single-use token. No force, tags or retry. See [attended commit publication](docs/publication.md).
-- `activate_pi_package` is an opt-in agent tool for one already-installed allowlisted Pi Git package. It requires live implement state and fresh TUI confirmation, but does not publish or reload. See [confirmed package activation](docs/package-activation.md).
-- `pi --implement --lease-roots '["repos/api","repos/web"]'` selects explicit startup roots. `pi --lazy` saves lazy mode. `--plan` wins; explicit startup flags override saved selection, and `--lazy` combined with `--implement` or `--lease-roots` starts guarded plan mode instead.
-- `PI_SESSION_GUARD=0` is the explicit, visibly unguarded emergency bypass.
+A fresh session or `/new` starts **lazy**, holding no worktree lease. The first native `edit`/`write` acquires its target's canonical worktree. Contention blocks the write, with an optional attended wait of up to five minutes; there is no automatic retry after refusal.
 
-**Compatibility change in 0.3:** once an implement session holds at least one live worktree lease, native `edit`/`write` preflight can acquire and persist additional canonical target worktrees without another prompt. Linked, nested and sibling repositories still require their own locks; a supported parallel wrapper acquires all missing roots atomically. This replaces the explicit-only expansion policy in released 0.2.1: leases now prevent writer collisions, not accidental targeting of a different repository. Plan, conflict, lost, unguarded and file-only sessions never auto-expand.
+### Modes and repository work
 
-**Compatibility change after 0.5.0:** sessions without a saved selection, including `/new` and `--continue` with no history, start `lazy` instead of leasing cwd. Concurrent sessions launched at a workspace root no longer contend for that root; each takes the member worktree its first write targets. Saved selections still restore, bare `/implement` still leases cwd, and a lazy session that acquires a worktree saves it as explicit roots so a reload reacquires in-progress work. Lazy selections use a v4 checkpoint after a v1 plan checkpoint; older readers resume guarded. Folder grants use a v5 checkpoint that v4 and older readers also resume guarded. Folder and file grants share ancestor intent locks, so reload every session on a machine together when upgrading or rolling back.
+| Command | Effect |
+|---|---|
+| `/plan` | Guard writes, drain pending acquisitions, release all worktree/file/folder leases and save plan mode. |
+| `/lazy` | Release all worktree leases, keep file/folder grants and save lazy mode. |
+| `/implement` | Acquire cwd's worktree if none is held; otherwise keep the current set. |
+| `/implement repos/api repos/web` | Add only those worktree roots, not the workspace root. |
 
-Bash/script effects remain outside path enforcement and cannot trigger expansion. Legacy non-Git or unavailable implicit-cwd sessions (bare `/implement`, `--implement` or a saved cwd selection) remain visibly `unguarded`; start lazy or in plan mode, or explicitly select valid roots, to obtain protection.
+For shell-first repository work, acquire the intended roots explicitly:
 
-A failed addition preserves previously held worktree and file scopes. Any lost lease guards the whole session and releases the combined set. File grants are limited to exact regular files with one filesystem link, or one missing leaf beneath an existing canonical parent; directories, missing parents, filesystem-marker-detectable Git ownership or administration, reserved Git marker names, hardlinks, dangling links, and special files fail closed. Marker-less or externally redirected worktrees are not detectable from an ordinary file path and remain outside this cooperative guarantee. Revalidation before every native edit/write catches identity and scope-revision changes.
-
-Beads claims, prose, reads, environment variables, project configuration, and arbitrary model tools cannot trigger expansion. Only concrete native-write targets in an eligible session do so; `/grant-file` remains interactive-only. Release is always explicit: there is no automatic release on tracker close, completion or idle, no per-root release, and no special cross-repository owner. `/lazy` and `release_scopes` release the whole worktree set; `/plan` also releases file grants. Separate `leases:N` and `grants:N` extension statuses plus `/leases` and `/grants` expose the active identities. A bounded grant widget remains visible even when a custom footer ignores extension statuses.
-
-## Observer integration
-
-Consumers import the package-owned API:
-
-```typescript
-import { probeWorktreeLeaseOccupancy } from "@flurdy/pi-session-mode/lease-observer";
+```text
+/implement repos/api "repos/web client"
+/leases
 ```
 
-The observer has no third-party runtime dependencies and never acquires a lock. A separately installed Pi package is not automatically a Node dependency of another extension. [ai-tools statusline](https://github.com/flurdy/ai-tools/tree/main/pi/statusline) provides explicit dependency wiring to the reviewed checkout or installed Git package. Keep the guard and observer on the same selected revision and reload them together.
+Paths are literal worktree roots, not subdirectories; quote spaces. While no worktree is held, obvious Bash, package, Git, system and writer-subagent mutations remain guarded. Use `run_admin`, not an unrelated lease or a dummy edit, for administration outside held worktrees.
+
+### Non-Git files and folders
+
+| Command | Effect |
+|---|---|
+| `/grant-file ~/.agents/tool/config.json` | Confirm canonical exact-file identities, then allow native edits/writes to those files. |
+| `/grant-folder ~/.agents/notes` | Confirm non-Git folders, then allow native edits/writes beneath them. |
+| `/revoke-grants [paths...]` | Release named or all file/folder grants; keep worktrees. |
+
+For example, grant an existing non-Git configuration file, then revoke it when finished:
+
+```text
+/grant-file ~/.agents/tool/config.json
+/grants
+/revoke-grants ~/.agents/tool/config.json
+```
+
+Grants require interactive TUI confirmation. An exact-file grant also permits one missing leaf beneath an existing canonical parent. Folder grants permit new descendants, never symlink escapes or repository files. Grants authorize native writes only, not Bash; grant-only sessions keep the bounded shell guard. See [scope validation](docs/guard.md#scope-selection) and [folder grants/admin runs](docs/admin-runs.md).
+
+### Inspect without acquiring
+
+- `/leases [roots...]` — held/requested/failed worktrees; supplied roots are inspected only.
+- `/grants [paths...]` — held/requested/failed grants; supplied paths are resolved only.
+- `/lease-holders` — kernel-validated inventory of live local Pi holders, grouped by session.
+
+The `leases:N` / `grants:N` statuses and grant widget expose active scopes. See [diagnostics](docs/guard.md#diagnostics-and-footer).
+
+## Safety and session lifetime
+
+- **Native writes can expand scope without another prompt** in lazy or healthy repository implementation sessions, including linked, nested and sibling repositories. A parent lease does not cover a nested repository. Plan, conflict, lost, unguarded and file-only sessions never auto-expand. Leases prevent cooperating-writer collisions, not wrong-repository targeting.
+- Reads, Beads claims, prose, environment variables, project configuration and arbitrary tools do not acquire leases. Bash/script effects cannot trigger expansion and remain outside native path enforcement.
+- Failed additions retain healthy held scopes; loss of any lease guards the whole session and releases the combined set. Unavailable explicit roots fail closed. Legacy implicit-cwd non-Git/unavailable sessions can instead be visibly **unguarded**; use lazy, plan or explicit valid roots for protection.
+- Release is explicit, never automatic on tracker close, completion or idle; there is no per-root worktree release. The agent's `release_scopes` tool returns to lazy only after committed, verified work; dirty roots need the user's explicit allowance and reason, and busy transitions refuse release. `/plan` also releases grants.
+- `PI_SESSION_GUARD=0` is the explicit, visibly unguarded emergency bypass. Other editors, machines, trusted extensions and typed `!` / `!!` can bypass the guard. Native preflight is not atomic filesystem isolation.
+
+See [dynamic acquisition and contention](docs/guard.md#dynamic-native-write-acquisition), [persistence and compatibility](docs/guard.md#failure-and-persistence) and [explicit limitations](docs/guard.md#explicit-limitations).
+
+### Startup selection
+
+```bash
+pi --lazy
+pi --implement --lease-roots '["repos/api","repos/web"]'
+pi --plan
+```
+
+`--plan` wins; explicit startup flags override saved selection and reapply on reload. Do not combine `--lazy` with `--implement` or `--lease-roots`: that starts guarded plan mode. Otherwise saved selections restore; a lazy session saves acquired roots for reload. See [selection precedence](docs/guard.md#scope-selection).
+
+## Task-specific tools and integrations
+
+These are agent tools or installed helpers, not slash commands. Each keeps its own authorization boundary.
+
+| Operation | Tool or helper | Boundary and details |
+|---|---|---|
+| Administrative script or installer | `run_admin` | Fresh confirmation of one exact command, cwd and declared non-Git folders; effects are not confined. Git mutations, publication and remote sync are refused. [Contract](docs/admin-runs.md#run_admin). |
+| Resume handoff | `save_handoff` | Fixed `~/.agents/handoffs` destination in every guard state; new files auto-save, replacement needs fresh TUI confirmation. Requires the reviewed installed helper and Python 3.10+. [Contract](docs/handoff-save.md). |
+| Exact-commit push | `publish_commit` | Every guard state, no source lease; each push needs its own native `defer` / `push` / `cancel` / `why?` dialog and single-use token. No force, tags or retry. [Contract](docs/publication.md). |
+| Installed Pi Git package update | `activate_pi_package` | Live implement state, an already-installed allowlisted package and fresh TUI confirmation; no publication or reload. [Contract](docs/package-activation.md). |
+| Read-only named review panel | Installed private stdin helper | Guarded use without source leases or general temporary-write authority. [Supported shape](docs/guard.md#read-only-second-opinions). |
+| Release-manager bookkeeping | Installed `release-state` helper | Guarded use without source leases; `update` requires the exact documented shape. [Supported shape](docs/guard.md#release-state-bookkeeping). |
+
+The lease observer never acquires locks and has no third-party runtime dependencies. Consumers import `probeWorktreeLeaseOccupancy` from `@flurdy/pi-session-mode/lease-observer`. Separate Pi installation does not supply another extension's Node dependency: [ai-tools statusline](https://github.com/flurdy/ai-tools/tree/main/pi/statusline) documents explicit wiring. Keep guard and observer on the same revision and reload together.
 
 ## Develop and verify
+
+Use `.nvmrc`'s Node version:
 
 ```bash
 npm ci
 npm run check
+# After committing:
+npm run verify:git-install
 ```
 
-After committing, run `npm run verify:git-install`. It installs the exact local commit through a temporary loopback Git server into an isolated Pi agent directory, verifies commands and real lease lifecycle, and checks the exported observer from a scratch consumer. It also runs the `verify:dynamic` helper against the installed package using a local scripted provider fixture: actual Pi native tools, contention, cancellation, in-turn persistence and reload, with no external model requests. No user installation is modified. Set `PANEL_STDIN_HELPER` to the reviewed agent-skills
-`skills/second-opinion/scripts/review-panel-stdin.py` path to include the cross-repository plan-mode
-check/run/evaluate smoke with a stub reviewer and no external model requests. Without it, that
-coverage is explicitly skipped. Likewise, `RELEASE_STATE_HELPER` set to the reviewed agent-skills
-`skills/release-manager/scripts/release-state` path adds a plan-mode release-state read/update smoke
-against an ignored fixture state file. For a separate current-host smoke, run `node scripts/verify-dynamic.mjs`
-with `PI_VERIFY_HOST_VERSION` matching `pi --version` (npm scripts prefer the development-pinned Pi).
+`check` runs tests, typechecking, the exact package allowlist and documentation-link checks. Git-install verification tests the exact local commit in an isolated agent directory, including real native-write lifecycle checks with a local scripted provider; it makes no external model requests and leaves the user installation unchanged. See [verification options and helper smokes](docs/guard.md#verification-options) for optional cross-repository coverage and current-host checks.
 
-`make verify-apply` verifies a checkout link; `make check` runs tests, typechecking, and the exact package allowlist. History provenance is recorded in [the extraction record](https://github.com/flurdy/pi-session-mode/blob/main/docs/extraction-history.md).
+`make verify-apply` checks a checkout link; `make check` runs the npm checks. See the [extraction record](https://github.com/flurdy/pi-session-mode/blob/main/docs/extraction-history.md) for history provenance.
 
 ## Rollback
 
-Enter `/plan`, remove only the selected package or checkout link, then restart Pi. Do not delete runtime lock files to force takeover. Roll back launcher `--lazy` emission before downgrading this extension. Worktree-only selections keep the safe v1-plan-plus-v2 checkpoint format; lazy selections write v1 plan then v4, which older versions restore as guarded plan. Selections containing file grants write a safe v1 plan checkpoint before their v3 combined record, so v2 readers resume guarded rather than retaining only part of the authority. Removing the extension makes its custom entries inert. Downgrading also removes exact-file and scoped native-write enforcement; do not assume mixed-version sessions provide the same protection.
+1. Enter `/plan`, remove only the selected package or checkout link, then restart Pi.
+2. Before downgrading, roll back launcher `--lazy` emission. Reload **all sessions on the machine together** when upgrading or rolling back: older sessions lack shared file/folder ancestor-intent coordination.
+3. Never delete runtime lock files to force takeover. Older readers reject newer checkpoint formats into guarded plan. Removing the extension makes its entries inert; downgrading or removing it can remove exact-file and scoped native-write enforcement. Do not assume mixed-version sessions provide equivalent protection.
+
+See [checkpoint compatibility](docs/guard.md#failure-and-persistence) and [file/folder coordination gaps](docs/admin-runs.md#leases-and-coordination).
 
 ## License
 
