@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import type { FileLeaseResult, FolderLeaseResult, HeldWorktreeLease, WorktreeLeaseResult } from "./lease.ts";
+import { acquireFolderLease, type FileLeaseResult, type FolderLeaseResult, type HeldWorktreeLease, type WorktreeLeaseResult } from "./lease.ts";
 import type { PackageActivationEvidence, PackageActivationRequest, PreparedPackageActivation } from "./package-activation.ts";
 import { registerSessionMode, type SessionModeDependencies } from "./session-mode.ts";
 
@@ -1407,6 +1407,54 @@ test("run_admin runs one confirmed command in lazy mode without taking worktree 
 		assert.match(dialogs[0]!, /Effects are not confined/);
 		assert.equal(controller.state, "lazy");
 		assert.deepEqual([controller.roots, controller.files, acquisitions], [[], [], []]);
+	} finally { await cleanup(); }
+});
+
+test("run_admin discloses nested data and takes real folder leases without granting source writes", async () => {
+	const { base, target, cleanup } = await adminFixture();
+	try {
+		await mkdir(join(target, "copy", ".git"), { recursive: true });
+		const runtimeDir = join(base, "runtime");
+		const { pi, controller, acquisitions } = harness([], {
+			acquireFolder: (dir, options) => acquireFolderLease(dir, { ...options, runtimeDir }),
+		});
+		const ctx = realContext([]);
+		await pi.emit("session_start", ctx);
+		let dialog = "";
+		ctx.ui.confirm = async (_title: string, message: string) => { dialog = message; return true; };
+		const marker = join(target, "marker");
+		const request = { purpose: "Admin backup data", cwd: base, writes: [target], script: `printf done > '${marker}'` };
+		assert.equal((await adminTool(pi, ctx, request)).details.status, "ok");
+		assert.match(dialog, /Nested Git repositories/);
+		assert.ok(dialog.includes(join(target, "copy")));
+		assert.equal(await readFile(marker, "utf8"), "done");
+		assert.deepEqual([controller.roots, controller.files, controller.folders, acquisitions], [[], [], [], []]);
+		assert.equal(controller.state, "lazy");
+		const granted = harness([]);
+		await granted.pi.emit("session_start", ctx);
+		await granted.pi.commands.get("grant-folder")!.handler(JSON.stringify(target), ctx);
+		assert.deepEqual(granted.controller.folders, []);
+		assert.match(ctx.notifications.at(-1)?.message ?? "", /Git repository/);
+		const lease = await acquireFolderLease(target, { runtimeDir, resolveFolder: async (dir) => dir });
+		assert.equal(lease.kind, "held", "temporary admin lease was released");
+		if (lease.kind === "held") await lease.release();
+	} finally { await cleanup(); }
+});
+
+test("run_admin does not execute when nested data changes during confirmation", async () => {
+	const { base, target, cleanup } = await adminFixture();
+	try {
+		const { pi, controller } = harness([], {
+			acquireFolder: (dir, options) => acquireFolderLease(dir, { ...options, runtimeDir: join(base, "runtime") }),
+		});
+		const ctx = realContext([]);
+		await pi.emit("session_start", ctx);
+		ctx.ui.confirm = async () => { await mkdir(join(target, "new", ".git"), { recursive: true }); return true; };
+		const result = await adminTool(pi, ctx, { purpose: "Stale inventory", cwd: base, writes: [target], script: `touch '${join(target, "must-not-exist")}'` });
+		assert.equal(result.details.status, "stale");
+		assert.match(result.details.reason, /inventory changed/);
+		await assert.rejects(stat(join(target, "must-not-exist")));
+		assert.equal(controller.state, "lazy");
 	} finally { await cleanup(); }
 });
 

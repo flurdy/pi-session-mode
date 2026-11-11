@@ -95,7 +95,7 @@ These are agent tools or installed helpers, not slash commands. Each keeps its o
 
 | Operation | Tool or helper | Boundary and details |
 |---|---|---|
-| Administrative script or installer | `run_admin` | Fresh confirmation of one exact command, cwd and declared non-Git folders; effects are not confined. Git mutations, publication and remote sync are refused. [Contract](docs/admin-runs.md#run_admin). |
+| Administrative script or installer | `run_admin` | Fresh confirmation of one exact command, cwd and declared non-Git folders; effects are not confined. Repositories nested inside declared folders (backups, copies) are disclosed, not vetoed. Git mutations, publication and remote sync are refused. [Contract](docs/admin-runs.md#run_admin). |
 | Resume handoff | `save_handoff` | Fixed `~/.agents/handoffs` destination in every guard state; new files auto-save, replacement needs fresh TUI confirmation. Requires the reviewed installed helper and Python 3.10+. [Contract](docs/handoff-save.md). |
 | Exact-commit push | `publish_commit` | Every guard state, no source lease; each push needs its own native `defer` / `push` / `cancel` / `why?` dialog and single-use token. No force, tags or retry. [Contract](docs/publication.md). |
 | Installed Pi Git package update | `activate_pi_package` | Live implement state, an already-installed allowlisted package and fresh TUI confirmation; no publication or reload. [Contract](docs/package-activation.md). |

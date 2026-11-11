@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, readFile, realpath, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { resolveGrantFile, resolveGrantFolder } from "./file-scope.ts";
+import { resolveAdminFolder, resolveGrantFile, resolveGrantFolder } from "./file-scope.ts";
 import { canonicalHome, isWithin, worktreeLeaseRuntimeDir } from "./path.ts";
 
 export { worktreeLeaseRuntimeDir } from "./path.ts";
@@ -128,6 +128,8 @@ export interface AcquireFolderLeaseOptions extends IntentLeaseOptions {
 	readyTimeoutMs?: number;
 	writeMetadata?(path: string, contents: string): Promise<void>;
 	resolveFolder?(dir: string, signal?: AbortSignal): Promise<string>;
+	/** Declared admin run folders inventory nested repositories instead of refusing them. */
+	nestedGit?: "reject" | "inventory";
 }
 
 function defaultExec(command: string, args: string[], options: LeaseExecOptions): Promise<LeaseCommandResult> {
@@ -432,7 +434,11 @@ export async function acquireFolderLease(dir: string, options: AcquireFolderLeas
 	const runtimeDir = options.runtimeDir ?? worktreeLeaseRuntimeDir();
 	let resolved: string;
 	try {
-		resolved = await (options.resolveFolder ?? ((path, signal) => resolveGrantFolder(pathToFileURL(path).href, "/", { runtimeDir, ...(signal ? { signal } : {}), ...(options.home ? { home: options.home } : {}) })))(dir, options.signal);
+		const resolveDefault = async (path: string, signal?: AbortSignal) => {
+			const scope = { runtimeDir, ...(signal ? { signal } : {}), ...(options.home ? { home: options.home } : {}) };
+			return options.nestedGit === "inventory" ? (await resolveAdminFolder(pathToFileURL(path).href, "/", scope)).path : resolveGrantFolder(pathToFileURL(path).href, "/", scope);
+		};
+		resolved = await (options.resolveFolder ?? resolveDefault)(dir, options.signal);
 	} catch (error) {
 		return { kind: "unavailable", reason: "invalid", detail: error instanceof Error ? error.message : String(error) };
 	}

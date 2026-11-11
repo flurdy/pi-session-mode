@@ -4,7 +4,7 @@ import { realpath } from "node:fs/promises";
 import { setTimeout as sleep } from "node:timers/promises";
 import { basename, dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { acquireFileLease, acquireFolderLease, acquireWorktreeLease, IntentPool, type FileLeaseResult, type FolderLeaseResult, type HeldFolderLease, type WorktreeLeaseResult } from "./lease.ts";
+import { acquireFileLease, acquireFolderLease, acquireWorktreeLease, IntentPool, type FileLeaseResult, type FolderLeaseResult, type HeldFolderLease, type WorktreeLeaseResult, type AcquireFolderLeaseOptions } from "./lease.ts";
 import { adminRunDialog, adminRunReceiptBase, executeAdminRun, prepareAdminRun, recheckAdminRun, type AdminRunReceipt, type PreparedAdminRun } from "./admin-run.ts";
 import { isWithin, normalizeToolPath } from "./path.ts";
 import { OperationReservation } from "./reservation.ts";
@@ -31,7 +31,7 @@ export interface PackageActivationAdapter {
 export interface SessionModeDependencies {
 	acquireLease(cwd: string, options: { sessionId: string; signal?: AbortSignal; expectedRoot?: string }): Promise<WorktreeLeaseResult>;
 	acquireFile?(file: string, options: { sessionId: string; signal?: AbortSignal; expectedFile?: string }): Promise<FileLeaseResult>;
-	acquireFolder?(dir: string, options: { sessionId: string; signal?: AbortSignal; expectedDir?: string; intentPool?: IntentPool }): Promise<FolderLeaseResult>;
+	acquireFolder?(dir: string, options: AcquireFolderLeaseOptions): Promise<FolderLeaseResult>;
 	resolveFiles?(paths: string[], cwd: string, signal?: AbortSignal): Promise<string[]>;
 	resolveFolders?(paths: string[], cwd: string, signal?: AbortSignal): Promise<string[]>;
 	isDisabled(): boolean;
@@ -750,6 +750,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		promptGuidelines: [
 			"Use run_admin for administrative or installation work whose effects fall outside held worktrees, such as migrating or linking files under ~/.agents. Never hand terminal commands back to the user, request an unrelated lease or make a dummy edit instead.",
 			"Prefer a short inspectable bash script, and declare every non-Git folder it changes in writes. For repository recipes use argv with cwd set to the clean recipe directory, never make -C.",
+			"Declared run_admin folders may contain copied repositories (backups): they are disclosed in the dialog and refused only while another live session holds one. Declare the real folders; never omit a folder or restructure data to avoid the check.",
 			"The native dialog is the user's approval of exactly that command once. Never retry a refused, stale, failed or interrupted run automatically; report it.",
 			"run_admin refuses Git mutations, publication and remote synchronization: use /implement, publish_commit or the dedicated workflow instead.",
 		],
@@ -799,7 +800,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 				const pool = new IntentPool();
 				for (const { path } of prepared.writes) {
 					if (leases.folders.some((folder) => isWithin(path, folder))) continue;
-					const lease = await (dependencies.acquireFolder ?? acquireFolderLease)(path, { sessionId, signal: combined, expectedDir: path, intentPool: pool });
+					const lease = await (dependencies.acquireFolder ?? acquireFolderLease)(path, { sessionId, signal: combined, expectedDir: path, intentPool: pool, nestedGit: "inventory" });
 					if (lease.kind === "held") {
 						held.push(lease);
 						void lease.lost.then(() => abort.abort(`lease lost for ${JSON.stringify(path)}`));

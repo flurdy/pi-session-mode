@@ -3,7 +3,8 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { access, lstat, realpath, stat } from "node:fs/promises";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
-import { MAX_FOLDER_GRANTS, resolveExplicitFolders } from "./file-scope.ts";
+import { MAX_FOLDER_GRANTS, resolveAdminFolders, type AdminFolder, type NestedRepository } from "./file-scope.ts";
+import { probeCanonicalWorktreeLeaseOccupancies, type WorktreeLeaseOccupancy } from "./lease-observer.ts";
 import { isWithin } from "./path.ts";
 import { adminRunRefusal, destructiveCommandLines, invokedCommand } from "./policy.ts";
 import { safeDisplay } from "./scope.ts";
@@ -42,7 +43,7 @@ export interface PreparedAdminRun {
 	command: AdminCommand;
 	cwd: string;
 	repository?: RepositoryBinding;
-	writes: { path: string; exists: boolean }[];
+	writes: (AdminFolder & { exists: boolean })[];
 	destructive: string[];
 	timeoutMs: number;
 }
@@ -68,7 +69,8 @@ export interface AdminRunReceipt {
 
 export interface AdminRunDependencies {
 	env?: NodeJS.ProcessEnv;
-	resolveFolders?(paths: string[], cwd: string, signal?: AbortSignal): Promise<string[]>;
+	resolveFolders?(paths: string[], cwd: string, signal?: AbortSignal): Promise<AdminFolder[]>;
+	probeOccupancies?(roots: readonly string[], signal?: AbortSignal): Promise<WorktreeLeaseOccupancy[]>;
 }
 
 function refuse(message: string): never { throw new Error(message); }
@@ -142,7 +144,24 @@ function shellQuote(word: string): string {
 }
 
 const resolveFolders = (dependencies: AdminRunDependencies) => dependencies.resolveFolders
-	?? ((paths: string[], cwd: string, signal?: AbortSignal) => resolveExplicitFolders(paths, cwd, signal ? { signal } : {}));
+	?? ((paths: string[], cwd: string, signal?: AbortSignal) => resolveAdminFolders(paths, cwd, signal ? { signal } : {}));
+
+async function checkNestedOccupancy(folders: readonly AdminFolder[], dependencies: AdminRunDependencies, signal?: AbortSignal): Promise<void> {
+	const roots = [...new Set(folders.flatMap((folder) => folder.nestedRepositories.map((repo) => repo.root)))];
+	if (!roots.length) return;
+	const observations = await (dependencies.probeOccupancies ?? ((paths, abort) => probeCanonicalWorktreeLeaseOccupancies(paths, abort ? { signal: abort } : {})))(roots, signal);
+	for (const [index, root] of roots.entries()) {
+		const observation = observations[index];
+		if (!observation || observation.kind === "unavailable") refuse(`Cannot verify nested repository lease for ${JSON.stringify(root)}: ${observation?.reason ?? "missing observation"}`);
+		if (observation.kind === "held") refuse(`Nested repository ${JSON.stringify(root)} is held by another live session; nothing ran`);
+	}
+}
+
+function nestedRepositories(folders: readonly AdminFolder[]): NestedRepository[] {
+	const repositories = new Map<string, NestedRepository>();
+	for (const folder of folders) for (const repo of folder.nestedRepositories) repositories.set(repo.root, repo);
+	return [...repositories.values()].sort((a, b) => a.root.localeCompare(b.root));
+}
 
 /** Validates and binds one run before confirmation. Throws a refusal message; nothing is executed. */
 export async function prepareAdminRun(request: AdminRunRequest, dependencies: AdminRunDependencies = {}, signal?: AbortSignal): Promise<PreparedAdminRun> {
@@ -175,8 +194,9 @@ export async function prepareAdminRun(request: AdminRunRequest, dependencies: Ad
 	if (refusal) refuse(refusal);
 	if (!Array.isArray(request.writes) || request.writes.length === 0 || request.writes.length > MAX_FOLDER_GRANTS) refuse(`Declare 1–${MAX_FOLDER_GRANTS} non-Git folders the run is expected to change`);
 	const resolved = await resolveFolders(dependencies)(request.writes, cwd, signal);
-	const outermost = resolved.filter((path) => !resolved.some((other) => other !== path && isWithin(path, other)));
-	const writes = await Promise.all(outermost.map(async (path) => ({ path, exists: await lstat(path).then(() => true, () => false) })));
+	const outermost = resolved.filter(({ path }) => !resolved.some((other) => other.path !== path && isWithin(path, other.path)));
+	await checkNestedOccupancy(outermost, dependencies, signal);
+	const writes = await Promise.all(outermost.map(async (folder) => ({ ...folder, exists: await lstat(folder.path).then(() => true, () => false) })));
 	const timeoutSeconds = request.timeoutSeconds ?? ADMIN_DEFAULT_TIMEOUT_SECONDS;
 	if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > ADMIN_MAX_TIMEOUT_SECONDS) refuse(`timeoutSeconds must be an integer from 1 to ${ADMIN_MAX_TIMEOUT_SECONDS}`);
 	const repository = await bindRepository(cwd, signal);
@@ -196,6 +216,12 @@ export function adminRunDialog(prepared: PreparedAdminRun): string {
 		? `Repository: ${show(prepared.repository.root)} at ${prepared.repository.head}, clean. Ignored files, PATH tools and user configuration remain trusted inputs.`
 		: "Repository: none");
 	lines.push("Declared folders (leased for coordination, not confinement):", ...prepared.writes.map((write) => `  ${show(write.path)} (${write.exists ? "exists" : "missing"})`));
+	const nested = nestedRepositories(prepared.writes);
+	if (nested.length) {
+		lines.push(`Nested Git repositories (${nested.length}; treated as data, not native-write grants):`, ...nested.slice(0, 20).map((repo) => `  ${show(repo.root)} (.git ${repo.marker})`));
+		if (nested.length > 20) lines.push(`  … ${nested.length - 20} more; all included in the pre-launch lease check.`);
+		lines.push("No nested worktree leases are taken. Git mutations remain refused. Occupancy is observed, not reserved; another writer can start after the check.");
+	}
 	if (prepared.destructive.length) lines.push("Flagged destructive commands:", ...prepared.destructive.map((line) => `  ${safeDisplay(line)}`));
 	lines.push(`Timeout: ${prepared.timeoutMs / 1000}s. Stdin is closed; nothing is retried.`, "", "Effects are not confined to these folders. Approving runs exactly this command once.");
 	if (command.kind === "script") lines.push("", "--- script ---", displayLines(command.script));
@@ -217,7 +243,10 @@ export async function recheckAdminRun(prepared: PreparedAdminRun, dependencies: 
 	try {
 		if (await realpath(prepared.cwd) !== prepared.cwd) return "The working directory changed after confirmation";
 		const declared = prepared.writes.map((write) => write.path);
-		if (JSON.stringify(await resolveFolders(dependencies)(declared, prepared.cwd, signal)) !== JSON.stringify([...declared].sort())) return "A declared folder changed identity after confirmation";
+		const folders = await resolveFolders(dependencies)(declared, prepared.cwd, signal);
+		if (JSON.stringify(folders.map((folder) => folder.path)) !== JSON.stringify(declared)) return "A declared folder changed identity after confirmation";
+		if (JSON.stringify(nestedRepositories(folders)) !== JSON.stringify(nestedRepositories(prepared.writes))) return "Nested Git repository inventory changed after confirmation";
+		await checkNestedOccupancy(folders, dependencies, signal);
 		for (const write of prepared.writes) {
 			if (await lstat(write.path).then(() => true, () => false) !== write.exists) return `Declared folder ${JSON.stringify(write.path)} appeared or disappeared after confirmation`;
 		}

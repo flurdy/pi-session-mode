@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { acquireWorktreeLease, lockIdentity } from "./lease.ts";
-import { probeWorktreeLeaseOccupancy, probeWorktreeLeaseOccupancies, type ProbeWorktreeLeaseOccupancyOptions } from "./lease-observer.ts";
+import { probeCanonicalWorktreeLeaseOccupancies, probeWorktreeLeaseOccupancy, probeWorktreeLeaseOccupancies, type ProbeWorktreeLeaseOccupancyOptions } from "./lease-observer.ts";
 
 async function gitRepo(): Promise<{ repo: string; runtimeDir: string; cleanup: () => Promise<void> }> {
 	const root = await mkdtemp(join(tmpdir(), "pi-lease-observer-"));
@@ -50,6 +50,43 @@ test("multiple explicit roots share one kernel scan and preserve partial lookup 
 		assert.deepEqual(result.slice(0, 2), [{ kind: "free", root: fixture.repo }, { kind: "free", root: second }]);
 		assert.equal(result[2]?.kind, "unavailable");
 		assert.equal(await readFile(calls, "utf8"), "scan\n");
+	} finally { await fixture.cleanup(); }
+});
+
+test("admin inventory observes more than 32 roots with dangling gitfiles through one lock scan and no Git", async () => {
+	const fixture = await gitRepo();
+	try {
+		await mkdir(fixture.runtimeDir);
+		const roots: string[] = [];
+		for (let i = 0; i < 40; i++) {
+			const root = join(fixture.repo, `copy-${i}`);
+			await mkdir(root);
+			await writeFile(join(root, ".git"), "gitdir: /missing/metadata\n");
+			await writeFile(join(fixture.runtimeDir, `${lockIdentity(root)}.lock`), "");
+			roots.push(root);
+		}
+		const calls = join(fixture.runtimeDir, "calls"), command = join(fixture.runtimeDir, "scan");
+		await writeFile(command, `#!${process.execPath}\nrequire("node:fs").appendFileSync(${JSON.stringify(calls)},"scan\\n"); console.log('{"locks":[]}');\n`, { mode: 0o700 });
+		const observations = await probeCanonicalWorktreeLeaseOccupancies(roots, { runtimeDir: fixture.runtimeDir, gitCommand: "/missing/git", lslocksCommand: command });
+		assert.deepEqual(observations, roots.map((root) => ({ kind: "free", root })));
+		assert.equal(await readFile(calls, "utf8"), "scan\n");
+		await assert.rejects(probeWorktreeLeaseOccupancies(roots), /At most 32/);
+	} finally { await fixture.cleanup(); }
+});
+
+test("canonical admin probes retain real holder detection and self exclusion", async () => {
+	const fixture = await gitRepo();
+	const options = { runtimeDir: fixture.runtimeDir, timeoutMs: 10_000 };
+	try {
+		const lease = await acquireWorktreeLease(fixture.repo, options);
+		assert.equal(lease.kind, "held");
+		try {
+			assert.deepEqual(await probeCanonicalWorktreeLeaseOccupancies([fixture.repo], options), [{ kind: "free", root: fixture.repo }]);
+			assert.deepEqual(await probeCanonicalWorktreeLeaseOccupancies([fixture.repo], { ...options, selfPid: -1 }), [{ kind: "held", root: fixture.repo }]);
+			const alias = join(fixture.repo, "..", "alias");
+			await symlink(fixture.repo, alias);
+			assert.equal((await probeCanonicalWorktreeLeaseOccupancies([alias], options))[0]?.kind, "unavailable");
+		} finally { if (lease.kind === "held") await lease.release(); }
 	} finally { await fixture.cleanup(); }
 });
 

@@ -4,7 +4,7 @@ import { link, mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import { MAX_FOLDER_GRANTS, resolveExplicitFolders, resolveFolderWrite, resolveGrantFolder } from "./file-scope.ts";
+import { MAX_FOLDER_GRANTS, resolveAdminFolder, resolveAdminFolders, resolveExplicitFolders, resolveFolderWrite, resolveGrantFolder } from "./file-scope.ts";
 
 async function fixture() {
 	const base = await realpath(await mkdtemp(join(tmpdir(), "pi-folder-scope-")));
@@ -57,6 +57,46 @@ test("folder scopes reject Git ownership above, at and below the folder", async 
 		const bare = join(root, "bare");
 		await mkdir(join(bare, "objects"), { recursive: true });
 		await assert.rejects(resolveGrantFolder(bare, root, { runtimeDir }), /Git/);
+	} finally { await cleanup(); }
+});
+
+test("admin inventory includes Git directories, gitfiles and marker symlinks without scanning Git internals", async () => {
+	const { root, runtimeDir, cleanup } = await fixture();
+	try {
+		const store = join(root, "store");
+		await mkdir(join(store, "tree", ".git", "objects"), { recursive: true });
+		for (let i = 0; i < 20; i++) await writeFile(join(store, "tree", ".git", "objects", `${i}`), "x");
+		await mkdir(join(store, "tree", "linked"));
+		await writeFile(join(store, "tree", "linked", ".git"), "gitdir: /missing/metadata\n");
+		await mkdir(join(store, "symbolic"));
+		await symlink(join(store, "tree", ".git"), join(store, "symbolic", ".git"));
+		await symlink(join(store, "tree"), join(store, "alias"));
+		const scope = await resolveAdminFolder(store, root, { runtimeDir, maxEntries: 12 });
+		assert.deepEqual(scope, { path: store, nestedRepositories: [
+			{ root: join(store, "symbolic"), marker: "symlink" },
+			{ root: join(store, "tree"), marker: "directory" },
+			{ root: join(store, "tree", "linked"), marker: "gitfile" },
+		] });
+		assert.deepEqual(await resolveAdminFolders([store, store], root, { runtimeDir }), [scope]);
+		await assert.rejects(resolveGrantFolder(store, root, { runtimeDir }), /Git repository.*run_admin/);
+		await assert.rejects(resolveAdminFolder(store, root, { runtimeDir, maxEntries: 2 }), /narrower/);
+		const controller = new AbortController(); controller.abort();
+		await assert.rejects(resolveAdminFolder(store, root, { runtimeDir, signal: controller.signal }), /abort/i);
+	} finally { await cleanup(); }
+});
+
+test("admin inventory retains direct Git, missing-parent, broad-scope and runtime refusals", async () => {
+	const { base, root, runtimeDir, cleanup } = await fixture();
+	try {
+		const repo = join(root, "repo");
+		await mkdir(join(repo, ".git"), { recursive: true });
+		for (const path of [repo, join(repo, "missing"), join(repo, ".git"), "/", runtimeDir, base, join(root, "missing", "leaf")]) {
+			await assert.rejects(resolveAdminFolder(path, root, { runtimeDir }), Error, path);
+		}
+		const bare = join(root, "bare");
+		await mkdir(join(bare, "objects"), { recursive: true });
+		await assert.rejects(resolveAdminFolder(bare, root, { runtimeDir }), /Git administration/);
+		assert.deepEqual(await resolveAdminFolder(join(root, "fresh"), root, { runtimeDir }), { path: join(root, "fresh"), nestedRepositories: [] });
 	} finally { await cleanup(); }
 });
 

@@ -7,6 +7,8 @@ import { join } from "node:path";
 import test from "node:test";
 import { adminRunDialog, executeAdminRun, prepareAdminRun, recheckAdminRun, type AdminRunRequest } from "./admin-run.ts";
 import { adminRunRefusal, destructiveCommandLines } from "./policy.ts";
+import { acquireWorktreeLease } from "./lease.ts";
+import { probeCanonicalWorktreeLeaseOccupancies } from "./lease-observer.ts";
 
 async function fixture() {
 	const base = await realpath(await mkdtemp(join(tmpdir(), "pi-admin-run-")));
@@ -55,8 +57,8 @@ test("prepare binds canonical writes, script digest and a clean repository; rech
 		assert.equal(prepared.command.kind, "script");
 		if (prepared.command.kind === "script") assert.equal(prepared.command.sha256, createHash("sha256").update(script).digest("hex"));
 		assert.deepEqual(prepared.writes, [
-			{ path: join(home, ".agents", "handoffs"), exists: false },
-			{ path: join(home, ".claude", "handoffs"), exists: true },
+			{ path: join(home, ".agents", "handoffs"), nestedRepositories: [], exists: false },
+			{ path: join(home, ".claude", "handoffs"), nestedRepositories: [], exists: true },
 		], "nested declarations collapse to the outermost folder");
 		assert.equal(prepared.repository?.root, repo);
 		assert.equal(prepared.repository?.head, execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim());
@@ -106,6 +108,109 @@ test("prepare refuses unsupported shapes before any dialog", async () => {
 		}
 		await writeFile(join(repo, "dirty.txt"), "x\n");
 		await assert.rejects(prepareAdminRun({ purpose: "Dirty", cwd: repo, writes, argv: ["true"] }), /clean/);
+	} finally { await cleanup(); }
+});
+
+test("backup continuation accepts copied Git directories and gitfiles as disclosed data", async () => {
+	const { base, repo, cleanup } = await fixture();
+	try {
+		const backup = join(base, "backup");
+		await mkdir(backup);
+		const first = await prepareAdminRun({ purpose: "First backup", cwd: base, writes: [backup], argv: ["cp", "-a", repo, join(backup, "tree")] });
+		assert.equal((await executeAdminRun(first)).status, "ok");
+		await mkdir(join(backup, "linked"));
+		await writeFile(join(backup, "linked", ".git"), "gitdir: /missing/backup-metadata\n");
+		const next = await prepareAdminRun({ purpose: "Continue backup", cwd: base, writes: [backup], script: `printf continued > '${join(backup, "continued")}'` });
+		const dialog = adminRunDialog(next);
+		assert.match(dialog, /Nested Git repositories/);
+		assert.ok(dialog.includes(join(backup, "tree")));
+		assert.ok(dialog.includes(join(backup, "linked")));
+		assert.equal(await recheckAdminRun(next), undefined);
+		assert.equal((await executeAdminRun(next)).status, "ok");
+		assert.equal(await readFile(join(backup, "continued"), "utf8"), "continued");
+	} finally { await cleanup(); }
+});
+
+test("content relocation into a parent containing an unrelated Git backup preserves checksums", async () => {
+	const { base, cleanup } = await fixture();
+	try {
+		const source = join(base, "content"), parent = join(base, "destination"), target = join(parent, "content");
+		await mkdir(source);
+		await mkdir(join(parent, "unrelated", ".git"), { recursive: true });
+		const content = "harmless archived data\n";
+		const digest = createHash("sha256").update(content).digest("hex");
+		await writeFile(join(source, "archive.tar"), content);
+		await writeFile(join(source, "SHA256SUMS"), `${digest}  archive.tar\n`);
+		const script = `set -eu\n(cd '${source}' && sha256sum -c SHA256SUMS)\ntest ! -e '${target}'\nmv -n -T '${source}' '${target}'\ntest ! -e '${source}'\n(cd '${target}' && sha256sum -c SHA256SUMS)`;
+		const prepared = await prepareAdminRun({ purpose: "Relocate content", cwd: base, writes: [source, parent], script });
+		assert.equal(await recheckAdminRun(prepared), undefined);
+		const receipt = await executeAdminRun(prepared);
+		assert.equal(receipt.status, "ok", JSON.stringify(receipt));
+		assert.equal((receipt.output?.match(/archive.tar: OK/g) ?? []).length, 2);
+		assert.equal(createHash("sha256").update(await readFile(join(target, "archive.tar"))).digest("hex"), digest);
+		await assert.rejects(stat(source));
+		await assert.rejects(prepareAdminRun({ purpose: "No Git mutation", cwd: base, writes: [parent], script: `git -C '${join(parent, "unrelated")}' commit -m forbidden` }), /Git/);
+	} finally { await cleanup(); }
+});
+
+test("nested worktree occupancy refuses foreign holders, allows self, and is rechecked before launch", async () => {
+	const { base, repo, cleanup } = await fixture();
+	const runtimeDir = join(base, "runtime");
+	const request = { purpose: "Inspect backup data", cwd: tmpdir(), writes: [base], script: "true" };
+	const options = { runtimeDir, timeoutMs: 10_000 };
+	const dependencies = { probeOccupancies: (roots: readonly string[], signal?: AbortSignal) => probeCanonicalWorktreeLeaseOccupancies(roots, { ...options, selfPid: -1, signal }) };
+	try {
+		const prepared = await prepareAdminRun(request, dependencies);
+		const lease = await acquireWorktreeLease(repo, options);
+		assert.equal(lease.kind, "held");
+		try {
+			await assert.rejects(prepareAdminRun(request, dependencies), /Nested repository.*held by another live session/);
+			assert.match(await recheckAdminRun(prepared, dependencies) ?? "", /held by another live session/);
+			const own = await prepareAdminRun(request, { probeOccupancies: (roots, signal) => probeCanonicalWorktreeLeaseOccupancies(roots, { ...options, signal }) });
+			assert.equal(own.writes[0]?.nestedRepositories[0]?.root, repo);
+		} finally { if (lease.kind === "held") await lease.release(); }
+		await assert.rejects(prepareAdminRun(request, {
+			probeOccupancies: (roots, signal) => probeCanonicalWorktreeLeaseOccupancies(roots, { ...options, signal, lslocksCommand: "/missing/lslocks" }),
+		}), /Cannot verify nested repository lease/);
+	} finally { await cleanup(); }
+});
+
+test("a changed nested inventory, marker kind or folder identity makes confirmation stale", async () => {
+	const { base, cleanup } = await fixture();
+	try {
+		const backup = join(base, "backup"), nested = join(backup, "copy");
+		await mkdir(backup);
+		const request = { purpose: "Recheck backup", cwd: base, writes: [backup], script: "true" };
+		const empty = await prepareAdminRun(request);
+		await mkdir(join(nested, ".git"), { recursive: true });
+		assert.match(await recheckAdminRun(empty) ?? "", /inventory changed/);
+		const directory = await prepareAdminRun(request);
+		await rm(join(nested, ".git"), { recursive: true });
+		await writeFile(join(nested, ".git"), "gitdir: /absent/metadata\n");
+		assert.match(await recheckAdminRun(directory) ?? "", /inventory changed/);
+		const file = await prepareAdminRun(request);
+		await rm(join(nested, ".git"));
+		assert.match(await recheckAdminRun(file) ?? "", /inventory changed/);
+	} finally { await cleanup(); }
+});
+
+test("large nested inventories disclose a capped list and check every root", async () => {
+	const { base, cleanup } = await fixture();
+	try {
+		const backup = join(base, "backup");
+		await mkdir(backup);
+		for (let i = 0; i < 35; i++) {
+			await mkdir(join(backup, `tree-${i}`));
+			await writeFile(join(backup, `tree-${i}`, ".git"), "gitdir: /absent\n");
+		}
+		let checked = 0;
+		const prepared = await prepareAdminRun({ purpose: "Many copied repositories", cwd: base, writes: [backup], script: "true" }, {
+			probeOccupancies: async (roots) => { checked = roots.length; return roots.map((root) => ({ kind: "free" as const, root })); },
+		});
+		assert.equal(checked, 35);
+		assert.equal(prepared.writes[0]?.nestedRepositories.length, 35);
+		assert.match(adminRunDialog(prepared), /Nested Git repositories \(35/);
+		assert.match(adminRunDialog(prepared), /15 more; all included/);
 	} finally { await cleanup(); }
 });
 

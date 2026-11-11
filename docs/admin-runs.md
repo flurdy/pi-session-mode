@@ -13,10 +13,16 @@ Both capabilities take folder scopes. A scope is an existing canonical directory
 
 - `/`, the user's home directory and any of its ancestors;
 - the private lease runtime directory, or any folder containing or inside it;
-- anything inside a Git worktree or Git administration, and folders named `.git`;
-- folders containing a `.git` entry, found by a scan that does not follow symlinks. Folders with more than 20,000 entries are refused as too large to verify; grant a narrower folder.
+- anything inside a Git worktree or Git administration, and folders named `.git`.
 
-At most 16 folders are granted at once.
+The two capabilities treat repositories *inside* a folder differently. The scan never follows symlinks and never descends into a `.git` entry.
+
+| Capability | Nested `.git` entries (directories, gitfiles, symlinks) | Scan bound |
+|---|---|---|
+| `/grant-folder` | Refused: native writes must never reach repository files. The refusal names the first nested root and points to `run_admin`. | 20,000 entries |
+| `run_admin` declared folders | Inventoried as data: each nested root is listed in the confirmation, and the run is refused if another live Pi session holds a worktree lease on any of them. No worktree lease is taken on them. | 200,000 entries |
+
+Over the bound, both refuse as too large to verify; declare a narrower folder. At most 16 folders are granted or declared at once.
 
 ## `/grant-folder`
 
@@ -54,14 +60,15 @@ It is available in lazy, grant-only and implement sessions. It is refused in pla
 - A repository-backed `cwd` must be clean: committed `HEAD`, no tracked changes and no untracked non-ignored files. Run repository recipes through `argv` with `cwd` set to the recipe directory; `make -C`, `--directory`, `-f` and `--file` are refused, including after `env`, `command` or `exec` prefixes, so the bound recipe is the one that runs.
 - Recognizable Git mutations, `gh`, publication (`make` push targets), workspace and Beads/Dolt remote synchronization, and privilege escalation (`sudo` and similar) are refused. Repository changes need `/implement`, publication uses `publish_commit`, and synchronization keeps its own confirmation. Commands are recognized by their words, including quoted subcommands and commands after shell keywords such as `then` or `do`. This is still bounded pattern recognition: effects hidden in scripts or recipes are not comprehensively detected.
 - A declared folder that contains one of the session's exact-file or folder grants is refused; revoke the grant first. A declared folder inside a held folder grant reuses that grant.
+- Nested repositories inside declared folders (for example copied backups) are inventoried, not vetoed. Each root's worktree lock is observed through one `lslocks` scan: a root held by another live session refuses the run, and an unavailable observation (missing `lslocks`, timeout, malformed output) refuses it too, because missing evidence is never proof of freedom. The session's own holders do not block. Git mutations against those repositories stay refused by the command policy; copying, archiving or renaming the data is what this permits.
 
 ### Dialog
 
-The 60-second native confirmation shows the purpose, the full script and its SHA-256 (or the resolved executable and arguments), the working directory and its repository binding, each declared folder (existing or missing), flagged lines that delete, overwrite or recursively change permissions, and the deadline. It states that effects are not confined to the declared folders. Approval authorizes exactly that command once; there is no session-wide allowance. Declining or letting the dialog time out runs nothing and takes no lease.
+The 60-second native confirmation shows the purpose, the full script and its SHA-256 (or the resolved executable and arguments), the working directory and its repository binding, each declared folder (existing or missing), the nested repositories found inside them (up to 20 listed with their marker kind, plus a count of the rest), flagged lines that delete, overwrite or recursively change permissions, and the deadline. It states that effects are not confined to the declared folders. Approval authorizes exactly that command once; there is no session-wide allowance. Declining or letting the dialog time out runs nothing and takes no lease.
 
 ### Launch and execution
 
-After approval the tool rechecks the session and takes transient `dir-` leases on the declared folders. It then rebinds every displayed fact: canonical cwd, declared folder identities and whether each exists, repository `HEAD` and cleanliness, and the executable. Contention or any change refuses or returns `stale`; nothing runs and nothing is retried.
+After approval the tool rechecks the session and takes transient `dir-` leases on the declared folders. It then rebinds every displayed fact: canonical cwd, declared folder identities and whether each exists, the nested repository inventory and its occupancy, repository `HEAD` and cleanliness, and the executable. Contention or any change refuses or returns `stale`; nothing runs and nothing is retried.
 
 The command runs in its own process group with stdin closed and `GIT_TERMINAL_PROMPT=0`. Cancellation, the deadline, loss of any declared lease, loss of the session's scopes, reload and shutdown send `SIGTERM` to the group, then `SIGKILL` after two seconds. Group members left after the main process exits are killed and reported as `lingering`; start long-lived services through their own managers. The receipt waits (bounded) until no group member remains and reports any survivor. Leases, including a reused folder grant after a scope loss, are released only after the process group has ended.
 
@@ -84,9 +91,10 @@ Receipts include the exit code, signal, duration and the last 16 KiB of combined
 
 Folder grants and declared run folders use a `dir-<sha256>` lock namespace. A folder takes an exclusive lock on itself and shared intent locks on each grantable ancestor (root, home and home ancestors are skipped). Exact-file grants take the same ancestor intents, so a folder lease contends with every grant inside it, and with any grant on an ancestor folder, across sessions, without enumerating descendants. Within a session, intents are shared and reference-counted. Losing any holder loses the whole grant and revokes the session's authority at once. Surviving holders stay locked until any interrupted admin run has ended, and only then are they released.
 
-Worktree leases and the public observer are unchanged. Two coordination gaps remain:
+Worktree leases and the public observer are unchanged. Three coordination gaps remain:
 
 - A repository created inside a granted folder after the grant is not detected across sessions. The holding session itself refuses to acquire a worktree inside or containing its folders.
+- Nested repository occupancy under a declared run folder is observed before the dialog and again before launch, never reserved. Another session can acquire one of those worktrees after the recheck; its native writes then race the approved command. Keep admin runs over repository data short and bounded.
 - Sessions running an older guard take no intent locks. Overlaps with their file grants go undetected until every session on the machine reloads the same version. Roll out and roll back by reloading all sessions together.
 
 `save_handoff` and `activate_pi_package` take temporary exact-file leases. A folder grant covering their target blocks them, just as an exact-file grant on the target does.

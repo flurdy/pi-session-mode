@@ -5,6 +5,17 @@ import { canonicalHome, canonicalPossiblyMissing, isWithin, normalizeToolPath, w
 export const MAX_FILE_GRANTS = 32;
 export const MAX_FOLDER_GRANTS = 16;
 export const MAX_FOLDER_SCAN_ENTRIES = 20_000;
+export const MAX_ADMIN_SCAN_ENTRIES = 200_000;
+
+export interface NestedRepository {
+	root: string;
+	marker: "directory" | "gitfile" | "symlink" | "other";
+}
+
+export interface AdminFolder {
+	path: string;
+	nestedRepositories: NestedRepository[];
+}
 
 export interface FolderScopeOptions {
 	signal?: AbortSignal;
@@ -61,22 +72,27 @@ export async function resolveGrantFile(value: unknown, cwd: string, signal?: Abo
 	return canonical;
 }
 
-async function assertNoNestedGit(folder: string, maxEntries: number, signal?: AbortSignal): Promise<void> {
-	const pending = [folder];
+async function scanNestedGit(folder: string, maxEntries: number, inventory: boolean, signal?: AbortSignal): Promise<NestedRepository[]> {
+	const pending = [folder], repositories: NestedRepository[] = [];
 	let entries = 0;
 	while (pending.length) {
 		signal?.throwIfAborted();
 		const directory = pending.pop()!;
 		for (const entry of await readdir(directory, { withFileTypes: true })) {
-			if (++entries > maxEntries) throw new Error(`Folder has more than ${maxEntries} entries and is too large to verify; grant a narrower folder`);
-			if (entry.name === ".git") throw new Error("Folder contains a Git repository");
+			signal?.throwIfAborted();
+			if (++entries > maxEntries) throw new Error(`Folder has more than ${maxEntries} entries and is too large to verify; declare a narrower folder`);
+			if (entry.name === ".git") {
+				if (!inventory) throw new Error(`Folder contains a Git repository at ${JSON.stringify(directory)}; /grant-folder cannot cover repositories. Use run_admin for attended administrative data operations`);
+				repositories.push({ root: directory, marker: entry.isDirectory() ? "directory" : entry.isFile() ? "gitfile" : entry.isSymbolicLink() ? "symlink" : "other" });
+				continue;
+			}
 			if (entry.isDirectory()) pending.push(join(directory, entry.name));
 		}
 	}
+	return repositories.sort((a, b) => a.root.localeCompare(b.root));
 }
 
-/** Canonical non-repository folder scope: an existing directory or one missing leaf beneath an existing canonical directory. */
-export async function resolveGrantFolder(value: unknown, cwd: string, options: FolderScopeOptions = {}): Promise<string> {
+async function resolveFolder(value: unknown, cwd: string, options: FolderScopeOptions, inventory: boolean): Promise<AdminFolder> {
 	const { signal } = options;
 	const requested = normalizeToolPath(value, cwd);
 	let existing = true;
@@ -100,9 +116,29 @@ export async function resolveGrantFolder(value: unknown, cwd: string, options: F
 	if (isWithin(canonical, runtime) || isWithin(runtime, canonical)) throw new Error("Folder scope overlaps the private lease runtime directory");
 	if (basename(canonical) === ".git") throw new Error("Folder name overlaps Git administration");
 	await assertOutsideGitAdministration(existing ? canonical : dirname(canonical), signal);
-	if (existing) await assertNoNestedGit(canonical, options.maxEntries ?? MAX_FOLDER_SCAN_ENTRIES, signal);
+	const nestedRepositories = existing ? await scanNestedGit(canonical, options.maxEntries ?? (inventory ? MAX_ADMIN_SCAN_ENTRIES : MAX_FOLDER_SCAN_ENTRIES), inventory, signal) : [];
 	signal?.throwIfAborted();
-	return canonical;
+	return { path: canonical, nestedRepositories };
+}
+
+/** Native-write grants always reject nested repositories. */
+export async function resolveGrantFolder(value: unknown, cwd: string, options: FolderScopeOptions = {}): Promise<string> {
+	return (await resolveFolder(value, cwd, options, false)).path;
+}
+
+/** Admin data scopes disclose nested Git markers without following them or granting native-write authority. */
+export async function resolveAdminFolder(value: unknown, cwd: string, options: FolderScopeOptions = {}): Promise<AdminFolder> {
+	return resolveFolder(value, cwd, options, true);
+}
+
+export async function resolveAdminFolders(paths: string[], cwd: string, options: FolderScopeOptions = {}): Promise<AdminFolder[]> {
+	if (!Array.isArray(paths) || paths.length === 0 || paths.length > MAX_FOLDER_GRANTS) throw new Error(`Expected 1–${MAX_FOLDER_GRANTS} folder paths`);
+	const folders = new Map<string, AdminFolder>();
+	for (const path of paths) {
+		const folder = await resolveAdminFolder(path, cwd, options);
+		folders.set(folder.path, folder);
+	}
+	return [...folders.values()].sort((a, b) => a.path.localeCompare(b.path));
 }
 
 /**
