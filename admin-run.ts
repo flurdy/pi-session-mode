@@ -15,6 +15,9 @@ export const ADMIN_MAX_ARGS = 32;
 export const ADMIN_DEFAULT_TIMEOUT_SECONDS = 120;
 export const ADMIN_MAX_TIMEOUT_SECONDS = 900;
 const MAX_DIALOG_CHARS = 24_000;
+const SCRIPT_PREVIEW_LINES = 12;
+/** Marks every script line so script text cannot pose as a dialog field. */
+const SCRIPT_GUTTER = "│ ";
 const OUTPUT_LIMIT = 64 * 1024;
 const OUTPUT_TAIL = 16 * 1024;
 const KILL_GRACE_MS = 2000;
@@ -205,26 +208,34 @@ export async function prepareAdminRun(request: AdminRunRequest, dependencies: Ad
 	return prepared;
 }
 
+/** Decision facts first (purpose, command, destructive lines, where it runs); binding details last. */
 export function adminRunDialog(prepared: PreparedAdminRun): string {
 	const show = (value: string) => safeDisplay(JSON.stringify(value));
 	const { command } = prepared;
 	const lines = [`Purpose: ${safeDisplay(prepared.purpose)}`];
-	if (command.kind === "script") lines.push(`Command: bash script via ${show(command.shell)} --noprofile --norc -c`, `Script sha256: ${command.sha256}`);
-	else lines.push(`Executable: ${show(command.executable)}`, `Arguments: ${safeDisplay(JSON.stringify(command.argv))}`);
+	const scriptLines = command.kind === "script" ? displayLines(command.script.replace(/\n+$/, "")).split("\n") : [];
+	const truncated = scriptLines.length > SCRIPT_PREVIEW_LINES;
+	if (command.kind === "script") {
+		lines.push(`Script (${scriptLines.length} line${scriptLines.length === 1 ? "" : "s"}):`, ...scriptLines.slice(0, SCRIPT_PREVIEW_LINES).map((line) => `${SCRIPT_GUTTER}${line}`));
+		if (truncated) lines.push(`${SCRIPT_GUTTER}… ${scriptLines.length - SCRIPT_PREVIEW_LINES} more lines; full script at the end`);
+	} else lines.push(`Command: ${safeDisplay(command.argv.map(shellQuote).join(" "))}`);
+	if (prepared.destructive.length) lines.push("Flagged destructive commands:", ...prepared.destructive.map((line) => `  ${safeDisplay(line)}`));
 	lines.push(`Working directory: ${show(prepared.cwd)}`);
-	lines.push(prepared.repository
-		? `Repository: ${show(prepared.repository.root)} at ${prepared.repository.head}, clean. Ignored files, PATH tools and user configuration remain trusted inputs.`
-		: "Repository: none");
-	lines.push("Declared folders (leased for coordination, not confinement):", ...prepared.writes.map((write) => `  ${show(write.path)} (${write.exists ? "exists" : "missing"})`));
+	lines.push("Declared folders:", ...prepared.writes.map((write) => `  ${show(write.path)} (${write.exists ? "exists" : "missing"})`));
 	const nested = nestedRepositories(prepared.writes);
 	if (nested.length) {
 		lines.push(`Nested Git repositories (${nested.length}; treated as data, not native-write grants):`, ...nested.slice(0, 20).map((repo) => `  ${show(repo.root)} (.git ${repo.marker})`));
 		if (nested.length > 20) lines.push(`  … ${nested.length - 20} more; all included in the pre-launch lease check.`);
-		lines.push("No nested worktree leases are taken. Git mutations remain refused. Occupancy is observed, not reserved; another writer can start after the check.");
 	}
-	if (prepared.destructive.length) lines.push("Flagged destructive commands:", ...prepared.destructive.map((line) => `  ${safeDisplay(line)}`));
-	lines.push(`Timeout: ${prepared.timeoutMs / 1000}s. Stdin is closed; nothing is retried.`, "", "Effects are not confined to these folders. Approving runs exactly this command once.");
-	if (command.kind === "script") lines.push("", "--- script ---", displayLines(command.script));
+	lines.push("", "Approving runs exactly this command once. The folders are leased for coordination; effects are not confined to them.", "", "Details:");
+	if (command.kind === "script") lines.push(`  Shell: ${show(command.shell)} --noprofile --norc -c`, `  Script sha256: ${command.sha256}`);
+	else lines.push(`  Executable: ${show(command.executable)}`, `  Arguments: ${safeDisplay(JSON.stringify(command.argv))}`);
+	lines.push(prepared.repository
+		? `  Repository: ${show(prepared.repository.root)} at ${prepared.repository.head}, clean. Ignored files, PATH tools and user configuration remain trusted inputs.`
+		: "  Repository: none");
+	if (nested.length) lines.push("  No nested worktree leases are taken. Git mutations remain refused. Occupancy is observed, not reserved; another writer can start after the check.");
+	lines.push(`  Timeout: ${prepared.timeoutMs / 1000}s. Stdin is closed; nothing is retried.`);
+	if (truncated) lines.push("", "--- full script ---", ...scriptLines.map((line) => `${SCRIPT_GUTTER}${line}`));
 	return lines.join("\n");
 }
 

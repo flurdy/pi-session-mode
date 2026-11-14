@@ -63,7 +63,7 @@ test("prepare binds canonical writes, script digest and a clean repository; rech
 		assert.equal(prepared.repository?.root, repo);
 		assert.equal(prepared.repository?.head, execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim());
 		const dialog = adminRunDialog(prepared);
-		assert.match(dialog, /Effects are not confined/);
+		assert.match(dialog, /effects are not confined/);
 		assert.match(dialog, /echo prepared/);
 		assert.equal(await recheckAdminRun(prepared), undefined);
 		await writeFile(join(repo, "untracked.txt"), "x\n");
@@ -75,6 +75,42 @@ test("prepare binds canonical writes, script digest and a clean repository; rech
 		await mkdir(join(base, "elsewhere"));
 		await symlink(join(base, "elsewhere"), join(home, ".agents", "handoffs"));
 		assert.match(await recheckAdminRun(prepared) ?? "", /declared/i);
+	} finally { await cleanup(); }
+});
+
+test("the dialog leads with purpose, command and destructive flags and keeps every detail", async () => {
+	const { home, repo, cleanup } = await fixture();
+	try {
+		const writes = [join(home, ".agents", "handoffs"), join(home, ".claude", "handoffs")];
+		const short = await prepareAdminRun({ purpose: "Move handoffs", cwd: repo, writes, script: "set -eu\nrm -rf ~/.claude/handoffs/archive\n" });
+		const lines = adminRunDialog(short).split("\n");
+		const at = (pattern: RegExp) => lines.findIndex((line) => pattern.test(line));
+		assert.equal(lines[0], "Purpose: Move handoffs");
+		assert.ok(at(/set -eu/) > 0 && at(/set -eu/) < 5, "a short script is visible within the first lines");
+		assert.ok(at(/rm -rf/) < 5);
+		const details = at(/^Details:$/);
+		assert.ok(details > 0, "low-value facts move to a trailing details block");
+		for (const decisive of [/^Flagged destructive commands:$/, /^Working directory:/, /^Declared folders:/, /Approving runs exactly this command once/]) {
+			assert.ok(at(decisive) >= 0 && at(decisive) < details, String(decisive));
+		}
+		if (short.command.kind !== "script") assert.fail("expected a script");
+		for (const detail of [short.command.sha256, short.command.shell, short.repository!.head, "Timeout: 120s", "Stdin is closed", "coordination", "(missing)", "(exists)", "PATH tools"]) {
+			assert.ok(lines.some((line) => line.includes(detail)), detail);
+		}
+		assert.ok(at(/sha256/) > details && at(/Timeout/) > details && at(/^ {2}Repository:/) > details);
+		assert.equal(lines.filter((line) => /not confined|not confinement/.test(line)).length, 1, "one confinement caveat");
+		assert.equal(lines.filter((line) => line.includes("set -eu")).length, 1, "a short script is shown once");
+
+		const body = Array.from({ length: 30 }, (_, index) => `echo step-${index + 1}`).join("\n");
+		const long = adminRunDialog(await prepareAdminRun({ purpose: "Long", cwd: repo, writes, script: body })).split("\n");
+		assert.ok(long.slice(0, 15).some((line) => /… 18 more lines; full script at the end/.test(line)), "a long script is previewed with a visible remainder count");
+		assert.ok(long.findIndex((line) => line.endsWith("echo step-30")) > long.indexOf("Details:"), "the full script still follows");
+		for (let step = 1; step <= 30; step++) assert.ok(long.some((line) => line.endsWith(`echo step-${step}`)), `step ${step}`);
+
+		const argv = adminRunDialog(await prepareAdminRun({ purpose: "Argv", cwd: repo, writes, argv: ["git", "--version", "two words"] })).split("\n");
+		assert.equal(argv[1], "Command: git --version 'two words'");
+		assert.ok(argv.indexOf("Details:") < argv.findIndex((line) => line.includes('["git","--version","two words"]')), "exact argv stays in the details");
+		assert.ok(argv.some((line) => /^ {2}Executable: ".*\/git"$/.test(line)));
 	} finally { await cleanup(); }
 });
 

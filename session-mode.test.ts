@@ -1439,7 +1439,7 @@ test("run_admin runs one confirmed command in lazy mode without taking worktree 
 		assert.equal(await readFile(join(target, "marker"), "utf8"), "done\n");
 		assert.deepEqual(log, [`acquire ${target}`, `release ${target}`]);
 		assert.equal(dialogs.length, 2);
-		assert.match(dialogs[0]!, /Effects are not confined/);
+		assert.match(dialogs[0]!, /effects are not confined/);
 		assert.equal(controller.state, "lazy");
 		assert.deepEqual([controller.roots, controller.files, acquisitions], [[], [], []]);
 	} finally { await cleanup(); }
