@@ -12,7 +12,7 @@ import { LeaseSet, type HeldScopes, type LeaseSetResult, type ScopeSetRequest } 
 import { probeWorktreeLeaseOccupancies } from "./lease-observer.ts";
 import { inventoryHeldLeases, type LeaseInventory, type LeaseInventoryOptions } from "./lease-inventory.ts";
 import { defaultPackageActivationDependencies, activatePreparedPackage, preparePackageActivation, type PackageActivationEvidence, type PackageActivationLaunchOptions, type PackageActivationRequest, type PreparedPackageActivation } from "./package-activation.ts";
-import { guardedToolBlockReason } from "./policy.ts";
+import { guardedToolBlockReason, implementPushCheck, type ImplementPushCheck } from "./policy.ts";
 import { APPROVAL_WAIT_MS, attendedConfirm, ringTerminalBell, type ApprovalOutcome, type AttentionSignal } from "./attention.ts";
 import { scopedWriteBlockReason } from "./scoped-policy.ts";
 import { resolveExplicitFiles, resolveExplicitFolders } from "./file-scope.ts";
@@ -844,6 +844,26 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		},
 	});
 
+	/** One fresh native confirmation per raw push while a worktree lease leaves Bash otherwise unguarded. */
+	async function confirmPush(ctx: ExtensionContext, push: Extract<ImplementPushCheck, { kind: "confirm" }>, ticket: number): Promise<string | undefined> {
+		if (ctx.mode !== "tui" || !ctx.hasUI) return "Guarded session: a raw git push needs a native TUI confirmation; it is unavailable in RPC, JSON and print modes. Nothing ran.";
+		const body = [
+			`Command: ${safeDisplay(push.command)}`,
+			`Working directory: ${safeDisplay(JSON.stringify(ctx.cwd))}`,
+			`Flags: ${push.risky.join(", ") || "none"}`,
+			"",
+			"Approving lets this one Bash call run once; nothing is retried. Its effects are not confined to the push.",
+		].join("\n");
+		if (body.length > 10_000) return "Guarded session: this push command is too long to show for confirmation. Nothing ran.";
+		const outcome = await approve(ctx, "Push to a remote?", body, ctx.signal);
+		if (outcome !== "approved") {
+			const why = { declined: "declined", expired: `approval expired after ${approvalWait}`, cancelled: "cancelled" }[outcome];
+			return `Guarded session: push ${why}; nothing ran. Do not retry it automatically.`;
+		}
+		if (!current(ticket) || !writable() || leases.roots.length === 0) return "Guarded session: the session changed during push confirmation; nothing ran.";
+		return undefined;
+	}
+
 	function setWorkingMessage(ctx: ExtensionContext, message?: string): void {
 		try { ctx.ui.setWorkingMessage(message); } catch { /* Progress rendering is not an authority boundary. */ }
 	}
@@ -975,7 +995,11 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 			if (leases.roots.length === 0) {
 				const guardedReason = guardedToolBlockReason(event.toolName, event.input, { readOnlySubagents, allowNativeWrites: true, allowAdminRuns: true });
 				if (guardedReason) return { block: true, reason: guardedReason };
+				return;
 			}
+			const push = implementPushCheck(event.toolName, event.input);
+			const pushReason = push && (push.kind === "block" ? push.reason : await confirmPush(ctx, push, ticket));
+			if (pushReason) return { block: true, reason: pushReason };
 			return;
 		}
 		const reason = guardedToolBlockReason(event.toolName, event.input, { readOnlySubagents });

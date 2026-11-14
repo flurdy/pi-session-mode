@@ -1368,6 +1368,40 @@ test("release_scopes reports a lease loss during its release drain instead of se
 	assert.deepEqual(pi.appended.at(-1)?.data, { version: 2, mode: "plan" });
 });
 
+test("implement mode confirms each raw git push natively and blocks make push without a dialog", async () => {
+	let bells = 0;
+	const { pi, controller } = harness([held()], { approvalWaitMs: 1_000, attention: () => { bells++; } });
+	pi.planFlag = true;
+	const ctx = context();
+	await pi.emit("session_start", ctx);
+	await pi.commands.get("implement")?.handler("", ctx);
+	assert.equal(controller.state, "implement");
+	const dialogs: string[] = [];
+	const bash = (command: string) => pi.emit("tool_call", ctx, { toolName: "bash", input: { command } });
+	ctx.ui.confirm = async (_title: string, message: string) => { dialogs.push(message); return false; };
+	const [declined] = await bash("git push --force-with-lease origin feat/x") as Array<{ block: boolean; reason: string }>;
+	assert.equal(declined!.block, true);
+	assert.match(declined!.reason, /declined; nothing ran/i);
+	assert.match(dialogs[0]!, /git push --force-with-lease origin feat\/x/);
+	assert.match(dialogs[0]!, /Flags: force/);
+	ctx.ui.confirm = async (_title: string, message: string) => { dialogs.push(message); return true; };
+	assert.deepEqual(await bash("git push -u origin feat/x"), [undefined]);
+	assert.deepEqual(await bash("git status && touch notes"), [undefined], "other Bash keeps the ordinary implementation boundary");
+	assert.equal(dialogs.length, 2, "one dialog per push, none for other commands");
+	const [makePush] = await bash("make push") as Array<{ block: boolean; reason: string }>;
+	assert.match(makePush!.reason, /publish_commit/);
+	const [parallel] = await pi.emit("tool_call", ctx, { toolName: "multi_tool_use.parallel", input: {
+		tool_uses: [{ recipient_name: "functions.bash", parameters: { command: "git push" } }],
+	} }) as Array<{ block: boolean; reason: string }>;
+	assert.equal(parallel!.block, true);
+	ctx.mode = "rpc";
+	const [rpc] = await bash("git push") as Array<{ block: boolean; reason: string }>;
+	assert.match(rpc!.reason, /native TUI confirmation/);
+	assert.equal(dialogs.length, 2, "refusals show no dialog");
+	assert.equal(bells, 2, "one attention signal per push dialog");
+	assert.equal(controller.state, "implement");
+});
+
 async function adminFixture() {
 	const base = await realpath(await mkdtemp(join(tmpdir(), "pi-admin-session-")));
 	const target = join(base, "target");

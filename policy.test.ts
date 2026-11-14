@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { guardedToolBlockReason, isObviousMutation } from "./policy.ts";
+import { guardedToolBlockReason, implementPushCheck, isObviousMutation } from "./policy.ts";
 
 test("blocks direct writes while leaving reads available", () => {
 	assert.match(guardedToolBlockReason("edit") ?? "", /guarded session/i);
@@ -275,4 +275,51 @@ test("fails closed when shell payload inspection exceeds its nesting limit", () 
 
 test("leaves unknown commands outside the bounded policy", () => {
 	assert.equal(isObviousMutation("custom-generator --apply"), false);
+});
+
+test("implement-mode push check asks to confirm recognizable raw git pushes and flags risky forms", () => {
+	const bash = (command: string) => implementPushCheck("bash", { command });
+	for (const command of [
+		"git push",
+		"git push -u origin feat/x",
+		"git -C /repo -c push.default=simple push origin main",
+		"cd repo && git push",
+		"env GIT_SSH_COMMAND=ssh git push",
+		"bash -c 'git push origin main'",
+		'git "push"',
+	]) assert.deepEqual(bash(command), { kind: "confirm", command, risky: [] }, command);
+	for (const [command, risky] of [
+		["git push -f", ["force"]],
+		["git push --force-with-lease origin feat/x", ["force"]],
+		["git push origin +main", ["force"]],
+		["git push origin :old", ["delete"]],
+		["git push --delete origin old", ["delete"]],
+		["git push --mirror backup", ["mirror"]],
+		["git push --tags", ["tags"]],
+	] as const) assert.deepEqual(bash(command), { kind: "confirm", command, risky }, command);
+	for (const command of [
+		"git status",
+		"git log --grep push",
+		"git -c push.default=simple status",
+		"echo git push",
+		"bd comments add fixture-1 'git push'",
+	]) assert.equal(bash(command), undefined, command);
+	assert.equal(implementPushCheck("read", { path: "git push" }), undefined);
+});
+
+test("implement-mode push check blocks make push recipes and pushes inside parallel wrappers", () => {
+	for (const command of ["make push", "make -C repo release-push", "git push && make push"]) {
+		const check = implementPushCheck("bash", { command });
+		assert.equal(check?.kind, "block", command);
+		assert.match(check?.kind === "block" ? check.reason : "", /publish_commit/);
+	}
+	const parallel = (command: string) => implementPushCheck("multi_tool_use.parallel", {
+		tool_uses: [{ recipient_name: "functions.read", parameters: { path: "a" } }, { recipient_name: "functions.bash", parameters: { command } }],
+	});
+	const nested = parallel("git push origin main");
+	assert.equal(nested?.kind, "block");
+	assert.match(nested?.kind === "block" ? nested.reason : "", /own Bash call/);
+	assert.equal(parallel("git status"), undefined);
+	const deep = { tool_uses: [{ recipient_name: "multi_tool_use.parallel", parameters: { tool_uses: [{ recipient_name: "functions.bash", parameters: { command: "git push" } }] } }] };
+	assert.equal(implementPushCheck("multi_tool_use.parallel", deep)?.kind, "block");
 });

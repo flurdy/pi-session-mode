@@ -84,15 +84,30 @@ outside this accidental-change guard's guarantee.
 Publishing a commit is a remote action, not a source edit, so it does not use writer leases.
 `publish_commit` is available in every guard state: each exact commit needs its own native
 TUI confirmation and single-use session token, then execution rechecks identity and
-configuration before a non-force single-ref push. Guarded Bash still blocks raw `git push`
-and recognizable `make`/`gmake` push targets, whose recipes publish whatever tip exists
-when they run. Do not request `/implement` scopes to publish. See
-[attended commit publication](publication.md).
+configuration before a non-force single-ref push. Do not request `/implement` scopes to publish.
+See [attended commit publication](publication.md).
+
+Recognizable `make`/`gmake` push targets, whose recipes publish whatever tip exists when they
+run, are blocked in every guarded state. Raw `git push` depends on the session:
+
+- **No worktree lease held** (plan, lazy, file-only): guarded Bash blocks it.
+- **A worktree lease held**: Bash is otherwise unguarded, so each recognizable raw `git push`
+  Bash call opens its own native TUI confirmation. It shows the command, working directory and
+  flags for force, delete, mirror or tag forms, and uses the shared
+  [approval wait](#attended-approval-dialogs). Only Yes lets that one call run. Decline, expiry,
+  Esc and turn cancellation block it, nothing is retried, and the session's state is rechecked after
+  approval. RPC, JSON and print modes, and pushes inside parallel tool wrappers, are blocked
+  without a dialog. This keeps branch, force-with-lease and new-upstream pushes that
+  `publish_commit` does not cover available, each with a fresh human answer.
+
+Detection is word-based and bounded: Git aliases, variables, scripts and other tools that push
+are not recognized. It is a confirmation step for ordinary push commands, not a remote-effect
+sandbox. Writer subagents remain outside it.
 
 ## Attended approval dialogs
 
-Approval dialogs for `/grant-file`, `/grant-folder`, `run_admin`, `activate_pi_package` and
-handoff overwrite share one bounded wait of **10 minutes**, shown as a countdown. This is the time
+Approval dialogs for `/grant-file`, `/grant-folder`, `run_admin`, `activate_pi_package`,
+handoff overwrite and [raw pushes while a lease is held](#attended-publication) share one bounded wait of **10 minutes**, shown as a countdown. This is the time
 the dialog waits for an answer. It is separate from `run_admin`'s `timeoutSeconds` execution deadline.
 Only an explicit approval authorizes anything. Decline, expiry, Esc and turn cancellation all run
 nothing, take no lease and are never retried automatically. Each operation's post-approval
@@ -196,7 +211,7 @@ A parent lease does not cover a nested repository or initialized submodule. Inde
 
 File locks provide cooperating-session exclusion, not content compare-and-swap. Scope-revision rechecks catch loss or selection changes during asynchronous preflight. External content changes, hostile filesystem races, and holder loss between preflight and the actual write remain outside the same documented TOCTOU boundary as worktree scopes. Native Pi serializes same-process operations for the canonical file; this extension does not override edit/write implementations or claim atomic file writes.
 
-A grant-only (exact-file or folder) implementation session retains the guarded bounded Bash, package, Git, system and writer-subagent policy while allowing native edit/write through the grant checkers. Adding any worktree lease selects the ordinary implementation boundary, where shell/script effects are explicitly unscoped. This avoids turning confirmation of one configuration file into general obvious shell-mutation authority.
+A grant-only (exact-file or folder) implementation session retains the guarded bounded Bash, package, Git, system and writer-subagent policy while allowing native edit/write through the grant checkers. Adding any worktree lease selects the ordinary implementation boundary, where shell/script effects are explicitly unscoped apart from the [raw-push confirmation](#attended-publication). This avoids turning confirmation of one configuration file into general obvious shell-mutation authority.
 
 ## Dynamic native-write acquisition
 

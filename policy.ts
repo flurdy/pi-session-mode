@@ -398,6 +398,53 @@ function isMakePushCommand(words: string[]): boolean {
 		&& invoked.args.some((arg) => !arg.startsWith("-") && !arg.includes("=") && /(?:^|[-_:.])push(?:$|[-_:.])/i.test(arg)));
 }
 
+// Git options before the subcommand that consume the next word.
+const GIT_VALUE_OPTIONS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"]);
+
+function gitPushArgs(words: string[]): string[] | undefined {
+	const invoked = invokedCommand(words);
+	if (invoked?.executable !== "git") return undefined;
+	for (let index = 0; index < invoked.args.length; index++) {
+		const arg = invoked.args[index]!;
+		if (GIT_VALUE_OPTIONS.has(arg)) index++;
+		else if (!arg.startsWith("-")) return arg === "push" ? invoked.args.slice(index + 1) : undefined;
+	}
+	return undefined;
+}
+
+const RISKY_PUSH_FORMS: ReadonlyArray<[string, (arg: string) => boolean]> = [
+	["force", (arg) => /^(?:-f|--force(?:-with-lease|-if-includes)?(?:=.*)?|\+.+)$/.test(arg)],
+	["delete", (arg) => arg === "-d" || arg === "--delete" || /^:./.test(arg)],
+	["mirror", (arg) => arg === "--mirror"],
+	["tags", (arg) => arg === "--tags" || arg === "--follow-tags"],
+];
+
+const PARALLEL_PUSH_REASON = "Guarded session: a push inside a parallel tool wrapper cannot be confirmed. Run git push as its own Bash call, or publish an exact commit with publish_commit.";
+export type ImplementPushCheck = { kind: "block"; reason: string } | { kind: "confirm"; command: string; risky: string[] };
+
+/**
+ * Push handling once a worktree lease is held, where the guarded Bash policy no longer runs.
+ * Recognizable raw `git push` invocations need one native confirmation each; make push recipes stay
+ * blocked. Word-based and bounded like the rest of this policy: aliases, variables and scripts that
+ * push are not seen, so this is a confirmation step, not a complete detector of remote effects.
+ */
+export function implementPushCheck(toolName: string, input: unknown, depth = 0): ImplementPushCheck | undefined {
+	if (toolName === "multi_tool_use.parallel") {
+		if (!isRecord(input) || !Array.isArray(input.tool_uses) || depth >= MAX_PARALLEL_DEPTH) return undefined;
+		for (const nested of input.tool_uses) {
+			if (!isRecord(nested) || typeof nested.recipient_name !== "string") continue;
+			if (implementPushCheck(normalizedNestedToolName(nested.recipient_name), nested.parameters, depth + 1)) return { kind: "block", reason: PARALLEL_PUSH_REASON };
+		}
+		return undefined;
+	}
+	const command = toolName === "bash" && isRecord(input) ? input.command : undefined;
+	if (typeof command !== "string") return undefined;
+	if (hasCommand(command, isMakePushCommand)) return { kind: "block", reason: MAKE_PUSH_REASON };
+	const pushes: string[][] = [];
+	hasCommand(command, (words) => { const args = gitPushArgs(words); if (args) pushes.push(args); return false; });
+	return pushes.length ? { kind: "confirm", command, risky: RISKY_PUSH_FORMS.filter(([, matches]) => pushes.flat().some(matches)).map(([form]) => form) } : undefined;
+}
+
 function hasCommand(command: string, matches: (words: string[]) => boolean, depth = 0): boolean {
 	if (depth < MAX_INSPECTION_DEPTH && constantShellPayloads(command).some((payload) => hasCommand(payload, matches, depth + 1))) return true;
 	const words: string[] = [];
