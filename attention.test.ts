@@ -26,6 +26,15 @@ test("approval passes the bounded countdown and caller signal and signals attent
 	assert.equal(bells, 1, "one attention signal per dialog and none after it closes");
 });
 
+test("the body is set apart from the title and the countdown gets its own line", async () => {
+	const shown: string[] = [];
+	const ctx = { mode: "tui", ui: { confirm: async (_title: string, message: string) => { shown.push(message); return false; } } };
+	await attendedConfirm(ctx, "Title", "First\nLast: 30s", { attention: () => undefined });
+	// Pi renders `${title}\n${message}` as one block and appends " (Ns)" to its last line.
+	const rendered = `Title\n${shown[0]} (587s)`.split("\n");
+	assert.deepEqual(rendered, ["Title", "", "First", "Last: 30s", " (587s)"]);
+});
+
 test("an explicit decline before the bound is declined, not expired", async () => {
 	const { ctx } = dialogContext(async () => false);
 	assert.equal(await attendedConfirm(ctx, "Title", "Body", { waitMs: 1_000, attention: () => undefined }), "declined");

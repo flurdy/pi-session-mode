@@ -88,6 +88,7 @@ test("the dialog leads with purpose, command and destructive flags and keeps eve
 		assert.equal(lines[0], "Purpose: Move handoffs");
 		assert.ok(at(/set -eu/) > 0 && at(/set -eu/) < 5, "a short script is visible within the first lines");
 		assert.ok(at(/rm -rf/) < 5);
+		assert.equal(lines[at(/^Working directory:/) - 1], "", "where it runs is set apart from what runs");
 		const details = at(/^Details:$/);
 		assert.ok(details > 0, "low-value facts move to a trailing details block");
 		for (const decisive of [/^Flagged destructive commands:$/, /^Working directory:/, /^Declared folders:/, /Approving runs exactly this command once/]) {

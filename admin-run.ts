@@ -220,7 +220,7 @@ export function adminRunDialog(prepared: PreparedAdminRun): string {
 		if (truncated) lines.push(`${SCRIPT_GUTTER}… ${scriptLines.length - SCRIPT_PREVIEW_LINES} more lines; full script at the end`);
 	} else lines.push(`Command: ${safeDisplay(command.argv.map(shellQuote).join(" "))}`);
 	if (prepared.destructive.length) lines.push("Flagged destructive commands:", ...prepared.destructive.map((line) => `  ${safeDisplay(line)}`));
-	lines.push(`Working directory: ${show(prepared.cwd)}`);
+	lines.push("", `Working directory: ${show(prepared.cwd)}`);
 	lines.push("Declared folders:", ...prepared.writes.map((write) => `  ${show(write.path)} (${write.exists ? "exists" : "missing"})`));
 	const nested = nestedRepositories(prepared.writes);
 	if (nested.length) {

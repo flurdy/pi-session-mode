@@ -33,7 +33,9 @@ export async function attendedConfirm(
 	if (signal?.aborted) return "cancelled";
 	attention(ctx);
 	const started = Date.now();
-	const confirmed = await ctx.ui.confirm(title, message, { timeout: waitMs, ...(signal ? { signal } : {}) });
+	// Pi shows `${title}\n${message}` as one block and appends the countdown to its last line:
+	// a blank line sets the body apart and a final newline keeps the countdown off the content.
+	const confirmed = await ctx.ui.confirm(title, `\n${message}\n`, { timeout: waitMs, ...(signal ? { signal } : {}) });
 	if (signal?.aborted) return "cancelled";
 	if (confirmed) return "approved";
 	return Date.now() - started >= waitMs ? "expired" : "declined";
