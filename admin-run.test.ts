@@ -94,10 +94,12 @@ test("the dialog leads with purpose, command and destructive flags and keeps eve
 			assert.ok(at(decisive) >= 0 && at(decisive) < details, String(decisive));
 		}
 		if (short.command.kind !== "script") assert.fail("expected a script");
-		for (const detail of [short.command.sha256, short.command.shell, short.repository!.head, "Timeout: 120s", "Stdin is closed", "coordination", "(missing)", "(exists)", "PATH tools"]) {
+		const head = short.repository!.head;
+		for (const detail of [`at ${head.slice(0, 12)}, clean`, "Timeout: 120s", "Stdin is closed", "coordination", "(missing)", "(exists)", "PATH tools"]) {
 			assert.ok(lines.some((line) => line.includes(detail)), detail);
 		}
-		assert.ok(at(/sha256/) > details && at(/Timeout/) > details && at(/^ {2}Repository:/) > details);
+		for (const noise of [short.command.sha256, short.command.shell, head]) assert.ok(!lines.some((line) => line.includes(noise)), `hidden: ${noise}`);
+		assert.ok(at(/Timeout/) > details && at(/^ {2}Repository:/) > details);
 		assert.equal(lines.filter((line) => /not confined|not confinement/.test(line)).length, 1, "one confinement caveat");
 		assert.equal(lines.filter((line) => line.includes("set -eu")).length, 1, "a short script is shown once");
 

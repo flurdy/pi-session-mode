@@ -228,10 +228,9 @@ export function adminRunDialog(prepared: PreparedAdminRun): string {
 		if (nested.length > 20) lines.push(`  … ${nested.length - 20} more; all included in the pre-launch lease check.`);
 	}
 	lines.push("", "Approving runs exactly this command once. The folders are leased for coordination; effects are not confined to them.", "", "Details:");
-	if (command.kind === "script") lines.push(`  Shell: ${show(command.shell)} --noprofile --norc -c`, `  Script sha256: ${command.sha256}`);
-	else lines.push(`  Executable: ${show(command.executable)}`, `  Arguments: ${safeDisplay(JSON.stringify(command.argv))}`);
+	if (command.kind === "argv") lines.push(`  Executable: ${show(command.executable)}`, `  Arguments: ${safeDisplay(JSON.stringify(command.argv))}`);
 	lines.push(prepared.repository
-		? `  Repository: ${show(prepared.repository.root)} at ${prepared.repository.head}, clean. Ignored files, PATH tools and user configuration remain trusted inputs.`
+		? `  Repository: ${show(prepared.repository.root)} at ${prepared.repository.head.slice(0, 12)}, clean. Ignored files, PATH tools and user configuration remain trusted inputs.`
 		: "  Repository: none");
 	if (nested.length) lines.push("  No nested worktree leases are taken. Git mutations remain refused. Occupancy is observed, not reserved; another writer can start after the check.");
 	lines.push(`  Timeout: ${prepared.timeoutMs / 1000}s. Stdin is closed; nothing is retried.`);
