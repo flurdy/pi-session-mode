@@ -1410,6 +1410,42 @@ test("run_admin runs one confirmed command in lazy mode without taking worktree 
 	} finally { await cleanup(); }
 });
 
+test("approval dialogs share a bounded wait, signal attention once and label expiry without running anything", async () => {
+	const { base, target, cleanup } = await adminFixture();
+	try {
+		const log: string[] = [];
+		let bells = 0;
+		const { pi, controller } = harness([], { acquireFolder: folderLeases(log), approvalWaitMs: 20, attention: () => { bells++; } });
+		const ctx = realContext([]);
+		await pi.emit("session_start", ctx);
+		const params = { purpose: "Create marker", cwd: base, writes: [target], script: `echo done > '${join(target, "marker")}'` };
+		const options: Array<{ timeout?: number; signal?: AbortSignal }> = [];
+		ctx.ui.confirm = async (_title: string, _message: string, given: any = {}) => {
+			options.push(given);
+			await new Promise((done) => setTimeout(done, given.timeout + 5));
+			return false;
+		};
+		const turn = new AbortController();
+		const expired = await pi.tools.get("run_admin")!.execute("call", params, turn.signal, undefined, ctx);
+		assert.equal(expired.details.status, "declined", "receipt statuses are unchanged");
+		assert.match(expired.details.reason, /approval wait of 0:01 expired; nothing ran/i);
+		assert.equal(options[0]!.timeout, 20);
+		assert.ok(options[0]!.signal, "the turn can close the dialog");
+		ctx.ui.confirm = async () => false;
+		assert.match((await adminTool(pi, ctx, params)).details.reason, /^Declined; nothing ran/);
+		await assert.rejects(stat(join(target, "marker")));
+		assert.deepEqual(log, [], "neither expiry nor decline takes a lease");
+		ctx.ui.confirm = async (_title: string, _message: string, given: any = {}) => {
+			await new Promise((done) => setTimeout(done, given.timeout + 5));
+			return false;
+		};
+		await pi.commands.get("grant-folder")!.handler(JSON.stringify(target), ctx);
+		assert.match(ctx.notifications.at(-1)?.message ?? "", /Folder grant approval expired/);
+		assert.deepEqual(controller.folders, []);
+		assert.equal(bells, 3, "one attention signal per dialog");
+	} finally { await cleanup(); }
+});
+
 test("run_admin discloses nested data and takes real folder leases without granting source writes", async () => {
 	const { base, target, cleanup } = await adminFixture();
 	try {

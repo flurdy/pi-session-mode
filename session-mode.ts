@@ -13,6 +13,7 @@ import { probeWorktreeLeaseOccupancies } from "./lease-observer.ts";
 import { inventoryHeldLeases, type LeaseInventory, type LeaseInventoryOptions } from "./lease-inventory.ts";
 import { defaultPackageActivationDependencies, activatePreparedPackage, preparePackageActivation, type PackageActivationEvidence, type PackageActivationLaunchOptions, type PackageActivationRequest, type PreparedPackageActivation } from "./package-activation.ts";
 import { guardedToolBlockReason } from "./policy.ts";
+import { APPROVAL_WAIT_MS, attendedConfirm, ringTerminalBell, type ApprovalOutcome, type AttentionSignal } from "./attention.ts";
 import { scopedWriteBlockReason } from "./scoped-policy.ts";
 import { resolveExplicitFiles, resolveExplicitFolders } from "./file-scope.ts";
 import { registerHandoffSave } from "./handoff-save.ts";
@@ -40,6 +41,10 @@ export interface SessionModeDependencies {
 	inventory?(options: LeaseInventoryOptions): Promise<LeaseInventory>;
 	/** Bound and retry interval of the attended wait offered after native-write contention. */
 	contentionWait?: { budgetMs: number; pollMs: number };
+	/** How long attended approval dialogs wait for an answer before expiring. */
+	approvalWaitMs?: number;
+	/** Attention signal shown when a session-mode dialog starts waiting for the user. */
+	attention?: AttentionSignal;
 }
 export interface SessionModeController {
 	readonly mode: SessionMode;
@@ -151,6 +156,9 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	pi.registerFlag("lazy", { description: "Hold no worktree lease until the first native edit/write; overrides restored scopes", type: "boolean", default: false });
 	pi.registerFlag("lease-roots", { description: "Explicit worktree roots as a JSON array; overrides restored scopes", type: "string" });
 
+	const approvalWait = clock(dependencies.approvalWaitMs ?? APPROVAL_WAIT_MS);
+	const approve = (ctx: ExtensionContext, title: string, message: string, signal?: AbortSignal): Promise<ApprovalOutcome> =>
+		attendedConfirm(ctx, title, message, { ...(signal ? { signal } : {}), waitMs: dependencies.approvalWaitMs, attention: dependencies.attention });
 	function notify(ctx: ExtensionContext, text: string, level: "info" | "warning" | "error" = "info"): void {
 		const escaped = safeDisplay(text.slice(0, 12_000));
 		const bounded = escaped.length > 12_000 || text.length > 12_000 ? `${escaped.slice(0, 11_970)} … (truncated)` : escaped;
@@ -490,8 +498,9 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 					if (rejectBusy(ctx)) return;
 					const display = expected.map((path) => safeDisplay(JSON.stringify(path))).join("\n");
 					if (display.length > 10_000) throw new Error(`${spec.label} confirmation scope is too large`);
-					const confirmed = await ctx.ui.confirm(spec.title, spec.body(display), { timeout: 60_000 });
-					if (!confirmed) { notify(ctx, `${spec.label} grant cancelled.`); return; }
+					const outcome = await approve(ctx, spec.title, spec.body(display), ctx.signal);
+					if (outcome === "expired") { notify(ctx, `${spec.label} grant approval expired after ${approvalWait}; nothing was granted.`, "warning"); return; }
+					if (outcome !== "approved") { notify(ctx, `${spec.label} grant cancelled.`); return; }
 					if (!confirmationCurrent()) { sessionChanged(); return; }
 					if (rejectBusy(ctx)) return;
 					if (dependencies.isDisabled() || ctx.mode !== "tui" || !ctx.hasUI) { notify(ctx, `${spec.label} grant cancelled because the authorization context changed.`, "warning"); return; }
@@ -651,8 +660,13 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 					"Pi will update this checkout and may execute reviewed package/dependency install scripts. This does not reload the running session.",
 				].join("\n");
 				if (confirmation.length > 10_000) throw new Error("Pi package activation confirmation is too large");
-				const confirmed = await ctx.ui.confirm("Activate pinned Pi package?", confirmation, { timeout: 60_000 });
-				if (!confirmed) return { content: [{ type: "text" as const, text: "Pi package activation cancelled; no activation command was started." }], details: { status: "cancelled" } };
+				const outcome = await approve(ctx, "Activate pinned Pi package?", confirmation, signal);
+				if (outcome !== "approved") {
+					const text = outcome === "expired"
+						? `Pi package activation approval expired after ${approvalWait}; no activation command was started.`
+						: "Pi package activation cancelled; no activation command was started.";
+					return { content: [{ type: "text" as const, text }], details: { status: "cancelled" } };
+				}
 				if (!eligible()) throw new Error("Pi package activation authorization context changed after confirmation");
 				const acquired = await packageActivation.acquireSettingsLease(display.settingsPath, { sessionId, expectedFile: display.settingsPath, ...(signal ? { signal } : {}) });
 				if (acquired.kind === "contended") throw new Error("Another Pi package activation or exact-file writer is already running");
@@ -794,8 +808,11 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 					if (inside) return refused(`Declared folder ${JSON.stringify(path)} contains the held grant ${JSON.stringify(inside)}; revoke it first. Nothing ran.`, prepared);
 				}
 				if (!eligible()) return result({ ...adminRunReceiptBase(prepared), status: "stale", reason: "The session changed before confirmation; nothing ran." });
-				const confirmed = await ctx.ui.confirm("Run administrative command once?", adminRunDialog(prepared), { timeout: 60_000 });
-				if (!confirmed) return result({ ...adminRunReceiptBase(prepared), status: "declined", reason: "Declined or timed out; nothing ran." });
+				const outcome = await approve(ctx, "Run administrative command once?", adminRunDialog(prepared), combined);
+				if (outcome !== "approved") {
+					const reason = { expired: `Approval wait of ${approvalWait} expired; nothing ran.`, cancelled: "Cancelled before approval; nothing ran.", declined: "Declined; nothing ran." }[outcome];
+					return result({ ...adminRunReceiptBase(prepared), status: "declined", reason });
+				}
 				if (!eligible()) return result({ ...adminRunReceiptBase(prepared), status: "stale", reason: "The session changed during confirmation; nothing ran." });
 				const pool = new IntentPool();
 				for (const { path } of prepared.writes) {
@@ -851,6 +868,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		try {
 			let choice: string | undefined;
 			try {
+				(dependencies.attention ?? ringTerminalBell)(ctx);
 				choice = await ctx.ui.select(`Worktree ${safeDisplay(JSON.stringify(initial.root))} is held by another live session. Wait for all requested worktrees?`, [wait, "Stop: block this write"], { timeout: WAIT_OFFER_TIMEOUT_MS, signal: turn });
 			} catch { choice = undefined; }
 			if (choice !== wait) return { result: initial, reason: "the offered wait was not accepted" };

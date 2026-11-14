@@ -6,6 +6,7 @@ import { lstat, mkdir, open, readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { Type } from "typebox";
+import { attendedConfirm } from "./attention.ts";
 import { acquireFileLease } from "./lease.ts";
 import { safeDisplay } from "./scope.ts";
 
@@ -223,7 +224,7 @@ export function registerHandoffSave(pi: ExtensionAPI, save = createHandoffSaver(
 			const combined = signal ? AbortSignal.any([active.abort.signal, signal]) : active.abort.signal;
 			const operation = save(params, {
 				sessionId: active.id, signal: combined,
-				...(ctx.mode === "tui" && ctx.hasUI ? { confirm: (message: string) => ctx.ui.confirm("Overwrite handoff?", message, { timeout: 60_000, signal: combined }) } : {}),
+				...(ctx.mode === "tui" && ctx.hasUI ? { confirm: async (message: string) => await attendedConfirm(ctx, "Overwrite handoff?", message, { signal: combined }) === "approved" } : {}),
 			});
 			pending.add(operation);
 			try {

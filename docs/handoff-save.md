@@ -52,7 +52,8 @@ or publish the handoff: keep private handoffs out of dotfiles publication separa
 A collision returns `status: "collision"`, `existingSha256` and `suggestedSlug`, without changing
 existing bytes. Select a new slug or explicitly request overwrite; no automatic renaming.
 
-Overwrite requires a fresh 60-second **native TUI confirmation** naming the canonical target,
+Overwrite requires a fresh **native TUI confirmation**, bounded by the shared
+[approval wait](guard.md#attended-approval-dialogs), naming the canonical target,
 old hash, replacement hash and replacement size. RPC/headless overwrite is unavailable. The
 adapter checks the old bytes before the dialog and the helper checks the approved hash again
 under the temporary lease. Cancellation, decline, timeout or a changed target never establishes

@@ -26,7 +26,7 @@ Over the bound, both refuse as too large to verify; declare a narrower folder. A
 
 ## `/grant-folder`
 
-`/grant-folder <paths…>` resolves the folders, shows their canonical identities in a 60-second TUI confirmation and acquires their leases. Like `/grant-file` it is TUI-only, idle-only and unavailable while the guard is disabled. From plan it starts a grant-only implementation scope; in lazy or implement mode it keeps the current worktree intent.
+`/grant-folder <paths…>` resolves the folders, shows their canonical identities in a TUI confirmation with the shared [approval wait](guard.md#attended-approval-dialogs) and acquires their leases. Like `/grant-file` it is TUI-only, idle-only and unavailable while the guard is disabled. From plan it starts a grant-only implementation scope; in lazy or implement mode it keeps the current worktree intent.
 
 A native write beneath a granted folder is checked by a folder-bounded resolver:
 
@@ -64,7 +64,7 @@ It is available in lazy, grant-only and implement sessions. It is refused in pla
 
 ### Dialog
 
-The 60-second native confirmation shows the purpose, the full script and its SHA-256 (or the resolved executable and arguments), the working directory and its repository binding, each declared folder (existing or missing), the nested repositories found inside them (up to 20 listed with their marker kind, plus a count of the rest), flagged lines that delete, overwrite or recursively change permissions, and the deadline. It states that effects are not confined to the declared folders. Approval authorizes exactly that command once; there is no session-wide allowance. Declining or letting the dialog time out runs nothing and takes no lease.
+The native confirmation waits up to 10 minutes ([approval wait](guard.md#attended-approval-dialogs)) and shows the purpose, the full script and its SHA-256 (or the resolved executable and arguments), the working directory and its repository binding, each declared folder (existing or missing), the nested repositories found inside them (up to 20 listed with their marker kind, plus a count of the rest), flagged lines that delete, overwrite or recursively change permissions, and the deadline. It states that effects are not confined to the declared folders. Approval authorizes exactly that command once; there is no session-wide allowance. Declining, letting the dialog expire or cancelling the turn runs nothing and takes no lease.
 
 ### Launch and execution
 
@@ -80,7 +80,7 @@ The command runs in its own process group with stdin closed and `GIT_TERMINAL_PR
 |---|---|
 | `ok` | Exit status 0. |
 | `failed` | Non-zero exit, or the command could not be started. |
-| `declined` | Declined or timed out in the dialog; nothing ran. |
+| `declined` | Declined, expired or cancelled in the dialog; the reason says which. Nothing ran. |
 | `refused` | Refused before running: state, shape, recognizable refusal, contained grant or lease contention. |
 | `stale` | The session, a lease or a displayed fact changed after approval; nothing ran. |
 | `interrupted` | Terminated by cancellation, deadline, lease loss or shutdown; effects are partial or unknown. |

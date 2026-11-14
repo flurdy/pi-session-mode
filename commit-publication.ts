@@ -5,6 +5,7 @@ import { constants } from "node:fs";
 import { access, realpath } from "node:fs/promises";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { Type } from "typebox";
+import { ringTerminalBell } from "./attention.ts";
 import { probeWorktreeLeaseOccupancies, type WorktreeLeaseOccupancy } from "./lease-observer.ts";
 import { OperationReservation } from "./reservation.ts";
 import { safeDisplay } from "./scope.ts";
@@ -466,6 +467,7 @@ export function registerCommitPublication(pi: ExtensionAPI, dependencies: Public
 				const occupancy = await observe(prepared.identity.root).catch(() => [] as WorktreeLeaseOccupancy[]);
 				combined.throwIfAborted();
 				// No timeout: an attended release waits for its answer; only cancellation closes the dialog, and that authorizes nothing.
+				ringTerminalBell(ctx);
 				const choice = await ctx.ui.select(dialog(prepared, occupancyLine(occupancy)), [...CHOICES], { signal: combined });
 				if (session !== active || combined.aborted) throw new Error("Publication session changed during confirmation; nothing was authorized");
 				const { trackingCommit: _tracking, ...identity } = prepared.identity;

@@ -24,7 +24,7 @@ The current contract uses explicit, incrementally growing sets of canonical Git-
 
 Explicit `/implement` paths must identify existing worktree roots or their symlink aliases. Subdirectories are rejected rather than silently broadening to an ancestor. Paths are quoted literals, with no shell execution, variable substitution or glob expansion. File URLs can represent unusual literal characters. The startup string flag `--lease-roots` accepts a JSON array.
 
-`/grant-file` accepts only exact non-repository files after showing the complete bounded canonical set in a fresh TUI confirmation. It is TUI-only (RPC and headless calls are denied), unavailable while the guard is disabled, and expires after 60 seconds. Session identity plus idle/pending-message state are checked again after the dialog. Existing regular files must have exactly one filesystem link. A missing leaf is accepted only beneath an existing canonical directory; missing parents are rejected because native `write` would otherwise create unleased directories. Existing symlink aliases resolve to their targets and share one identity. Directories, hardlinks, dangling links, loops, special nodes, paths beneath `.git`, reserved Git marker names, filesystem-marker-detectable worktree files, and bare or malformed Git-administration shapes fail closed. Git command failure is never evidence that a target is safe non-repository state; independent filesystem marker checks must establish it. Marker-less or externally redirected worktrees cannot be discovered from an ordinary target path and remain outside the guarantee.
+`/grant-file` accepts only exact non-repository files after showing the complete bounded canonical set in a fresh TUI confirmation. It is TUI-only (RPC and headless calls are denied), unavailable while the guard is disabled, and expires after the [approval wait](#attended-approval-dialogs). Session identity plus idle/pending-message state are checked again after the dialog. Existing regular files must have exactly one filesystem link. A missing leaf is accepted only beneath an existing canonical directory; missing parents are rejected because native `write` would otherwise create unleased directories. Existing symlink aliases resolve to their targets and share one identity. Directories, hardlinks, dangling links, loops, special nodes, paths beneath `.git`, reserved Git marker names, filesystem-marker-detectable worktree files, and bare or malformed Git-administration shapes fail closed. Git command failure is never evidence that a target is safe non-repository state; independent filesystem marker checks must establish it. Marker-less or externally redirected worktrees cannot be discovered from an ordinary target path and remain outside the guarantee.
 
 Worktrees and files each have an independent limit of 32. Each combined addition has a ten-second cancellation deadline; cleanup may require draining pending process termination before returning. Confirmation evidence is rebound during acquisition: changed canonical identities fail before any new scope is published.
 
@@ -88,6 +88,30 @@ configuration before a non-force single-ref push. Guarded Bash still blocks raw 
 and recognizable `make`/`gmake` push targets, whose recipes publish whatever tip exists
 when they run. Do not request `/implement` scopes to publish. See
 [attended commit publication](publication.md).
+
+## Attended approval dialogs
+
+Approval dialogs for `/grant-file`, `/grant-folder`, `run_admin`, `activate_pi_package` and
+handoff overwrite share one bounded wait of **10 minutes**, shown as a countdown. This is the time
+the dialog waits for an answer. It is separate from `run_admin`'s `timeoutSeconds` execution deadline.
+Only an explicit approval authorizes anything. Decline, expiry, Esc and turn cancellation all run
+nothing, take no lease and are never retried automatically. Each operation's post-approval
+freshness, session and lease checks still apply, however long the dialog stayed open. Pi reports
+an expiry and a decline the same way, so a dialog that stayed open for the whole bound is labelled
+expired. This label is diagnostic only: a decline in the final moment may read as an expiry.
+Receipt status values are unchanged; only their reason text differs. An open `run_admin` dialog
+keeps its operation reservation, so this session's other scope transitions and attended
+operations report busy until it is answered, expires or the turn is cancelled.
+
+When one of these dialogs, the contention wait offer or the `publish_commit` dialog opens, the
+session writes a single terminal bell (BEL) in interactive TUI mode. The bell carries no title,
+script, path or credential. Whether it becomes a sound or desktop notification depends on the
+terminal. Orca shows one for an unfocused pane when its terminal-bell notification setting is on
+(focused panes are suppressed by default). Pi's `ui_prompt_start` event also lets status
+integrations such as Orca's mark the session as waiting. No bell is written in RPC, JSON or print
+mode, where stdout carries the protocol, or when stdout is not a terminal. There is no reminder
+bell; a missed bell leaves the countdown visible in the session. Nothing detects whether the user
+noticed the signal.
 
 ## Release-state bookkeeping
 
