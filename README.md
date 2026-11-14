@@ -34,14 +34,18 @@ A fresh session or `/new` starts **lazy**, holding no worktree lease. The first 
 | `/implement` | Acquire cwd's worktree if none is held; otherwise keep the current set. |
 | `/implement repos/api repos/web` | Add only those worktree roots, not the workspace root. |
 
-For shell-first repository work, acquire the intended roots explicitly:
+In lazy mode, shell-first repository work needs no `/implement`: a recognized shell mutation
+acquires the worktree of its literal `cd`/`pushd` or `git -C` directory, otherwise the cwd
+([details](docs/guard.md#lazy-implementation-and-release)). A directory without a Git worktree stays
+blocked; use `run_admin`, not an unrelated repository lease, for administration outside worktrees.
+To pre-select roots explicitly:
 
 ```text
 /implement repos/api "repos/web client"
 /leases
 ```
 
-Paths are literal worktree roots, not subdirectories; quote spaces. While no worktree is held, obvious Bash, package, Git, system and writer-subagent mutations remain guarded. Use `run_admin`, not an unrelated lease or a dummy edit, for administration outside held worktrees.
+Paths are literal worktree roots, not subdirectories; quote spaces.
 
 ### Non-Git files and folders
 
@@ -72,7 +76,7 @@ The `leases:N` / `grants:N` statuses and grant widget expose active scopes. See 
 ## Safety and session lifetime
 
 - **Native writes can expand scope without another prompt** in lazy or healthy repository implementation sessions, including linked, nested and sibling repositories. A parent lease does not cover a nested repository. Plan, conflict, lost, unguarded and file-only sessions never auto-expand. Leases prevent cooperating-writer collisions, not wrong-repository targeting.
-- Reads, Beads claims, prose, environment variables, project configuration and arbitrary tools do not acquire leases. Bash/script effects cannot trigger expansion and remain outside native path enforcement.
+- Reads, Beads claims, prose, environment variables, project configuration and arbitrary tools do not acquire leases. Bash triggers acquisition only for lazy shell-first work, never expansion of a held set; its effects remain outside native path enforcement.
 - Failed additions retain healthy held scopes; loss of any lease guards the whole session and releases the combined set. Unavailable explicit roots fail closed. Legacy implicit-cwd non-Git/unavailable sessions can instead be visibly **unguarded**; use lazy, plan or explicit valid roots for protection.
 - Release is explicit, never automatic on tracker close, completion or idle; there is no per-root worktree release. The agent's `release_scopes` tool returns to lazy only after committed, verified work; dirty roots need the user's explicit allowance and reason, and busy transitions refuse release. `/plan` also releases grants.
 - `PI_SESSION_GUARD=0` is the explicit, visibly unguarded emergency bypass. Other editors, machines, trusted extensions and typed `!` / `!!` can bypass the guard. Native preflight is not atomic filesystem isolation.

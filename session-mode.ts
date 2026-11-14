@@ -12,13 +12,13 @@ import { LeaseSet, type HeldScopes, type LeaseSetResult, type ScopeSetRequest } 
 import { probeWorktreeLeaseOccupancies } from "./lease-observer.ts";
 import { inventoryHeldLeases, type LeaseInventory, type LeaseInventoryOptions } from "./lease-inventory.ts";
 import { defaultPackageActivationDependencies, activatePreparedPackage, preparePackageActivation, type PackageActivationEvidence, type PackageActivationLaunchOptions, type PackageActivationRequest, type PreparedPackageActivation } from "./package-activation.ts";
-import { guardedToolBlockReason, implementPushCheck, type ImplementPushCheck } from "./policy.ts";
+import { guardedToolBlockReason, implementPushCheck, lazyShellTargets, type ImplementPushCheck } from "./policy.ts";
 import { APPROVAL_WAIT_MS, attendedConfirm, ringTerminalBell, type ApprovalOutcome, type AttentionSignal } from "./attention.ts";
 import { scopedWriteBlockReason } from "./scoped-policy.ts";
 import { resolveExplicitFiles, resolveExplicitFolders } from "./file-scope.ts";
 import { registerHandoffSave } from "./handoff-save.ts";
 import { publicationWrapperBlockReason, registerCommitPublication } from "./commit-publication.ts";
-import { ADDITION_TIMEOUT_MS, parseRootArguments, parseRootFlag, resolveExplicitRoots, safeDisplay, scopeStatus } from "./scope.ts";
+import { ADDITION_TIMEOUT_MS, parseRootArguments, parseRootFlag, resolveExplicitRoots, resolveWriteRoot, safeDisplay, scopeStatus } from "./scope.ts";
 import { restoreSelection, selectionEntries, selectionFiles, selectionFolders, type Selection, type WorktreeSelection } from "./selection.ts";
 import { verifiedReadOnlySubagents } from "./subagent-policy.ts";
 
@@ -762,7 +762,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		description: "Run one exact bash script or argv command for administrative or installation work outside held worktrees, after a fresh native TUI confirmation that shows the full command, working directory and declared non-Git folders. Single use: the declared folders are leased for coordination, but effects are not confined to them. Refuses Git mutations, publication, remote synchronization and privilege escalation. Returns an admin-run/v1 receipt: ok, failed, declined, refused, stale or interrupted.",
 		promptSnippet: "Run one confirmed administrative script or command outside held worktrees",
 		promptGuidelines: [
-			"Use run_admin for administrative or installation work whose effects fall outside held worktrees, such as migrating or linking files under ~/.agents. Never hand terminal commands back to the user, request an unrelated lease or make a dummy edit instead.",
+			"Use run_admin for administrative or installation work whose effects fall outside held worktrees, such as migrating or linking files under ~/.agents. Never hand terminal commands back to the user or take an unrelated repository lease (by /implement, a native edit or a shell mutation) to run them instead.",
 			"Prefer a short inspectable bash script, and declare every non-Git folder it changes in writes. For repository recipes use argv with cwd set to the clean recipe directory, never make -C.",
 			"Declared run_admin folders may contain copied repositories (backups): they are disclosed in the dialog and refused only while another live session holds one. Declare the real folders; never omit a folder or restructure data to avoid the check.",
 			"The native dialog is the user's approval of exactly that command once. Never retry a refused, stale, failed or interrupted run automatically; report it.",
@@ -918,8 +918,37 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 
 	async function acquireWriteTargets(tool: string, input: unknown, ctx: ExtensionContext): Promise<string | undefined> {
 		if (!NATIVE_WRITE_TOOLS.has(tool) || !acquisitionEligible()) return;
+		return acquireMissingRoots(ctx, "native-write", (missing, signal, unchanged) =>
+			scopedWriteBlockReason(tool, input, ctx.cwd, leases.roots, { files: leases.files, folders: leases.folders, collectMissingRoots: missing, signal, isCurrent: unchanged }));
+	}
+
+	/** A lazy session's recognized shell mutation acquires its target worktrees like a native write. */
+	async function acquireShellTargets(tool: string, input: unknown, ctx: ExtensionContext): Promise<string | undefined> {
+		if (state !== "lazy" || leases.roots.length > 0 || !acquisitionEligible()) return;
+		const targets = lazyShellTargets(tool, input, ctx.cwd);
+		if (!targets) return;
+		return acquireMissingRoots(ctx, "shell", async (missing, signal) => {
+			for (const target of targets) {
+				try { missing.add(await resolveWriteRoot(target, ctx.cwd, signal)); }
+				catch {
+					if (signal.aborted) return "Shell scope acquisition cancelled; nothing ran.";
+					return safeDisplay(`Guarded session: ${JSON.stringify(target)} has no owning Git worktree, so this recognized shell mutation cannot acquire a lease and stays blocked. Use run_admin for administrative work outside repositories.`);
+				}
+			}
+			return undefined;
+		});
+	}
+
+	/**
+	 * Dynamic acquisition shared by native writes and lazy shell mutations: `collect` names the canonical
+	 * roots a call needs; missing ones are added in one transaction with the attended contention wait.
+	 */
+	async function acquireMissingRoots(
+		ctx: ExtensionContext, label: "native-write" | "shell",
+		collect: (missing: Set<string>, signal: AbortSignal, unchanged: () => boolean) => Promise<string | undefined>,
+	): Promise<string | undefined> {
 		if (dynamicAcquisition || releaseOperation || (implementation && current(implementation.generation))) return "Another scope acquisition or release is busy; write blocked.";
-		const operation = Symbol("native-write");
+		const operation = Symbol(label);
 		dynamicAcquisition = operation;
 		const lazy = state === "lazy";
 		const ticket = generation, revision = leases.revision;
@@ -930,9 +959,9 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		const eligible = () => current(ticket) && acquisitionEligible() && !signal.aborted;
 		const unchanged = () => eligible() && leases.revision === revision;
 		try {
-			const reason = await scopedWriteBlockReason(tool, input, ctx.cwd, leases.roots, { files: leases.files, folders: leases.folders, collectMissingRoots: missing, signal, isCurrent: unchanged });
+			const reason = await collect(missing, signal, unchanged);
 			if (reason) return reason;
-			if (!unchanged()) return "Scope changed or tool cancelled during native-write validation; write blocked.";
+			if (!unchanged()) return `Scope changed or tool cancelled during ${label} validation; write blocked.`;
 			if (!missing.size) return;
 			for (const root of missing) {
 				if (leases.files.some((file) => isWithin(file, root))) return `Worktree ${safeDisplay(JSON.stringify(root))} overlaps an exact-file grant; reselect scopes explicitly.`;
@@ -975,7 +1004,8 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 				return safeDisplay(`Dynamic lease acquisition blocked for ${boundedScopeList(roots)}: ${detail.slice(0, 2000)}. ${lazy ? "The session remains lazy with no new worktree lease." : "Existing valid scopes are retained."}`);
 			}
 		} catch (error) {
-			return safeDisplay(`Native-write scope acquisition failed for ${boundedScopeList([...missing])}: ${String(error).slice(0, 2000)}. Write blocked.`);
+			const title = label === "shell" ? "Shell" : "Native-write";
+			return safeDisplay(`${title} scope acquisition failed for ${boundedScopeList([...missing])}: ${String(error).slice(0, 2000)}. Write blocked.`);
 		} finally {
 			if (dynamicAcquisition === operation) dynamicAcquisition = undefined;
 		}
@@ -987,7 +1017,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		if (reservation.holder === "admin run" && NATIVE_WRITE_TOOLS.has(event.toolName)) return { block: true, reason: "An administrative run is active; native writes wait until it finishes." };
 		if (state === "unguarded") return;
 		if (writable()) {
-			const acquisitionReason = await acquireWriteTargets(event.toolName, event.input, ctx);
+			const acquisitionReason = await acquireWriteTargets(event.toolName, event.input, ctx) ?? await acquireShellTargets(event.toolName, event.input, ctx);
 			if (acquisitionReason) return { block: true, reason: acquisitionReason };
 			const ticket = generation, revision = leases.revision;
 			const reason = await scopedWriteBlockReason(event.toolName, event.input, ctx.cwd, leases.roots, { files: leases.files, folders: leases.folders, signal: ctx.signal, isCurrent: () => current(ticket) && writable() && revision === leases.revision });
@@ -1015,9 +1045,9 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	pi.on("before_agent_start", (event) => {
 		if (state === "unguarded") return;
 		const grants = `Exact-file grants: ${boundedScopeList(leases.files)}. Folder grants: ${boundedScopeList(leases.folders)}.`;
-		const common = "Native writes to other non-repository files need explicit /grant-file or /grant-folder confirmation. For administrative or installation work outside held worktrees (for example linking or migrating files under ~/.agents), use run_admin: one native confirmation per exact command, never confined to its declared folders. Never hand terminal commands back to the user, request an unrelated lease or make a dummy edit instead. Shell/script effects are not automatically scoped: never use them as a scope-expansion workaround. Reads, Beads claims, prose and subagent requests do not acquire leases.";
+		const common = "Native writes to other non-repository files need explicit /grant-file or /grant-folder confirmation. For administrative or installation work outside held worktrees (for example linking or migrating files under ~/.agents), use run_admin: one native confirmation per exact command, never confined to its declared folders. Never hand terminal commands back to the user or take an unrelated repository lease (by /implement, a native edit or a shell mutation) to run it instead. Shell/script effects are not automatically scoped: never use them as a scope-expansion workaround. Reads, Beads claims, prose and subagent requests do not acquire leases.";
 		const guidance = state === "lazy" && writable()
-			? `Lazy implementation: no worktree lease is held yet. ${grants} The first native edit/write acquires only its target's canonical Git worktree; do not ask for /implement for that path. Contention or unavailable identity blocks that write and the session stays lazy. ${CONTENTION_GUIDANCE} Until a worktree is held, obvious Bash, package, Git, system and writer-subagent mutations stay guarded; for repository shell-first work ask the user for /implement <root> while idle. ${common}`
+			? `Lazy implementation: no worktree lease is held yet. ${grants} The first native edit/write acquires only its target's canonical Git worktree, and a recognized shell mutation acquires the worktree of its literal cd/pushd or git -C directory, otherwise cwd; do not ask for /implement for these. Contention or unavailable identity blocks that call and the session stays lazy. ${CONTENTION_GUIDANCE} A shell mutation whose directory has no Git worktree stays blocked, as do make push, workspace sync and writer-subagent requests. ${common}`
 			: state === "implement" && leases.live
 			? `Leased worktrees: ${boundedScopeList(leases.roots)}. ${grants} ${leases.roots.length ? `Native edit/write calls can acquire and persist their canonical target worktree leases automatically; do not ask for a redundant /implement command for that supported path. Contention or unavailable identity blocks the write. ${CONTENTION_GUIDANCE} After the task's work is committed and verified, release_scopes returns held worktrees to lazy mode; it refuses dirty worktrees unless the user explicitly allows them.` : "Grant-only sessions cannot auto-acquire worktrees and retain the bounded guarded shell/subagent policy; ask for /implement while idle before repository work."} ${common}`
 			: "[GUARDED SESSION]\nDo not modify source files, Git, package or system state; ask the user to select /implement scopes first. Read-only analysis, safe subagent management and verified direct read-only reviewers are allowed.\nOrdinary local Beads triage means a local mutation in any resolver-proven owning store, not only cwd. Use bd -C <proven directory> for comments, create, update and close without /implement or a worktree lease. If ownership resolution is ambiguous, unavailable or not-found, write nothing; repository-specific tracker rules still win. Beads writes do not acquire source leases.\nVerify effective export, backup and synchronization side effects, not just command syntax or commented config examples. A configured Dolt remote alone does not make a local comment a sync request. Follow the applicable remote/destructive policy separately; /implement alone does not authorize remote or destructive actions. Workspace synchronization uses make beads-sync after fresh explicit confirmation; never synchronize during list, resolver or triage workflows.\nrun_admin and native writes need a writable session: ask the user for /lazy or /implement while idle; never switch modes yourself.";

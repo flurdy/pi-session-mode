@@ -255,10 +255,25 @@ try {
 	assert.deepEqual((await lazy.snapshot()).saved.data, { version: 4, mode: "implement", scope: { kind: "lazy", originCwd: work } });
 	await lazy.send("prompt", { message: "/fixture-reload" });
 	await lazy.roots([]);
-	const shellFirst = await lazy.turn("lazy-shell", [{ name: "bash", arguments: { command: "touch repos/api/shell" } }]);
-	assert.equal(shellFirst[0].isError, true); await absent(join(repos.api, "shell"));
+	const shell = (command) => ({ name: "bash", arguments: { command } });
+	// The fixture base lives under the source checkout's .artifacts, so use a directory with no worktree.
+	const outside = await lazy.turn("lazy-shell-outside", [shell("cd / && touch shell-outside")]);
+	assert.equal(outside[0].isError, true); assert.match(JSON.stringify(outside[0].result), /no owning Git worktree/);
+	await lazy.roots([]); await absent("/shell-outside");
+	await peer.send("prompt", { message: `/implement ${repos.api}` });
+	await peer.roots([repos.api]);
+	const contended = await lazy.turn("lazy-shell-contended", [shell("cd repos/api && touch shell")]);
+	assert.equal(contended[0].isError, true); assert.match(JSON.stringify(contended[0].result), /held by another live session/);
+	await lazy.roots([]); await absent(join(repos.api, "shell"));
+	await peer.send("prompt", { message: "/plan" });
+	await peer.roots([]);
+	const shellFirst = await lazy.turn("lazy-shell", [shell("cd repos/api && touch shell")]);
+	assert.equal(shellFirst[0].isError, false, JSON.stringify(shellFirst));
+	await access(join(repos.api, "shell"));
+	await lazy.roots([repos.api]);
+	assert.deepEqual((await lazy.snapshot()).saved.data.scope.roots, [repos.api]);
 	await lazy.stop();
-	console.log("Lazy RPC PASS: fresh start holds no lease, first native write takes only its member, dirty release refusal, explicit release to v4 lazy, reload stays lazy, shell-first refusal.");
+	console.log("Lazy RPC PASS: fresh start holds no lease, first native write takes only its member, dirty release refusal, explicit release to v4 lazy, reload stays lazy, shell mutation outside worktrees refused, shell-first contention stopped, then shell-first acquisition of its cd target.");
 	if (handoffHome) {
 		const input = handoffRequest("guarded-plan");
 		const saved = receipt((await first.turn("handoff-plan", [input]))[0]);

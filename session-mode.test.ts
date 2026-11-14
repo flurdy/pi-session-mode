@@ -1207,7 +1207,8 @@ test("lazy sessions keep the guarded shell boundary and fixed-destination except
 	assert.match(text, /Lazy implementation: no worktree lease is held yet/);
 	assert.match(text, /first native edit\/write acquires only its target's canonical Git worktree/);
 	assert.match(text, /session stays lazy/);
-	assert.match(text, /\/implement <root>/);
+	assert.match(text, /recognized shell mutation acquires/i);
+	assert.doesNotMatch(text, /dummy edit/);
 	assert.match(text, /save_handoff.*every guard state/);
 	assert.doesNotMatch(text, /GUARDED SESSION/);
 });
@@ -1611,7 +1612,7 @@ test("agent guidance offers run_admin and folder grants instead of terminal hand
 	const lazyContext = realContext([]);
 	await lazy.pi.emit("session_start", lazyContext);
 	const lazyPrompt = await promptOf(lazy.pi, lazyContext);
-	for (const pattern of [/run_admin/, /never hand terminal commands back to the user/i, /\/grant-folder/, /Folder grants: \[\]/, /repository shell-first work/]) assert.match(lazyPrompt, pattern);
+	for (const pattern of [/run_admin/, /never hand terminal commands back to the user/i, /\/grant-folder/, /Folder grants: \[\]/, /recognized shell mutation acquires/i, /unrelated repository lease/]) assert.match(lazyPrompt, pattern);
 	const implement = harness();
 	const implementContext = context();
 	await implement.pi.emit("session_start", implementContext);

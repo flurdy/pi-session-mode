@@ -1,3 +1,6 @@
+import { homedir } from "node:os";
+import { normalizeToolPath } from "./path.ts";
+
 const GUARDED_TOOL_REASONS = new Map<string, string>([
 	["edit", "Guarded session: direct file edits are disabled. Switch to /implement after acquiring the worktree lease."],
 	["write", "Guarded session: direct file writes are disabled. Switch to /implement after acquiring the worktree lease."],
@@ -443,6 +446,57 @@ export function implementPushCheck(toolName: string, input: unknown, depth = 0):
 	const pushes: string[][] = [];
 	hasCommand(command, (words) => { const args = gitPushArgs(words); if (args) pushes.push(args); return false; });
 	return pushes.length ? { kind: "confirm", command, risky: RISKY_PUSH_FORMS.filter(([, matches]) => pushes.flat().some(matches)).map(([form]) => form) } : undefined;
+}
+
+const CHANGE_DIRECTORY = new Set(["cd", "pushd"]);
+
+/**
+ * Directories a command works in, from literal cd/pushd and git -C arguments, tracking cd along the
+ * chain. A word with expansions, globs or `-` cannot be resolved and stands for the session cwd.
+ * A heuristic for choosing which worktree to coordinate, not a confinement of the command's effects.
+ */
+function shellTargetDirectories(command: string, cwd: string, depth = 0): string[] {
+	const targets = new Set<string>();
+	if (depth < MAX_INSPECTION_DEPTH) {
+		for (const payload of constantShellPayloads(command)) for (const dir of shellTargetDirectories(payload, cwd, depth + 1)) targets.add(dir);
+	}
+	let current = cwd;
+	const resolveDirectory = (word: string | undefined) => {
+		if (word === undefined) return homedir();
+		if (word === "-" || /[$`*?[\]{}]/.test(word)) return cwd;
+		try { return normalizeToolPath(word, current); } catch { return cwd; }
+	};
+	const segment: string[] = [];
+	for (const word of [...shellWords(command, true), ";"]) {
+		if (word !== ";") { segment.push(word); continue; }
+		const invoked = invokedCommand(segment);
+		segment.length = 0;
+		if (!invoked) continue;
+		if (CHANGE_DIRECTORY.has(invoked.executable)) {
+			current = resolveDirectory(invoked.args.find((arg) => !/^-[A-Za-z]+$/.test(arg)));
+			targets.add(current);
+		} else if (invoked.executable === "git") {
+			for (let index = 0; index < invoked.args.length; index++) {
+				const arg = invoked.args[index]!;
+				if (arg === "-C") targets.add(resolveDirectory(invoked.args[++index]));
+				else if (GIT_VALUE_OPTIONS.has(arg)) index++;
+				else if (!arg.startsWith("-")) break;
+			}
+		}
+	}
+	return [...targets];
+}
+
+/**
+ * Directories whose worktrees a lazy session acquires for a Bash command the guarded policy blocks
+ * only as an ordinary recognized mutation; undefined when the command is not blocked or keeps a
+ * dedicated refusal (make push, workspace sync, panels, release-state shapes, parallel wrappers).
+ */
+export function lazyShellTargets(toolName: string, input: unknown, cwd: string): string[] | undefined {
+	if (toolName !== "bash" || !isRecord(input) || typeof input.command !== "string") return undefined;
+	if (guardedToolBlockReason(toolName, input) !== GUARDED_MUTATION_REASON || hasCommand(input.command, isWorkspaceSyncCommand)) return undefined;
+	const targets = shellTargetDirectories(input.command, cwd);
+	return targets.length ? targets : [cwd];
 }
 
 function hasCommand(command: string, matches: (words: string[]) => boolean, depth = 0): boolean {

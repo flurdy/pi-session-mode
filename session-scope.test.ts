@@ -659,20 +659,56 @@ test("lazy wrappers acquire every missing member atomically or nothing", async (
 	assert.deepEqual(session.controller.roots, [join(root, "api"), join(root, "web")]);
 }));
 
-test("shell-first work stays guarded in lazy mode until a worktree is actually held", async () => fixture(async (_root, start) => {
+test("a recognized shell mutation in lazy mode acquires its target worktree without /implement", async () => fixture(async (root, start) => {
 	const session = await start({});
-	for (const command of ["git commit -m nope", "touch api/x", "npm install left-pad"]) {
-		assert.equal((await session.tool("bash", { command }))?.block, true, command);
-	}
 	assert.equal(await session.tool("bash", { command: "git status" }), undefined);
 	assert.equal((await session.tool("subagent", { agent: "worker", task: "edit" }))?.block, true);
-	assert.deepEqual(session.acquired, [], "shell and subagent requests never acquire leases");
+	assert.deepEqual(session.acquired, [], "unblocked shell and subagent requests take no lease");
 	const prompt = await session.pi.handlers.get("before_agent_start")?.({ systemPrompt: "base" }, session.ctx);
 	assert.match(prompt.systemPrompt, /Lazy implementation: no worktree lease is held/);
-	assert.match(prompt.systemPrompt, /\/implement <root>/);
-	await session.command("implement", "api");
+	assert.match(prompt.systemPrompt, /recognized shell mutation acquires/i);
+	assert.doesNotMatch(prompt.systemPrompt, /dummy edit/);
+	assert.equal(await session.tool("bash", { command: "cd api && git commit -m allowed" }), undefined);
+	assert.deepEqual(session.controller.roots, [join(root, "api")]);
 	assert.equal(session.controller.state, "implement");
-	assert.equal(await session.tool("bash", { command: "git commit -m allowed" }), undefined);
+	assert.deepEqual(session.pi.entries.at(-1).data.scope, { kind: "roots", roots: [join(root, "api")], originCwd: root });
+	assert.equal(await session.tool("bash", { command: "touch web/x" }), undefined, "once a root is held Bash follows the implement boundary");
+	assert.deepEqual(session.controller.roots, [join(root, "api")], "no further shell acquisition once a root is held");
+}));
+
+test("lazy shell acquisition keeps blocks for non-repository targets, dedicated refusals, contention and plan", async () => fixture(async (root, start) => {
+	const session = await start({});
+	const outside = await session.tool("bash", { command: "cd / && touch x" });
+	assert.equal(outside?.block, true);
+	assert.match(outside.reason, /no owning Git worktree/);
+	assert.match(outside.reason, /run_admin/);
+	const makePush = await session.tool("bash", { command: "cd api && make push" });
+	assert.match(makePush.reason, /publish_commit/);
+	assert.equal((await session.tool("bash", { command: "make beads-sync" }))?.block, true);
+	assert.equal((await session.tool("multi_tool_use.parallel", { tool_uses: [{ recipient_name: "functions.bash", parameters: { command: "touch x" } }] }))?.block, true);
+	assert.deepEqual(session.acquired, [], "refused shell commands take no lease");
+	const holder = await start(); await holder.command("implement", "api");
+	const contended = await session.tool("bash", { command: "cd api && touch x" });
+	assert.equal(contended?.block, true);
+	assert.match(contended.reason, /held by another live session/);
+	assert.match(contended.reason, /remains lazy/);
+	assert.equal(session.controller.state, "lazy");
+	assert.deepEqual(session.controller.roots, []);
+	const plan = await start();
+	assert.equal((await plan.tool("bash", { command: "cd web && touch x" }))?.block, true);
+	assert.deepEqual(plan.acquired, []);
+	await holder.command("plan");
+	assert.equal(await session.tool("bash", { command: "cd api && touch x" }), undefined);
+	assert.deepEqual(session.controller.roots, [join(root, "api")]);
+}));
+
+test("a lazy shell push acquires its worktree and still needs its own confirmation", async () => fixture(async (root, start) => {
+	const session = await start({});
+	session.setConfirm(false);
+	const declined = await session.tool("bash", { command: "git -C web push origin main" });
+	assert.equal(declined?.block, true);
+	assert.match(declined.reason, /push declined; nothing ran/);
+	assert.deepEqual(session.controller.roots, [join(root, "web")]);
 }));
 
 test("release_scopes returns completed member roots to lazy so another session can take them", async () => fixture(async (root, start) => {
@@ -706,7 +742,8 @@ test("lazy intent composes with exact-file grants across release and restoration
 	assert.deepEqual(session.pi.entries.at(-1).data, { version: 4, mode: "implement", scope: { kind: "lazy", originCwd: root }, files: [file] });
 	assert.equal(await session.tool("write", { path: file, content: "{}" }), undefined);
 	assert.deepEqual(session.controller.roots, [], "a granted file needs no worktree");
-	assert.equal((await session.tool("bash", { command: "touch /tmp/outside" }))?.block, true);
+	assert.equal((await session.tool("bash", { command: "cd / && touch tmp/outside" }))?.block, true, "a file grant gives no shell authority outside worktrees");
+	assert.deepEqual(session.controller.roots, []);
 	assert.equal(await session.tool("write", { path: "api/new", content: "x" }), undefined);
 	assert.deepEqual(session.controller.roots, [join(root, "api")]);
 	assert.equal(session.pi.entries.at(-1).data.version, 3);

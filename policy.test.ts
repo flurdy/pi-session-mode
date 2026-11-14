@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { guardedToolBlockReason, implementPushCheck, isObviousMutation } from "./policy.ts";
+import { homedir } from "node:os";
+import { guardedToolBlockReason, implementPushCheck, isObviousMutation, lazyShellTargets } from "./policy.ts";
 
 test("blocks direct writes while leaving reads available", () => {
 	assert.match(guardedToolBlockReason("edit") ?? "", /guarded session/i);
@@ -305,6 +306,43 @@ test("implement-mode push check asks to confirm recognizable raw git pushes and 
 		"bd comments add fixture-1 'git push'",
 	]) assert.equal(bash(command), undefined, command);
 	assert.equal(implementPushCheck("read", { path: "git push" }), undefined);
+});
+
+test("lazy shell mutations target their literal cd, pushd and git -C directories, otherwise cwd", () => {
+	const targets = (command: string) => lazyShellTargets("bash", { command }, "/w");
+	for (const [command, expected] of [
+		["touch x", ["/w"]],
+		["npm install left-pad", ["/w"]],
+		["cd api && touch x", ["/w/api"]],
+		["cd /abs/repo && git commit -m x", ["/abs/repo"]],
+		["cd api && cd sub && touch x", ["/w/api", "/w/api/sub"]],
+		["cd -P api; touch x", ["/w/api"]],
+		["pushd api; touch x", ["/w/api"]],
+		["git -C web add .", ["/w/web"]],
+		["cd api && git -C ../web commit -m x", ["/w/api", "/w/web"]],
+		["bash -c 'cd api && touch x'", ["/w/api"]],
+		['cd "$DIR" && touch x', ["/w"]],
+		["cd $(pwd)/api && touch x", ["/w"]],
+		["cd - && touch x", ["/w"]],
+		["cd && touch x", [homedir()]],
+		["cd ~/repo && touch x", [`${homedir()}/repo`]],
+	] as const) assert.deepEqual(targets(command), expected, command);
+});
+
+test("lazy shell acquisition never applies to unblocked commands or dedicated refusals", () => {
+	for (const command of [
+		"git status",
+		"cd api && ls",
+		"bd comments add fixture-1 'rm file > out'",
+		"make push",
+		"git push && make push",
+		"make beads-sync",
+		"project-workspace beads-sync --workspace .",
+		"~/.agents/skills/second-opinion/scripts/review-panel.sh check --panel focused",
+		"env ~/.agents/skills/release-manager/scripts/release-state update --owner manager --expect missing --patch '{}'",
+	]) assert.equal(lazyShellTargets("bash", { command }, "/w"), undefined, command);
+	assert.equal(lazyShellTargets("multi_tool_use.parallel", { tool_uses: [{ recipient_name: "functions.bash", parameters: { command: "touch x" } }] }, "/w"), undefined);
+	assert.equal(lazyShellTargets("bash", { command: 7 }, "/w"), undefined);
 });
 
 test("implement-mode push check blocks make push recipes and pushes inside parallel wrappers", () => {
