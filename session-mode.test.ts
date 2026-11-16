@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { acquireFolderLease, type FileLeaseResult, type FolderLeaseResult, type HeldWorktreeLease, type WorktreeLeaseResult } from "./lease.ts";
 import type { PackageActivationEvidence, PackageActivationRequest, PreparedPackageActivation } from "./package-activation.ts";
 import { registerSessionMode, type SessionModeDependencies } from "./session-mode.ts";
+import type { DirtySnapshotResult } from "./dirty-snapshot.ts";
 
 type Handler = (event: any, context: any) => unknown;
 
@@ -1291,6 +1292,108 @@ test("release_scopes refuses dirty or unverifiable worktrees unless explicitly a
 	assert.equal(result.details.reason, "user parked WIP");
 	assert.equal(controller.state, "lazy");
 	assert.match(ctx.notifications.map((notice) => notice.message).join("\n"), /Released dirty worktrees \["\/repo"\] on request: user parked WIP/);
+});
+
+const TAKEN_AT = "2026-11-16T09:00:00.000Z";
+const snapshotOf = (entries: string[], root = "/repo"): DirtySnapshotResult => ({ kind: "snapshot", snapshot: { root, entries: [...entries], takenAt: TAKEN_AT } });
+/** A restored implement session whose dirty-state snapshots are scripted: startup first, then each release probe. */
+async function startupHarness(startup: () => Promise<DirtySnapshotResult>, options: { reason?: unknown; entries?: any[] | null; release?: () => Promise<DirtySnapshotResult> } = {}) {
+	const calls: string[] = [];
+	const signals: Array<AbortSignal | undefined> = [];
+	let current: string[] = ["1 .M N... 100644 100644 100644 a a notes.md", "worktree 100644 aa notes.md"];
+	const dirtySnapshot = async (path: string, signal?: AbortSignal) => {
+		calls.push(path); signals.push(signal);
+		return calls.length === 1 ? startup() : options.release ? options.release() : snapshotOf(current);
+	};
+	const { pi, controller } = harness([held()], { dirtySnapshot });
+	const ctx = realContext();
+	const branch = ctx.sessionManager.getBranch();
+	if (options.entries !== null) Object.assign(ctx.sessionManager, { getEntries: () => options.entries ?? branch });
+	await pi.emit("session_start", ctx, { reason: "reason" in options ? options.reason : "startup" });
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	pi.exec = dirtyExec(pi);
+	return { pi, controller, ctx, calls, signals, setCurrent: (entries: string[]) => { current = entries; }, get current() { return current; } };
+}
+
+test("release_scopes releases dirt unchanged since the fresh-startup snapshot without allowDirty", async () => {
+	const run = await startupHarness(async () => snapshotOf(["1 .M N... 100644 100644 100644 a a notes.md", "worktree 100644 aa notes.md"]));
+	const result = await releaseTool(run.pi, run.ctx);
+	assert.deepEqual(run.calls, [run.ctx.cwd, "/repo"], "startup snapshots the cwd worktree; release re-snapshots the held root");
+	assert.deepEqual(result.details.dirty, ["/repo"]);
+	assert.deepEqual(result.details.dirtyEvidence, [{ root: "/repo", verdict: "unchanged-since-startup", entries: 2, snapshotAt: TAKEN_AT }]);
+	assert.equal("reason" in result.details, false);
+	assert.equal(run.controller.state, "lazy");
+	assert.match(run.ctx.notifications.map((notice) => notice.message).join("\n"), /Released worktrees \["\/repo"\] whose uncommitted changes are unchanged since session startup/);
+});
+
+test("release_scopes keeps session-caused, mixed and unverifiable dirt on the explicit override path", async () => {
+	const baseline = ["1 .M N... 100644 100644 100644 a a notes.md", "worktree 100644 aa notes.md"];
+	const cases: Array<[string, (entries: string[]) => string[], RegExp]> = [
+		["new session file", (entries) => [...entries, "? session.ts", "worktree - bb session.ts"], /differ from the session-startup snapshot/],
+		["same file edited further", (entries) => [entries[0]!, "worktree 100644 cc notes.md"], /differ from the session-startup snapshot/],
+		["pre-existing change staged", (entries) => ["1 M. N... 100644 100644 100644 a b notes.md", entries[1]!], /differ from the session-startup snapshot/],
+	];
+	for (const [label, mutate, expected] of cases) {
+		const run = await startupHarness(async () => snapshotOf(baseline));
+		run.setCurrent(mutate(baseline));
+		await assert.rejects(releaseTool(run.pi, run.ctx), (error: Error) => {
+			assert.match(error.message, /Refusing to release dirty worktrees \["\/repo"\]: changes are not proven unchanged since session startup/, label);
+			assert.match(error.message, expected, label);
+			assert.match(error.message, /ask the user whether to release them anyway\. Nothing was released\.$/, label);
+			return true;
+		});
+		assert.equal(run.controller.state, "implement", label);
+		const result = await releaseTool(run.pi, run.ctx, { allowDirty: true, reason: "user confirmed" });
+		assert.deepEqual(result.details.dirtyEvidence, [{ root: "/repo", verdict: "user-override", unproven: "uncommitted changes differ from the session-startup snapshot" }], label);
+		assert.equal(result.details.reason, "user confirmed", label);
+	}
+	const unavailable = await startupHarness(async () => snapshotOf(baseline), { release: async () => ({ kind: "unavailable", reason: "symlinks or special files are changed" }) });
+	await assert.rejects(releaseTool(unavailable.pi, unavailable.ctx), /not proven unchanged since session startup \(symlinks or special files are changed\)/);
+	const failing = await startupHarness(async () => snapshotOf(baseline), { release: async () => { throw new Error("aborted"); } });
+	await assert.rejects(releaseTool(failing.pi, failing.ctx), /Cannot compare "\/repo" with the session-startup snapshot: Error: aborted\. Nothing was released/);
+	const elsewhere = await startupHarness(async () => snapshotOf(baseline, "/other"));
+	await assert.rejects(releaseTool(elsewhere.pi, elsewhere.ctx), /no session-startup snapshot covers this worktree/);
+	assert.equal(elsewhere.controller.state, "implement");
+});
+
+test("only a fresh process startup without history, before any tool or user shell, yields release evidence", async () => {
+	const baseline = ["? notes.md", "worktree - aa notes.md"];
+	const refusal = async (run: Awaited<ReturnType<typeof startupHarness>>, expected: RegExp) => {
+		await assert.rejects(releaseTool(run.pi, run.ctx), expected);
+		assert.equal(run.controller.state, "implement");
+	};
+	for (const reason of ["reload", "new", "resume", "fork", undefined]) {
+		const run = await startupHarness(async () => snapshotOf(baseline), { reason });
+		assert.deepEqual(run.calls, [], "untrusted starts never snapshot");
+		await refusal(run, /not a fresh process startup/);
+	}
+	for (const entries of [[{ type: "message" }], [{ type: "compaction" }], [{ type: "branch_summary" }], [{ type: "custom_message" }], null]) {
+		const run = await startupHarness(async () => snapshotOf(baseline), { entries });
+		await refusal(run, /already had conversation history at startup/);
+	}
+	for (const event of ["tool_execution_start", "user_bash"]) {
+		let finish!: (result: DirtySnapshotResult) => void;
+		const run = await startupHarness(() => new Promise((resolve) => { finish = resolve; }));
+		await refusal(run, /session-startup snapshot had not completed/);
+		await run.pi.emit(event, run.ctx, { toolCallId: "r1", toolName: "read" });
+		finish(snapshotOf(baseline));
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		await refusal(run, /a tool or user shell command started before the session-startup snapshot completed/);
+	}
+	const failed = await startupHarness(async () => { throw new Error("boom"); });
+	await refusal(failed, /the session-startup snapshot failed/);
+	const unavailable = await startupHarness(async () => ({ kind: "unavailable", reason: "unmerged paths are present" }));
+	await refusal(unavailable, /\(unmerged paths are present\)/);
+
+	const later = await startupHarness(async () => snapshotOf(baseline));
+	await later.pi.emit("tool_execution_start", later.ctx, { toolCallId: "r2", toolName: "read" });
+	await later.pi.emit("agent_settled", later.ctx);
+	later.setCurrent(baseline);
+	assert.equal((await releaseTool(later.pi, later.ctx)).details.dirtyEvidence[0].verdict, "unchanged-since-startup", "tools after a completed snapshot do not taint it");
+
+	const pending = await startupHarness(() => new Promise(() => undefined));
+	await pending.pi.emit("session_shutdown", pending.ctx);
+	assert.equal(pending.signals[0]?.aborted, true, "shutdown aborts a running startup snapshot");
 });
 
 test("release_scopes refuses during in-flight writes and its own checks, and blocks writes while releasing", async () => {

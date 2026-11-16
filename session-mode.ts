@@ -21,6 +21,7 @@ import { publicationWrapperBlockReason, registerCommitPublication } from "./comm
 import { ADDITION_TIMEOUT_MS, parseRootArguments, parseRootFlag, resolveExplicitRoots, resolveWriteRoot, safeDisplay, scopeStatus } from "./scope.ts";
 import { restoreSelection, selectionEntries, selectionFiles, selectionFolders, type Selection, type WorktreeSelection } from "./selection.ts";
 import { verifiedReadOnlySubagents } from "./subagent-policy.ts";
+import { captureWorktreeDirtySnapshot, compareDirtySnapshots, type DirtySnapshotResult } from "./dirty-snapshot.ts";
 
 export type SessionMode = "implement" | "plan";
 export type SessionGuardState = "acquiring" | "implement" | "lazy" | "plan" | "implement-blocked" | "lost" | "unguarded";
@@ -45,6 +46,8 @@ export interface SessionModeDependencies {
 	approvalWaitMs?: number;
 	/** Attention signal shown when a session-mode dialog starts waiting for the user. */
 	attention?: AttentionSignal;
+	/** Snapshots the uncommitted state of the worktree owning a path, for evidence-backed dirty release. */
+	dirtySnapshot?(path: string, signal?: AbortSignal): Promise<DirtySnapshotResult>;
 }
 export interface SessionModeController {
 	readonly mode: SessionMode;
@@ -65,6 +68,11 @@ interface Implementation {
 	promise: Promise<void>;
 }
 const NATIVE_WRITE_TOOLS = new Set(["edit", "write", "multi_tool_use.parallel"]);
+/** Entry types showing that an earlier process may already have run agent work in this session. */
+const CONVERSATION_ENTRY_TYPES = new Set(["message", "custom_message", "compaction", "branch_summary"]);
+type DirtyEvidence =
+	| { root: string; verdict: "unchanged-since-startup"; entries: number; snapshotAt: string }
+	| { root: string; verdict: "user-override"; unproven: string };
 const CONTENTION_WAIT = { budgetMs: 5 * 60_000, pollMs: 2_000 };
 const WAIT_OFFER_TIMEOUT_MS = 60_000;
 const CONTENTION_GUIDANCE = "The user may be offered a bounded wait; if the write is still blocked, report it rather than retrying it automatically.";
@@ -121,6 +129,11 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	let packageActivationDrain: Promise<void> | undefined;
 	let releaseOperation: symbol | undefined;
 	const activeWrites = new Set<string>();
+	const dirtySnapshot = dependencies.dirtySnapshot ?? captureWorktreeDirtySnapshot;
+	/** Uncommitted state of the startup cwd worktree, trusted only when captured before any tool ran. */
+	let startupEvidence: DirtySnapshotResult = { kind: "unavailable", reason: "no session-startup snapshot" };
+	let startupCapture: AbortController | undefined;
+	let activityStarted = false;
 	let lastFailure: { requested: readonly string[]; result: LeaseSetResult | string } | undefined;
 	let activationDependencies: ReturnType<typeof defaultPackageActivationDependencies> | undefined;
 	const defaultActivationDependencies = () => activationDependencies ??= defaultPackageActivationDependencies();
@@ -211,6 +224,39 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	function unguarded(ctx: ExtensionContext): void { resetDiscovery(); restoreTools(); setState(ctx, "unguarded"); }
 	function persistSelection(value: Selection): void {
 		for (const entry of selectionEntries(value)) pi.appendEntry("session-mode", entry);
+	}
+	/**
+	 * Snapshots the cwd worktree of a fresh process startup in the background. The result is evidence
+	 * only if no tool or user shell command of this session started before it completed, so it predates
+	 * every session action.
+	 */
+	function beginStartupSnapshot(reason: unknown, ctx: ExtensionContext): void {
+		startupCapture?.abort(); startupCapture = undefined; activityStarted = false;
+		const entries = typeof ctx.sessionManager.getEntries === "function" ? ctx.sessionManager.getEntries() : undefined;
+		const untrusted = reason !== "startup" ? `the session started by ${typeof reason === "string" ? reason : "an unknown event"}, not a fresh process startup`
+			: dependencies.isDisabled() ? "the session guard was disabled at startup"
+			: !entries || entries.some((entry) => CONVERSATION_ENTRY_TYPES.has(entry.type)) ? "the session already had conversation history at startup"
+			: undefined;
+		if (untrusted) { startupEvidence = { kind: "unavailable", reason: untrusted }; return; }
+		startupEvidence = { kind: "unavailable", reason: "the session-startup snapshot had not completed" };
+		const capture = new AbortController();
+		startupCapture = capture;
+		const settle = (result: DirtySnapshotResult) => {
+			if (startupCapture !== capture) return;
+			startupCapture = undefined;
+			startupEvidence = activityStarted ? { kind: "unavailable", reason: "a tool or user shell command started before the session-startup snapshot completed" } : result;
+		};
+		dirtySnapshot(ctx.cwd, capture.signal).then(settle, () => settle({ kind: "unavailable", reason: "the session-startup snapshot failed" }));
+	}
+	/** Proves a dirty root releasable only when its uncommitted state equals the trusted startup snapshot. */
+	async function unchangedSinceStartup(root: string, signal?: AbortSignal): Promise<{ entries: number; snapshotAt: string } | { unproven: string }> {
+		if (startupEvidence.kind !== "snapshot") return { unproven: startupEvidence.reason };
+		const baseline = startupEvidence.snapshot;
+		if (baseline.root !== root) return { unproven: "no session-startup snapshot covers this worktree" };
+		const now = await dirtySnapshot(root, signal);
+		if (now.kind !== "snapshot") return { unproven: now.reason };
+		const comparison = compareDirtySnapshots(baseline, now.snapshot);
+		return comparison.kind === "unchanged" ? { entries: comparison.entries, snapshotAt: baseline.takenAt } : { unproven: comparison.reason };
 	}
 	function current(ticket: number): boolean { return ticket === generation && !shuttingDown; }
 	/** Lazy means implementation intent while no worktree lease is held. */
@@ -693,11 +739,11 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 	pi.registerTool({
 		name: "release_scopes",
 		label: "Release Scopes",
-		description: "Release every held worktree lease and return to lazy implementation intent after the current task's work is committed and verified. Exact-file grants stay held. Refuses dirty worktrees unless allowDirty is true with a reason, refuses while writes, scope transitions or shutdown are active, and changes nothing in plan, conflict, lost, file-only or unguarded sessions.",
+		description: "Release every held worktree lease and return to lazy implementation intent after the current task's work is committed and verified. Exact-file grants stay held. A dirty worktree releases only when its uncommitted changes are byte-identical to the snapshot taken at fresh session startup before any tool ran, or when allowDirty is true with a reason. Refuses while writes, scope transitions or shutdown are active, and changes nothing in plan, conflict, lost, file-only or unguarded sessions.",
 		promptSnippet: "Release completed task worktree leases back to lazy mode",
 		promptGuidelines: [
 			"Use release_scopes only after the task's changes are committed or otherwise verified complete; a tracker close alone is not a reason to release.",
-			"Never set allowDirty on your own: it needs the user's explicit decision and a short reason for leaving uncommitted changes unprotected.",
+			"Never set allowDirty on your own: it needs the user's explicit decision and a short reason for leaving uncommitted changes unprotected. Call without it first; changes proven unchanged since session startup release without asking.",
 			"A release_scopes refusal keeps every lease held; report it instead of retrying or working around it.",
 		],
 		executionMode: "sequential",
@@ -731,7 +777,19 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 					if (status?.code !== 0) refuse(`Cannot check ${JSON.stringify(root)} for uncommitted changes (git exited ${String(status?.code)}).`);
 					if (status?.stdout.trim()) dirty.push(root);
 				}
-				if (dirty.length && !allowDirty) refuse(`Refusing to release dirty worktrees ${boundedScopeList(dirty)}. Commit or stash first, or ask the user whether to release them anyway.`);
+				const evidence: DirtyEvidence[] = [];
+				for (const root of dirty) {
+					let proof: Awaited<ReturnType<typeof unchangedSinceStartup>> | undefined;
+					try { proof = await unchangedSinceStartup(root, signal); }
+					catch (error) { refuse(`Cannot compare ${JSON.stringify(root)} with the session-startup snapshot: ${String(error)}.`); }
+					if (!unchanged() || !proof) refuse("Scopes changed or the release was cancelled during checks.");
+					else evidence.push("unproven" in proof ? { root, verdict: "user-override", unproven: proof.unproven } : { root, verdict: "unchanged-since-startup", ...proof });
+				}
+				const overridden = evidence.flatMap((item) => item.verdict === "user-override" ? [item] : []);
+				if (overridden.length && !allowDirty) {
+					const reasons = [...new Set(overridden.map((item) => item.unproven))].join("; ").slice(0, 1000);
+					refuse(`Refusing to release dirty worktrees ${boundedScopeList(overridden.map((item) => item.root))}: changes are not proven unchanged since session startup (${reasons}). Commit or stash first, or ask the user whether to release them anyway.`);
+				}
 				const originCwd = await realpath(ctx.cwd);
 				if (!unchanged()) refuse("Scopes changed or the release was cancelled during checks.");
 				const releaseTicket = ++generation;
@@ -746,9 +804,11 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 				try { persistSelection(selection); } catch { checkpoint = "failed"; }
 				setState(ctx, activeState());
 				void refreshReadOnlySubagents(ctx).catch(() => {});
-				if (dirty.length) notify(ctx, `Released dirty worktrees ${boundedScopeList(dirty)} on request: ${reason}`, "warning");
+				const cleared = evidence.flatMap((item) => item.verdict === "unchanged-since-startup" ? [item.root] : []);
+				if (cleared.length) notify(ctx, `Released worktrees ${boundedScopeList(cleared)} whose uncommitted changes are unchanged since session startup.`, "info");
+				if (overridden.length) notify(ctx, `Released dirty worktrees ${boundedScopeList(overridden.map((item) => item.root))} on request: ${reason}`, "warning");
 				if (checkpoint === "failed") notify(ctx, "Worktree leases were released, but lazy mode could not be saved; use --lazy when restarting.", "error");
-				const details = { status: "released", released: roots, dirty, ...(dirty.length ? { reason } : {}), files: leases.files, folders: leases.folders, checkpoint };
+				const details = { status: "released", released: roots, dirty, ...(dirty.length ? { dirtyEvidence: evidence } : {}), ...(overridden.length ? { reason } : {}), files: leases.files, folders: leases.folders, checkpoint };
 				return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details };
 			} finally {
 				if (releaseOperation === operation) releaseOperation = undefined;
@@ -1035,7 +1095,11 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		const reason = guardedToolBlockReason(event.toolName, event.input, { readOnlySubagents });
 		if (reason) return { block: true, reason };
 	});
-	pi.on("tool_execution_start", (event) => { if (NATIVE_WRITE_TOOLS.has(event.toolName)) activeWrites.add(event.toolCallId); });
+	pi.on("user_bash", () => { activityStarted = true; });
+	pi.on("tool_execution_start", (event) => {
+		activityStarted = true;
+		if (NATIVE_WRITE_TOOLS.has(event.toolName)) activeWrites.add(event.toolCallId);
+	});
 	pi.on("tool_execution_end", (event) => { activeWrites.delete(event.toolCallId); });
 	pi.on("agent_settled", () => { activeWrites.clear(); });
 	pi.on("model_select", (event, ctx) => {
@@ -1049,12 +1113,13 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		const guidance = state === "lazy" && writable()
 			? `Lazy implementation: no worktree lease is held yet. ${grants} The first native edit/write acquires only its target's canonical Git worktree, and a recognized shell mutation acquires the worktree of its literal cd/pushd or git -C directory, otherwise cwd; do not ask for /implement for these. Contention or unavailable identity blocks that call and the session stays lazy. ${CONTENTION_GUIDANCE} A shell mutation whose directory has no Git worktree stays blocked, as do make push, workspace sync and writer-subagent requests. ${common}`
 			: state === "implement" && leases.live
-			? `Leased worktrees: ${boundedScopeList(leases.roots)}. ${grants} ${leases.roots.length ? `Native edit/write calls can acquire and persist their canonical target worktree leases automatically; do not ask for a redundant /implement command for that supported path. Contention or unavailable identity blocks the write. ${CONTENTION_GUIDANCE} After the task's work is committed and verified, release_scopes returns held worktrees to lazy mode; it refuses dirty worktrees unless the user explicitly allows them.` : "Grant-only sessions cannot auto-acquire worktrees and retain the bounded guarded shell/subagent policy; ask for /implement while idle before repository work."} ${common}`
+			? `Leased worktrees: ${boundedScopeList(leases.roots)}. ${grants} ${leases.roots.length ? `Native edit/write calls can acquire and persist their canonical target worktree leases automatically; do not ask for a redundant /implement command for that supported path. Contention or unavailable identity blocks the write. ${CONTENTION_GUIDANCE} After the task's work is committed and verified, release_scopes returns held worktrees to lazy mode; it refuses dirty worktrees unless their changes are proven unchanged since session startup or the user explicitly allows them.` : "Grant-only sessions cannot auto-acquire worktrees and retain the bounded guarded shell/subagent policy; ask for /implement while idle before repository work."} ${common}`
 			: "[GUARDED SESSION]\nDo not modify source files, Git, package or system state; ask the user to select /implement scopes first. Read-only analysis, safe subagent management and verified direct read-only reviewers are allowed.\nOrdinary local Beads triage means a local mutation in any resolver-proven owning store, not only cwd. Use bd -C <proven directory> for comments, create, update and close without /implement or a worktree lease. If ownership resolution is ambiguous, unavailable or not-found, write nothing; repository-specific tracker rules still win. Beads writes do not acquire source leases.\nVerify effective export, backup and synchronization side effects, not just command syntax or commented config examples. A configured Dolt remote alone does not make a local comment a sync request. Follow the applicable remote/destructive policy separately; /implement alone does not authorize remote or destructive actions. Workspace synchronization uses make beads-sync after fresh explicit confirmation; never synchronize during list, resolver or triage workflows.\nrun_admin and native writes need a writable session: ask the user for /lazy or /implement while idle; never switch modes yourself.";
 		return { systemPrompt: `${event.systemPrompt}\n\n${guidance}\nException: save_handoff is a dedicated, fixed-destination handoff save operation available in every guard state without repository leases or /grant-file. Use it for wrap-up; it grants no native write or shell authority. Never substitute a Bash helper when this tool is missing or fails.\nException: publish_commit is the attended exact-commit publication tool, available in every guard state without a source lease. Each push needs its own fresh native confirmation; never ask for /implement to publish, and never fall back to Bash or make pushes when it is missing or refuses.` };
 	});
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
 		publication.sessionStart(ctx);
+		beginStartupSnapshot((event as { reason?: unknown } | undefined)?.reason, ctx);
 		generation++; currentContext = ctx; shuttingDown = false; state = "acquiring"; activeWrites.clear();
 		const restored = restoreSelection(ctx.sessionManager.getBranch());
 		selection = restored?.selection ?? { mode: "plan" };
@@ -1086,6 +1151,7 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		shuttingDown = true; generation++; guardTools();
 		adminRun?.abort.abort("session shutdown");
 		contentionWait?.abort("session shutdown");
+		startupCapture?.abort("session shutdown"); startupCapture = undefined;
 		await Promise.all([packageActivationDrain, publication.sessionShutdown(), adminRun?.done]);
 		await leases.releaseAll();
 		resetDiscovery(); restoreTools();

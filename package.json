@@ -26,6 +26,7 @@
     "admin-run.ts",
     "attention.ts",
     "commit-publication.ts",
+    "dirty-snapshot.ts",
     "docs/admin-runs.md",
     "docs/guard.md",
     "docs/handoff-save.md",
