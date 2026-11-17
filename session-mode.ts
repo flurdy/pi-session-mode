@@ -40,8 +40,8 @@ export interface SessionModeDependencies {
 	readOnlySubagents(cwd: string, preferredProvider?: string): Promise<ReadonlySet<string>>;
 	packageActivation?: PackageActivationAdapter;
 	inventory?(options: LeaseInventoryOptions): Promise<LeaseInventory>;
-	/** Bound and retry interval of the attended wait offered after native-write contention. */
-	contentionWait?: { budgetMs: number; pollMs: number };
+	/** Wait bounds offered after native-write contention (the first is the default) and the minimum retry interval. */
+	contentionWait?: { budgetsMs: readonly number[]; pollMs: number };
 	/** How long attended approval dialogs wait for an answer before expiring. */
 	approvalWaitMs?: number;
 	/** Attention signal shown when a session-mode dialog starts waiting for the user. */
@@ -73,12 +73,19 @@ const CONVERSATION_ENTRY_TYPES = new Set(["message", "custom_message", "compacti
 type DirtyEvidence =
 	| { root: string; verdict: "unchanged-since-startup"; entries: number; snapshotAt: string }
 	| { root: string; verdict: "user-override"; unproven: string };
-const CONTENTION_WAIT = { budgetMs: 5 * 60_000, pollMs: 2_000 };
+const CONTENTION_WAIT = { budgetsMs: [5 * 60_000, 30 * 60_000, 8 * 3_600_000], pollMs: 2_000 };
+const CONTENTION_ATTEMPTS = 150, MAX_CONTENTION_POLL_MS = 30_000;
+/** Retry spacing: about 150 attempts per budget, never below `minPollMs` nor above 30 seconds. */
+export function contentionPollMs(budgetMs: number, minPollMs: number): number {
+	return Math.max(minPollMs, Math.min(MAX_CONTENTION_POLL_MS, Math.round(budgetMs / CONTENTION_ATTEMPTS)));
+}
 const WAIT_OFFER_TIMEOUT_MS = 60_000;
 const CONTENTION_GUIDANCE = "The user may be offered a bounded wait; if the write is still blocked, report it rather than retrying it automatically.";
 function clock(ms: number): string {
 	const seconds = Math.max(0, Math.ceil(ms / 1000));
-	return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+	const pad = (value: number) => String(value).padStart(2, "0");
+	if (seconds < 3600) return `${Math.floor(seconds / 60)}:${pad(seconds % 60)}`;
+	return `${Math.floor(seconds / 3600)}:${pad(Math.floor(seconds / 60) % 60)}:${pad(seconds % 60)}`;
 }
 const STATE_META: Record<SessionGuardState, { label: string; tone: "success" | "warning" | "error" }> = {
 	acquiring: { label: "acquiring", tone: "warning" },
@@ -928,7 +935,8 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		try { ctx.ui.setWorkingMessage(message); } catch { /* Progress rendering is not an authority boundary. */ }
 	}
 	/**
-	 * Offer one attended, bounded wait after native-write contention. Each retry is the ordinary
+	 * Offer one attended wait, bounded by the duration chosen for this occurrence, after native-write
+	 * contention. Each retry is the ordinary
 	 * nonblocking acquisition with its own deadline and identity checks; nothing is queued, reserved
 	 * or stolen, and any result other than worktree contention ends the wait. Returns undefined when
 	 * no dialog can be shown; otherwise keeps the latest result and any reason the wait ended.
@@ -938,20 +946,24 @@ export function registerSessionMode(pi: ExtensionAPI, dependencies: SessionModeD
 		still: () => boolean, track: (signal: AbortSignal) => void,
 	): Promise<{ result: LeaseSetResult; reason?: string } | undefined> {
 		if (!ctx.hasUI || typeof ctx.ui.select !== "function") return undefined;
-		const { budgetMs, pollMs } = dependencies.contentionWait ?? CONTENTION_WAIT;
+		const { budgetsMs, pollMs: minPollMs } = dependencies.contentionWait ?? CONTENTION_WAIT;
 		const stop = new AbortController();
 		contentionWait = stop;
 		const turn = ctx.signal ? AbortSignal.any([ctx.signal, stop.signal]) : stop.signal;
 		// The attended phase replaces the ten-second preflight deadline; each retry keeps its own.
 		track(turn);
-		const wait = `Wait up to ${clock(budgetMs)} (Esc cancels)`;
+		const waits = budgetsMs.map((budget, index) => `Wait up to ${clock(budget)}${index === 0 ? " (default)" : ""}`);
 		try {
 			let choice: string | undefined;
 			try {
 				(dependencies.attention ?? ringTerminalBell)(ctx);
-				choice = await ctx.ui.select(`Worktree ${safeDisplay(JSON.stringify(initial.root))} is held by another live session. Wait for all requested worktrees?`, [wait, "Stop: block this write"], { timeout: WAIT_OFFER_TIMEOUT_MS, signal: turn });
+				choice = await ctx.ui.select(
+					`Worktree ${safeDisplay(JSON.stringify(initial.root))} is held by another live session. Wait for all requested worktrees? If they free up in time, this write proceeds without asking again, even while you are away. Esc cancels the wait.`,
+					[...waits, "Stop: block this write"], { timeout: WAIT_OFFER_TIMEOUT_MS, signal: turn });
 			} catch { choice = undefined; }
-			if (choice !== wait) return { result: initial, reason: "the offered wait was not accepted" };
+			const selected = choice === undefined ? -1 : waits.indexOf(choice);
+			if (selected < 0) return { result: initial, reason: "the offered wait was not accepted" };
+			const budgetMs = budgetsMs[selected], pollMs = contentionPollMs(budgetMs, minPollMs);
 			const budget = AbortSignal.timeout(budgetMs), deadline = Date.now() + budgetMs;
 			const waiting = AbortSignal.any([turn, budget]);
 			track(waiting);

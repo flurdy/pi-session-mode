@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { acquireFileLease, acquireWorktreeLease, lockIdentity } from "./lease.ts";
-import { registerSessionMode } from "./session-mode.ts";
+import { contentionPollMs, registerSessionMode } from "./session-mode.ts";
 import { ADDITION_TIMEOUT_MS } from "./scope.ts";
 
 type Handler = (event: any, ctx: any) => any;
@@ -49,7 +49,7 @@ async function fixture(run: (root: string, start: (flags?: Record<string, unknow
 			const widgets = new Map<string, string[] | undefined>();
 			const notices: string[] = [], acquired: string[] = [], acquiredFiles: string[] = [], confirmations: string[] = [];
 			const selections: ({ title: string; options: string[] } & DialogOptions)[] = [], workingMessages: (string | undefined)[] = [];
-			const waitTiming = { budgetMs: 2000, pollMs: 10 };
+			const waitTiming = { budgetsMs: [2000, 120_000, 240_000], pollMs: 10 };
 			let confirmResult = true, confirmationHook: () => void | Promise<void> = () => {}, idle = true, pendingMessages = false;
 			let acquireHook: (path: string, signal?: AbortSignal) => void | Promise<void> = () => {};
 			let disabled = false;
@@ -73,7 +73,11 @@ async function fixture(run: (root: string, start: (flags?: Record<string, unknow
 						return choose(title, options, opts);
 					});
 				},
-				setWaitTiming: (timing: Partial<typeof waitTiming>) => Object.assign(waitTiming, timing),
+				/** `budgetMs` replaces the default (first) budget; `budgetsMs` replaces every offered choice. */
+				setWaitTiming: ({ budgetMs, ...timing }: Partial<typeof waitTiming> & { budgetMs?: number }) => {
+					Object.assign(waitTiming, timing);
+					if (budgetMs !== undefined) waitTiming.budgetsMs = [budgetMs, ...waitTiming.budgetsMs.slice(1)];
+				},
 				setConfirm: (value: boolean) => { confirmResult = value; },
 				setAcquireHook: (hook: typeof acquireHook) => { acquireHook = hook; },
 				setDisabled: (value: boolean) => { disabled = value; },
@@ -785,7 +789,8 @@ test("an accepted contention wait acquires the released worktree, then allows th
 	assert.equal(session.selections.length, 1);
 	const [offer] = session.selections;
 	assert.match(offer.title, /api.*held by another live session/);
-	assert.deepEqual(offer.options.map((option: string) => option.split(" ")[0]), ["Wait", "Stop:"]);
+	assert.match(offer.title, /proceeds without asking again/);
+	assert.deepEqual(offer.options, ["Wait up to 0:05 (default)", "Wait up to 2:00", "Wait up to 4:00", "Stop: block this write"]);
 	assert.equal(offer.timeout, 60_000); assert.ok(offer.signal);
 	assert.equal(session.controller.state, "lazy", "waiting changes no state");
 	assert.deepEqual(session.pi.entries, []);
@@ -805,7 +810,7 @@ test("an accepted contention wait acquires the released worktree, then allows th
 test("declined, dismissed and dialog-less contention blocks at once without retrying", async () => fixture(async (_root, start) => {
 	const holder = await start(); await holder.command("implement", "api");
 	const session = await start({});
-	for (const [answer, label] of [[choose(STOP), "stop"], [async () => undefined, "dismissed"]] as const) {
+	for (const [answer, label] of [[choose(STOP), "stop"], [async () => undefined, "dismissed"], [async () => "Wait up to 8:00:00", "unoffered answer"]] as const) {
 		session.setSelect(answer);
 		const attempts = session.acquired.length;
 		const blocked = await session.tool("write", { path: "api/new", content: label });
@@ -813,12 +818,12 @@ test("declined, dismissed and dialog-less contention blocks at once without retr
 		assert.match(blocked.reason, /held by another live session \(the offered wait was not accepted\)/, label);
 		assert.equal(session.acquired.length, attempts + 1, `${label} makes no retry`);
 	}
-	assert.equal(session.selections.length, 2);
+	assert.equal(session.selections.length, 3);
 	session.setSelect(choose(WAIT));
 	session.ctx.hasUI = false;
 	const headless = await session.tool("write", { path: "api/new", content: "z" });
 	assert.equal(headless?.block, true); assert.doesNotMatch(headless.reason, /offered wait/);
-	assert.equal(session.selections.length, 2, "headless sessions are never offered a wait");
+	assert.equal(session.selections.length, 3, "headless sessions are never offered a wait");
 	assert.equal(session.controller.state, "lazy");
 	assert.deepEqual(session.controller.roots, []);
 	assert.deepEqual(session.pi.entries, []);
@@ -844,10 +849,57 @@ test("an unreleased worktree ends the wait at its bound and leaves the holder un
 	await stillHeld(root, join(root, "api"));
 }));
 
+test("the offer lists the production durations with five minutes first and Stop last", async () => fixture(async (_root, start) => {
+	const holder = await start(); await holder.command("implement", "api");
+	const session = await start({});
+	session.setWaitTiming({ budgetsMs: [5 * 60_000, 30 * 60_000, 8 * 3_600_000] });
+	session.setSelect(choose(STOP));
+	assert.equal((await session.tool("write", { path: "api/new", content: "x" }))?.block, true);
+	assert.deepEqual(session.selections[0].options,
+		["Wait up to 5:00 (default)", "Wait up to 30:00", "Wait up to 8:00:00", "Stop: block this write"]);
+}));
+
+test("a longer selected wait outlasts the default bound and drives the countdown", async () => fixture(async (root, start) => {
+	const holder = await start(); await holder.command("implement", "api");
+	const session = await start({});
+	session.setWaitTiming({ budgetsMs: [100, 1500], pollMs: 10 });
+	session.setSelect(choose(/^Wait up to 0:02$/));
+	let settled = false;
+	const pending = session.tool("write", { path: "api/new", content: "x" }).finally(() => { settled = true; });
+	await delay(400);
+	assert.equal(settled, false, "the longer choice keeps waiting past the default bound");
+	assert.ok(session.workingMessages.some((message: string | undefined) => message === "Waiting for worktree lease api: 0:02 left. Esc cancels."));
+	await holder.command("plan");
+	assert.equal(await pending, undefined);
+	assert.deepEqual(session.controller.roots, [join(root, "api")]);
+	await stillHeld(root, join(root, "api"));
+}));
+
+test("the selected budget, not the default, bounds an unreleased wait", async () => fixture(async (root, start) => {
+	const holder = await start(); await holder.command("implement", "api");
+	const session = await start({});
+	session.setWaitTiming({ budgetsMs: [50, 400], pollMs: 10 });
+	session.setSelect(choose(/^Wait up to 0:01$/));
+	const began = Date.now();
+	const blocked = await session.tool("write", { path: "api/new", content: "x" });
+	assert.equal(blocked?.block, true);
+	assert.match(blocked.reason, /held by another live session \(waited 0:01 without acquiring all requested worktrees\)/);
+	assert.ok(Date.now() - began >= 400, "the default 50 ms bound did not end the wait");
+	assert.deepEqual(session.controller.roots, []);
+	assert.deepEqual(holder.controller.roots, [join(root, "api")]);
+}));
+
+test("retry spacing grows with the selected budget and stays bounded", () => {
+	assert.equal(contentionPollMs(5 * 60_000, 2_000), 2_000, "the default keeps its two-second cadence");
+	assert.equal(contentionPollMs(30 * 60_000, 2_000), 12_000);
+	assert.equal(contentionPollMs(8 * 3_600_000, 2_000), 30_000);
+	assert.equal(contentionPollMs(100, 10), 10);
+});
+
 test("turn cancellation and shutdown end a wait or an open offer promptly", async () => fixture(async (root, start) => {
 	const holder = await start(); await holder.command("implement", "api");
 	const session = await start({});
-	session.setSelect(choose(WAIT));
+	session.setSelect(choose(/^Wait up to 4:00$/));
 	session.setWaitTiming({ budgetMs: 60_000, pollMs: 50 });
 	const turn = new AbortController(); session.ctx.signal = turn.signal;
 	const pending = session.tool("write", { path: "api/new", content: "x" });

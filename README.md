@@ -23,7 +23,7 @@ Or, from a reviewed mutable checkout, run `make apply` to manage `~/.pi/agent/ex
 
 ## Everyday use
 
-A fresh session or `/new` starts **lazy**, holding no worktree lease. The first native `edit`/`write` acquires its target's canonical worktree. Contention blocks the write, with an optional attended wait of up to five minutes; there is no automatic retry after refusal.
+A fresh session or `/new` starts **lazy**, holding no worktree lease. The first native `edit`/`write` acquires its target's canonical worktree. Contention blocks the write, with an optional attended wait of up to five minutes (default), 30 minutes or eight hours, chosen each time; there is no automatic retry after refusal.
 
 ### Modes and repository work
 
