@@ -14,6 +14,7 @@ const MAX_BYTES = 65_536;
 const HELPER_SHA256 = "776cdd5663a0b8af563b7e86c0285ae39ed553f5cae0306a0c7aa16bcd601750";
 const STORAGE_PARENT = ".agents";
 const LEGACY_STORAGE = join(".claude", "handoffs");
+const GIT_TIMEOUT_MS = 5000;
 const SHA256 = /^[0-9a-f]{64}$/;
 const SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 export interface HandoffRequest { date: string; time: string; slug: string; content: string; overwriteSha256?: string }
@@ -28,7 +29,8 @@ export interface HandoffResult {
 	suggestedSlug?: string;
 }
 interface SaveContext { sessionId: string; signal?: AbortSignal; confirm?: (message: string) => Promise<boolean> }
-interface Dependencies { home: string; acquire: typeof acquireFileLease; run?: typeof runHelper }
+interface Dependencies { home: string; acquire: typeof acquireFileLease; run?: typeof runHelper; gitCommand?: string; gitTimeoutMs?: number }
+interface GitProbe { command: string; timeoutMs: number }
 const digest = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
 
 function validate(input: HandoffRequest): HandoffRequest {
@@ -44,19 +46,66 @@ function validate(input: HandoffRequest): HandoffRequest {
 	return { ...input };
 }
 
+async function marked(directory: string, marker: string): Promise<boolean> {
+	try { await lstat(join(directory, marker)); return true; }
+	catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+}
+
+/** Walks from a directory under home up to home itself; ancestors above home have their own rule. */
 async function assertHandoffDirectory(directory: string, home: string, signal?: AbortSignal): Promise<void> {
 	while (true) {
 		signal?.throwIfAborted();
 		if (basename(directory) === ".git") throw new Error("Handoff directory overlaps Git administration");
 		for (const marker of [".git", "HEAD", "objects", "refs"]) {
 			if (marker === ".git" && (directory === home || directory === join(home, STORAGE_PARENT))) continue;
-			try { await lstat(join(directory, marker)); }
-			catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
-			throw new Error("Handoff directory overlaps Git administration or an unsupported repository");
+			if (await marked(directory, marker)) throw new Error("Handoff directory overlaps Git administration or an unsupported repository");
 		}
 		const parent = dirname(directory);
-		if (parent === directory) return;
+		if (directory === home || parent === directory) return;
 		directory = parent;
+	}
+}
+
+function runGit(probe: GitProbe, args: string[], cwd: string, home: string, signal?: AbortSignal): Promise<{ code: number | null; stdout: string; unavailable?: string }> {
+	return new Promise((resolve) => {
+		// Fixed argv and a fixed environment: caller Git overrides (GIT_DIR, GIT_WORK_TREE, config) never redirect the verdict.
+		// Reading the index must not run a repository-configured fsmonitor command; the trailing -c wins over every config file.
+		const child = execFile(probe.command, ["-c", "core.fsmonitor=false", ...args], { cwd, env: { HOME: home, PATH: process.env.PATH, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" }, timeout: probe.timeoutMs, maxBuffer: 16_384, encoding: "utf8", windowsHide: true, ...(signal ? { signal } : {}) }, (error, stdout) => {
+			if (error && (error.killed || typeof error.code !== "number")) resolve({ code: null, stdout: "", unavailable: error.killed ? "timed out" : "could not be started" });
+			else resolve({ code: child.exitCode, stdout });
+		});
+	});
+}
+
+/**
+ * A repository enclosing home may stay only when it ignores the handoffs directory (covering the helper's temporary and
+ * recovery files) and the exact target (so a tracked handoff is refused); anything unverifiable fails closed.
+ */
+async function assertIgnoredByEnclosingRepository(repository: string, target: string, home: string, probe: GitProbe, signal?: AbortSignal): Promise<void> {
+	const toplevel = await runGit(probe, ["rev-parse", "--show-toplevel"], repository, home, signal);
+	signal?.throwIfAborted();
+	if (toplevel.unavailable) throw new Error(`Git ${toplevel.unavailable} while checking the repository enclosing the handoff home; nothing was saved`);
+	let root: string | undefined;
+	if (toplevel.code === 0) { try { root = await realpath(toplevel.stdout.replace(/\n$/, "")); } catch { root = undefined; } }
+	if (root !== repository) throw new Error("Git repository enclosing the handoff home could not be verified; nothing was saved");
+	for (const path of [dirname(target), target]) {
+		const ignored = await runGit(probe, ["check-ignore", "-q", "--", path], repository, home, signal);
+		signal?.throwIfAborted();
+		if (ignored.unavailable) throw new Error(`Git ${ignored.unavailable} while checking whether the enclosing repository ignores the handoff; nothing was saved`);
+		if (ignored.code === 1) throw new Error(`Git repository enclosing the handoff home does not ignore ${safeDisplay(JSON.stringify(path))}; nothing was saved`);
+		if (ignored.code !== 0) throw new Error("Git check-ignore failed for the repository enclosing the handoff home; nothing was saved");
+	}
+}
+
+async function assertAncestorsAboveHome(home: string, target: string, probe: GitProbe, signal?: AbortSignal): Promise<void> {
+	for (let directory = dirname(home); ; directory = dirname(directory)) {
+		signal?.throwIfAborted();
+		if (basename(directory) === ".git") throw new Error("Handoff home overlaps Git administration");
+		for (const marker of ["HEAD", "objects", "refs"]) {
+			if (await marked(directory, marker)) throw new Error("Handoff home is nested inside Git administration or a bare repository");
+		}
+		if (await marked(directory, ".git")) await assertIgnoredByEnclosingRepository(directory, target, home, probe, signal);
+		if (dirname(directory) === directory) return;
 	}
 }
 
@@ -75,9 +124,11 @@ async function assertMigrated(home: string): Promise<void> {
 	throw new Error(`Handoff storage migration-required: ~/${LEGACY_STORAGE} still exists; complete the approved move to ~/${STORAGE_PARENT}/handoffs before saving`);
 }
 
-async function directory(home: string, signal?: AbortSignal): Promise<string> {
+async function directory(home: string, name: string, probe: GitProbe, signal?: AbortSignal): Promise<string> {
 	if (await realpath(home) !== home) throw new Error("Handoff home identity changed");
 	await assertMigrated(home);
+	// Decided before any directory is created, lease taken or helper launched.
+	await assertAncestorsAboveHome(home, join(home, STORAGE_PARENT, "handoffs", name), probe, signal);
 	await assertHandoffDirectory(home, home, signal);
 	// ~/.agents already holds the reviewed helper; only the handoffs directory itself may be created.
 	const parent = join(home, STORAGE_PARENT);
@@ -110,8 +161,8 @@ async function targetBytes(path: string): Promise<Buffer> {
 	} finally { await file.close(); }
 }
 
-async function assertTarget(path: string, home: string, signal?: AbortSignal): Promise<void> {
-	if (dirname(path) !== await directory(home, signal)) throw new Error("Handoff target identity changed");
+async function assertTarget(path: string, home: string, probe: GitProbe, signal?: AbortSignal): Promise<void> {
+	if (dirname(path) !== await directory(home, basename(path), probe, signal)) throw new Error("Handoff target identity changed");
 	try {
 		const info = await lstat(path);
 		if (info.isSymbolicLink()) throw new Error("Symlink handoff target refused");
@@ -139,15 +190,17 @@ export function createHandoffSaver(dependencies: Dependencies = { home: homedir(
 	// Runtime-owned home and dependencies are never tool arguments or project settings.
 	const { home, acquire } = dependencies;
 	const run = dependencies.run ?? runHelper;
+	const probe: GitProbe = { command: dependencies.gitCommand ?? "git", timeoutMs: dependencies.gitTimeoutMs ?? GIT_TIMEOUT_MS };
 	return async (value: HandoffRequest, ctx: SaveContext): Promise<HandoffResult> => {
 		const input = validate(value);
 		ctx.signal?.throwIfAborted();
 		const source = await readFile(join(home, ".agents/skills/wrap-up/scripts/save-handoff.py"), "utf8");
 		if (digest(source) !== HELPER_SHA256) throw new Error("Handoff helper digest differs from reviewed code; update the adapter after review");
 		const canonicalHome = await realpath(home);
-		const folder = await directory(canonicalHome, ctx.signal);
-		const path = join(folder, `${input.date}-${input.slug}.md`);
-		await assertTarget(path, canonicalHome, ctx.signal);
+		const name = `${input.date}-${input.slug}.md`;
+		const folder = await directory(canonicalHome, name, probe, ctx.signal);
+		const path = join(folder, name);
+		await assertTarget(path, canonicalHome, probe, ctx.signal);
 		if (input.overwriteSha256) {
 			if (!ctx.confirm) throw new Error("Handoff overwrite requires fresh interactive TUI confirmation");
 			if (digest(await targetBytes(path)) !== input.overwriteSha256) throw new Error("Handoff overwrite-mismatch; inspect the current file again");
@@ -157,13 +210,13 @@ export function createHandoffSaver(dependencies: Dependencies = { home: homedir(
 		}
 		return withFileMutationQueue(path, async () => {
 			ctx.signal?.throwIfAborted();
-			if (await directory(canonicalHome, ctx.signal) !== folder) throw new Error("Handoff directory changed");
-			await assertTarget(path, canonicalHome, ctx.signal);
+			if (await directory(canonicalHome, name, probe, ctx.signal) !== folder) throw new Error("Handoff directory changed");
+			await assertTarget(path, canonicalHome, probe, ctx.signal);
 			const lease = await acquire(path, {
 				sessionId: ctx.sessionId, expectedFile: path, signal: ctx.signal,
 				resolveFile: async (candidate, signal) => {
 					if (candidate !== path) throw new Error("Handoff target identity changed");
-					await assertTarget(candidate, canonicalHome, signal);
+					await assertTarget(candidate, canonicalHome, probe, signal);
 					return candidate;
 				},
 			});
@@ -172,8 +225,8 @@ export function createHandoffSaver(dependencies: Dependencies = { home: homedir(
 			void lease.lost.then(() => { lost = true; });
 			try {
 				ctx.signal?.throwIfAborted();
-				await directory(canonicalHome, ctx.signal);
-				await assertTarget(path, canonicalHome, ctx.signal);
+				await directory(canonicalHome, name, probe, ctx.signal);
+				await assertTarget(path, canonicalHome, probe, ctx.signal);
 				const healthy = () => !lost && lease.alive !== false;
 				if (!healthy()) throw new Error("Handoff lease lost before save");
 				// Once launched, drain this bounded atomic operation even on cancellation/shutdown.
@@ -210,7 +263,7 @@ export function registerHandoffSave(pi: ExtensionAPI, save = createHandoffSaver(
 	pi.registerTool({
 		name: "save_handoff",
 		label: "Save handoff",
-		description: "Save the rendered wrap-up resume block to the fixed ~/.agents/handoffs location. Available in every guard state without /implement or /grant-file. New files auto-save; collisions never overwrite. overwriteSha256 requests a fresh native TUI confirmation, not automatic approval. Returns a verified wrap-up-save/v1 receipt; no caller-selected paths, commands or environment. Requires the reviewed installed wrap-up helper and Python 3.10+.",
+		description: "Save the rendered wrap-up resume block to the fixed ~/.agents/handoffs location. A home nested inside a Git repository is accepted only while that repository ignores the exact target. Available in every guard state without /implement or /grant-file. New files auto-save; collisions never overwrite. overwriteSha256 requests a fresh native TUI confirmation, not automatic approval. Returns a verified wrap-up-save/v1 receipt; no caller-selected paths, commands or environment. Requires the reviewed installed wrap-up helper and Python 3.10+.",
 		parameters: Type.Object({
 			date: Type.String({ pattern: "^\\d{4}-\\d{2}-\\d{2}$" }),
 			time: Type.String({ pattern: "^(?:[01]\\d|2[0-3]):[0-5]\\d$" }),

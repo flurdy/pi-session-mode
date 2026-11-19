@@ -20,8 +20,22 @@ holds the reviewed helper); only the missing `handoffs` directory may be created
 `~/.agents` are supported, including `.git` indirection files: dotfiles version control does
 not relocate the fixed destination, but keeping private handoffs out of publication remains
 the user's responsibility. Symlinked directories, symlink/non-regular/hardlinked targets, Git
-administration markers, a repository rooted at `handoffs`, and Git ancestors above home are
-rejected. Only this operation's exact generated target uses the private resolver; ordinary
+administration markers, a repository rooted at `handoffs`, and bare-repository markers above home
+are rejected.
+
+A home nested inside a Git work tree (for example a container home kept under an ignored
+subdirectory of a client repository) is accepted only while that repository ignores both the
+`handoffs` directory (which also covers the helper's temporary and recovery copies) and the exact
+target file. The adapter checks this before creating a directory, taking a lease or launching the
+helper: it runs `git rev-parse --show-toplevel` and `git check-ignore -q` for the directory and the
+target from the enclosing directory, each with fixed argv, `-c core.fsmonitor=false` (so reading
+the index never runs a repository-configured command), a five-second timeout per Git invocation
+and a fixed environment (`HOME`, `PATH`, no terminal prompts), so caller
+`GIT_DIR`/`GIT_WORK_TREE`/config overrides never redirect the verdict. The repository's own ignore rules (`.gitignore`, `.git/info/exclude`, the user's
+`core.excludesFile`) and index decide: a tracked or unignored target, a toplevel that is not the
+enclosing directory, a missing `git`, a timeout or any other error fails closed with a visible
+reason. Nested unignored homes stay rejected because the enclosing repository would otherwise
+record the handoff. Only this operation's exact generated target uses the private resolver; ordinary
 `/grant-file` and native-write ownership rules are unchanged.
 
 Storage moved from `~/.claude/handoffs` in one coordinated cutover. While that retired

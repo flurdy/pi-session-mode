@@ -179,6 +179,56 @@ for (const location of [".", ".agents", ".agents/handoffs"]) {
 	}
 }
 
+integration("a home nested in a repository is accepted only while that repository ignores the exact target", () => fixture(async ({ home, save, target }) => {
+	const enclosing = dirname(home);
+	execFileSync("git", ["-C", enclosing, "init", "-q"]);
+	await writeFile(join(enclosing, ".gitignore"), "/home/\n");
+	assert.equal((await save(request(), context())).status, "saved");
+	assert.equal(await readFile(target(), "utf8"), request().content);
+	const tracked = await save(request("tracked"), context());
+	execFileSync("git", ["-C", enclosing, "add", "-f", "--", target("tracked")]);
+	await assert.rejects(save({ ...request("tracked"), content: request("tracked").content.replace("- Verify.", "- Continue."), overwriteSha256: tracked.sha256! }, context()), /does not ignore/);
+	assert.equal(await readFile(target("tracked"), "utf8"), request("tracked").content);
+	// Ignoring only the Markdown name would leave the helper's temporary and recovery copies stageable.
+	await writeFile(join(enclosing, ".gitignore"), "/home/.agents/handoffs/*.md\n");
+	await assert.rejects(save(request("markdown-only"), context()), /does not ignore.*handoffs"/);
+	await assert.rejects(access(target("markdown-only")));
+	await rm(join(enclosing, ".gitignore"));
+	await assert.rejects(save(request("unignored"), context()), /does not ignore/);
+	await assert.rejects(access(target("unignored")));
+}));
+
+integration("an enclosing repository is decided with a fixed Git probe that fails closed before any directory, lease or helper", () => fixture(async ({ home, runtime, target }) => {
+	const enclosing = dirname(home);
+	execFileSync("git", ["-C", enclosing, "init", "-q"]);
+	await writeFile(join(enclosing, ".gitignore"), "/home/\n");
+	const slow = join(enclosing, "slow-git");
+	await writeFile(slow, "#!/bin/sh\nsleep 5\n", { mode: 0o755 });
+	let launched = false;
+	for (const [gitCommand, reason] of [[join(enclosing, "missing-git"), /could not be started/], [slow, /timed out/]] as const) {
+		const save = createHandoffSaver({ home, acquire: () => { throw new Error("lease must not be requested"); }, run: async () => { launched = true; return { code: 1, stdout: "" }; }, gitCommand, gitTimeoutMs: 200 });
+		await assert.rejects(save(request(), context()), reason);
+	}
+	assert.equal(launched, false);
+	await assert.rejects(access(join(home, ".agents/handoffs")));
+	await assert.rejects(access(target()));
+	// A repository-configured fsmonitor command must never run while the index is read for check-ignore.
+	const ran = join(enclosing, "fsmonitor-ran");
+	execFileSync("git", ["-C", enclosing, "add", ".gitignore"]);
+	execFileSync("git", ["-C", enclosing, "config", "core.fsmonitor", `sh -c 'touch ${ran}'`]);
+	execFileSync("git", ["-C", enclosing, "check-ignore", "-q", "--", target()], { env: { HOME: home, PATH: process.env.PATH! } });
+	assert.ok(existsSync(ran), "fixture premise: plain check-ignore runs the configured fsmonitor command");
+	await rm(ran);
+	// Caller Git overrides never redirect the verdict: an unrelated GIT_DIR would otherwise fail the toplevel check.
+	const other = join(enclosing, "other"); await mkdir(other);
+	execFileSync("git", ["-C", other, "init", "-q"]);
+	const save = createHandoffSaver({ home, acquire: (file, options) => acquireFileLease(file, { ...options, runtimeDir: runtime }) });
+	const previous = process.env;
+	process.env = { ...previous, GIT_DIR: join(other, ".git"), GIT_WORK_TREE: other };
+	try { assert.equal((await save(request(), context())).status, "saved"); } finally { process.env = previous; }
+	assert.equal(existsSync(ran), false);
+}));
+
 integration("bare repos, nested gitfiles and Git ancestors outside home stay rejected", () => fixture(async ({ home, save, target }) => {
 	const folder = join(home, ".agents/handoffs");
 	execFileSync("git", ["init", "--bare", "-q", folder]);
