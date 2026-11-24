@@ -62,7 +62,7 @@ After Pi exits successfully, the wrapper verifies the configured source, checkou
 
 ## Residual trust boundary
 
-This wrapper deliberately reuses Pi's package manager instead of maintaining a second installer. It therefore inherits Pi 0.85.1 behavior and these limitations:
+This wrapper deliberately reuses Pi's package manager instead of maintaining a second installer. It therefore inherits Pi 1.6.0 behavior and these limitations:
 
 - Pi's settings update is not transactional with every concurrent settings writer.
 - A tag can move between the wrapper's final remote check and Pi's internal fetch. Post-verification detects the resulting checkout mismatch but cannot undo code already executed.

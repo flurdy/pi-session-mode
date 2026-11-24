@@ -14,7 +14,7 @@ assert.deepEqual(manifest.exports, { "./lease-observer": "./lease-observer.ts" }
 assert.deepEqual([...manifest.files].sort(), runtimeFiles, "runtime allowlist differs");
 assert.equal(manifest.repository?.url, "git+https://github.com/flurdy/pi-session-mode.git");
 assert.deepEqual(manifest.peerDependencies, { "@earendil-works/pi-coding-agent": "*", typebox: "*" });
-assert.equal(manifest.devDependencies["@earendil-works/pi-coding-agent"], "0.85.1");
+assert.equal(manifest.devDependencies["@earendil-works/pi-coding-agent"], "1.6.0");
 
 const reports = JSON.parse(execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { cwd: root, encoding: "utf8" }));
 assert.equal(reports.length, 1);

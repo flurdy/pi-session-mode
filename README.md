@@ -6,7 +6,7 @@ A [Pi](https://pi.dev) extension for guarded plan mode, Git-worktree writer leas
 
 ## Requirements
 
-- Pi 0.85.1 or newer; development and lifecycle checks use 0.85.1. An open host peer range does not certify later versions.
+- Pi 1.6.0 or newer; development and lifecycle checks use 1.6.0. An open host peer range does not certify later versions.
 - Git and util-linux `flock`; Linux `lslocks` for optional occupancy observation.
 - Node.js from `.nvmrc` for development. Pi supplies its core package at runtime.
 - Optional guarded reviewers: `pi-subagents` 0.68.0+ with its compiled discovery API. Missing/incompatible discovery fails closed; see [runtime compatibility](docs/guard.md#runtime-and-distribution).
