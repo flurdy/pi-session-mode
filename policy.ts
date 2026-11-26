@@ -511,7 +511,25 @@ function hasCommand(command: string, matches: (words: string[]) => boolean, dept
 	return false;
 }
 
+// Match the whole literal probe, not arbitrary gh extensions, operands, wrappers or shell fragments.
+const HELP_COMMAND_PATHS = new Set([
+	"gh pr create", "gh release create", "gh repo create",
+	"bd init", "bd migrate", "bd dolt push", "bd dolt pull", "bd dolt fetch", "bd dolt remote",
+	"dolt sql", "dolt fetch", "dolt push", "dolt pull", "dolt remote",
+]);
+
+function isStandaloneHelpProbe(command: string): boolean {
+	const words = command.split(/[ \t]+/).filter(Boolean);
+	if (words[1] === "help") {
+		if (words[0] === "bd") return words.length === 3 && /^[a-z][a-z0-9-]*$/.test(words[2]!);
+		return words[0] === "gh" && HELP_COMMAND_PATHS.has(["gh", ...words.slice(2)].join(" "));
+	}
+	const flag = words.pop();
+	return (flag === "--help" || flag === "-h") && HELP_COMMAND_PATHS.has(words.join(" "));
+}
+
 function isObviousMutationAtDepth(command: string, depth: number): boolean {
+	if (depth === 0 && isStandaloneHelpProbe(command)) return false;
 	const payloads = constantShellPayloads(command);
 	if (payloads.length > 0 && depth >= MAX_INSPECTION_DEPTH) return true;
 	if (payloads.some((payload) => isObviousMutationAtDepth(payload, depth + 1))) return true;
@@ -545,6 +563,7 @@ const isGitHubCli = (words: string[]) => invokedCommand(words)?.executable === "
 
 /** Bounded refusal for attended admin runs. Recognizable shapes only: it is not a complete detector of Git or remote effects. */
 export function adminRunRefusal(command: string, depth = 0): string | undefined {
+	if (depth === 0 && isStandaloneHelpProbe(command)) return undefined;
 	for (const payload of constantShellPayloads(command)) {
 		const reason = depth >= MAX_INSPECTION_DEPTH ? ADMIN_REMOTE_REASON : adminRunRefusal(payload, depth + 1);
 		if (reason) return reason;

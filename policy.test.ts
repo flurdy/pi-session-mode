@@ -3,6 +3,11 @@ import test from "node:test";
 import { homedir } from "node:os";
 import { guardedToolBlockReason, implementPushCheck, isObviousMutation, lazyShellTargets } from "./policy.ts";
 
+test("guarded Bash recognizes standalone database help without exempting larger commands", () => {
+	for (const command of ["bd dolt push --help", "bd migrate -h", "dolt sql --help", "dolt fetch --help"]) assert.equal(isObviousMutation(command), false, command);
+	for (const command of ["bd dolt push --help; bd dolt push", "dolt fetch origin --help", "bd migrate --help && make push"]) assert.equal(isObviousMutation(command), true, command);
+});
+
 test("blocks direct writes while leaving reads available", () => {
 	assert.match(guardedToolBlockReason("edit") ?? "", /guarded session/i);
 	assert.match(guardedToolBlockReason("write") ?? "", /guarded session/i);

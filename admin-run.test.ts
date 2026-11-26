@@ -41,6 +41,15 @@ test("bounded refusals cover Git mutation, publication, remote sync and privileg
 	}
 });
 
+test("only standalone literal built-in help probes get the admin exemption", () => {
+	for (const command of ["gh repo create --help", "gh help repo create", "bd init --help", "bd help init-safety", "bd dolt push -h", "bd migrate --help", "dolt sql --help", "dolt fetch --help"]) {
+		assert.equal(adminRunRefusal(command), undefined, command);
+	}
+	for (const command of ["gh repo create x --help", "gh repo create --help-ish", "gh custom --help", "bd dolt push --remote origin --help", "bd dolt push --help; bd dolt push", "dolt sql -q 'DELETE FROM example' --help", "dolt fetch origin --help", "true && gh repo create --help"]) {
+		assert.ok(adminRunRefusal(command), command);
+	}
+});
+
 test("destructive commands are flagged with their literal lines", () => {
 	assert.deepEqual(
 		destructiveCommandLines("rm -rf x\nmv a b\nmv -n a b\ncp -an a b\nchmod -R 700 d\necho hi > f\necho ok >/dev/null 2>&1\nmkdir -m 700 d"),
